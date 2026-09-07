@@ -78,6 +78,9 @@ void common_speculative_begin(common_speculative * spec, llama_seq_id seq_id, co
 
 // process the batch and update the internal state of the speculative context
 bool common_speculative_process(common_speculative * spec, const llama_batch & batch);
+// same, for a batch whose target nextn rows belong to decode sequence `nextn_seq` (see llama_nextn_seq):
+// waits only for the exporting backend so the target's next decode keeps running meanwhile
+bool common_speculative_process_seq(common_speculative * spec, const llama_batch & batch, uint64_t nextn_seq);
 
 // generate drafts for the sequences specified with `common_speculative_get_draft_params`
 void common_speculative_draft(common_speculative * spec);

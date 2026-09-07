@@ -1007,10 +1007,34 @@ static bool ggml_gallocr_node_needs_realloc(ggml_gallocr_t galloc, struct ggml_t
 }
 
 static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph * graph) {
+    static int dbg = -1;
+    if (dbg < 0) { const char * e = getenv("GGML_GALLOC_DEBUG"); dbg = e ? atoi(e) : 0; }
+    static char prev_names[16384][40]; static int prev_n = 0;
+    if (dbg && galloc->n_nodes != graph->n_nodes) {
+        int m = prev_n < graph->n_nodes ? prev_n : graph->n_nodes;
+        for (int k = 0; k < m; ++k) {
+            if (strncmp(prev_names[k], graph->nodes[k]->name, 39) != 0) {
+                GGML_LOG_INFO("gallocr realloc: first differing node #%d (n %d -> %d)\n", k, prev_n, graph->n_nodes);
+                for (int q = k - 6; q < k + 8; ++q) {
+                    if (q < 0) continue;
+                    GGML_LOG_INFO("   #%d prev='%s'  now='%s' [%s ne=%lld,%lld,%lld]\n", q,
+                        q < prev_n ? prev_names[q] : "-", q < graph->n_nodes ? graph->nodes[q]->name : "-",
+                        q < graph->n_nodes ? ggml_op_name(graph->nodes[q]->op) : "-",
+                        q < graph->n_nodes ? (long long) graph->nodes[q]->ne[0] : 0, q < graph->n_nodes ? (long long) graph->nodes[q]->ne[1] : 0, q < graph->n_nodes ? (long long) graph->nodes[q]->ne[2] : 0);
+                }
+                break;
+            }
+        }
+    }
+    if (dbg) {
+        prev_n = graph->n_nodes < 16384 ? graph->n_nodes : 16384;
+        for (int k = 0; k < prev_n; ++k) { strncpy(prev_names[k], graph->nodes[k]->name, 39); prev_names[k][39] = 0; }
+    }
     if (galloc->n_nodes != graph->n_nodes) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of nodes\n", __func__);
 #endif
+        if (dbg) fprintf(stderr, "gallocr realloc: n_nodes %d -> %d\n", galloc->n_nodes, graph->n_nodes);
         return true;
     }
 
@@ -1018,6 +1042,7 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: graph has different number of leafs\n", __func__);
 #endif
+        if (dbg) fprintf(stderr, "gallocr realloc: n_leafs %d -> %d\n", galloc->n_leafs, graph->n_leafs);
         return true;
     }
 
@@ -1029,6 +1054,10 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #ifndef NDEBUG
             GGML_LOG_DEBUG("%s: node %s is not valid\n", __func__, node->name);
 #endif
+            if (dbg) fprintf(stderr, "gallocr realloc [graph %d nodes]: node %d '%s' op=%s ne=[%lld,%lld,%lld,%lld] needs %zu > reserved %zu (buffer_id %d, data=%p view_src=%p)\n",
+                graph->n_nodes, i, node->name, ggml_op_name(node->op), (long long) node->ne[0], (long long) node->ne[1], (long long) node->ne[2], (long long) node->ne[3],
+                (node->data || node->view_src || node_alloc->dst.buffer_id < 0) ? (size_t) 0 : ggml_backend_buft_get_alloc_size(galloc->bufts[node_alloc->dst.buffer_id], node),
+                node_alloc->dst.size_max, node_alloc->dst.buffer_id, node->data, (void *) node->view_src);
             return true;
         }
 
@@ -1041,6 +1070,10 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
 #ifndef NDEBUG
                 GGML_LOG_DEBUG("%s: src %d (%s) of node %s is not valid\n", __func__, j, src->name, node->name);
 #endif
+                if (dbg) fprintf(stderr, "gallocr realloc [graph %d nodes]: src %d '%s' of node %d '%s' ne=[%lld,%lld,%lld,%lld] needs %zu > reserved %zu (buffer_id %d, data=%p)\n",
+                    graph->n_nodes, j, src->name, i, node->name, (long long) src->ne[0], (long long) src->ne[1], (long long) src->ne[2], (long long) src->ne[3],
+                    (src->data || src->view_src || node_alloc->src[j].buffer_id < 0) ? (size_t) 0 : ggml_backend_buft_get_alloc_size(galloc->bufts[node_alloc->src[j].buffer_id], src),
+                    node_alloc->src[j].size_max, node_alloc->src[j].buffer_id, src->data);
                 return true;
             }
         }
