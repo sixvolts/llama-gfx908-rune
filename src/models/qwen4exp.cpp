@@ -352,6 +352,10 @@ ggml_tensor * llama_model_qwen4exp::graph::build_hc_mix(
     if (inject) {
         *inject = build_lora_mm(w_inject, xn);
         cb(*inject, "hc_inject", il);
+        // expand now so the inject GEMM is ordered here rather than being pulled into the
+        // middle of build_hc_combine's node sequence; keeps that sequence contiguous for
+        // the CUDA hc_combine fusion (repeat, scale, sigmoid, scale, reshape, mul, add)
+        ggml_build_forward_expand(gf, *inject);
     }
 
     return mixed;
@@ -800,6 +804,7 @@ ggml_tensor * llama_model_qwen4exp::graph::build_qsa_top_k(
         auto qsa = std::make_unique<llm_graph_input_qsa>(mctx_hyb, (uint32_t) r, blk_bias);
 
         qsa->k_idxs    = mctx_idx->build_input_k_idxs(ctx0, ubatch);
+        if (getenv("GGML_GALLOC_DEBUG")) { fprintf(stderr, "build_inp_qsa: n_kv=%lld n_tokens=%lld n_stream=%lld r=%lld\n", (long long) n_kv, (long long) n_tokens, (long long) n_stream, (long long) r); }
         qsa->cell_blk  = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, n_kv, n_stream);
         qsa->blk_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, r*n_blocks, n_stream);
         qsa->blk_pos   = ggml_new_tensor_1d(ctx0, GGML_TYPE_I32, 4*n_blocks*n_stream);

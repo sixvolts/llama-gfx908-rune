@@ -4,6 +4,9 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <memory>
+#include <cstring>
+#include <cstdlib>
 #include <type_traits>
 
 typedef float (*vec_dot_q_cuda_t)(const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1, const int & kbx, const int & iqs);
@@ -1355,6 +1358,35 @@ static void mul_mat_vec_q_switch_type(
     }
 }
 
+// Per-device cache of q8_1-quantized activations, live for one graph evaluation. Every mmvq call of a graph
+// that reads the same src1 tensor (same tensor, data, shape, strides) shares one quantize launch.
+// GGML_CUDA_Q8_CACHE=0 disables it; GGML_CUDA_Q8_CACHE_STATS=1 prints hits/misses per graph.
+ggml_cuda_q8_cache & ggml_cuda_q8_cache_get(int device) {
+    static ggml_cuda_q8_cache caches[GGML_CUDA_MAX_DEVICES];
+    return caches[device];
+}
+
+void ggml_cuda_q8_cache_begin(ggml_backend_cuda_context & ctx) {
+    static const bool enabled = !(getenv("GGML_CUDA_Q8_CACHE") && atoi(getenv("GGML_CUDA_Q8_CACHE")) == 0);
+    ggml_cuda_q8_cache & c = ggml_cuda_q8_cache_get(ctx.device);
+    c.entries.clear();
+    c.hits = 0;
+    c.misses = 0;
+    c.active = enabled;
+}
+
+void ggml_cuda_q8_cache_end(ggml_backend_cuda_context & ctx) {
+    static const bool stats = getenv("GGML_CUDA_Q8_CACHE_STATS") && atoi(getenv("GGML_CUDA_Q8_CACHE_STATS"));
+    ggml_cuda_q8_cache & c = ggml_cuda_q8_cache_get(ctx.device);
+    if (stats && (c.hits + c.misses) > 0) {
+        GGML_LOG_INFO("q8 cache dev%d: %zu quantize launches saved, %zu issued\n", ctx.device, c.hits, c.misses);
+    }
+    while (!c.entries.empty()) {   // release in reverse allocation order (pool-friendly)
+        c.entries.pop_back();
+    }
+    c.active = false;
+}
+
 void ggml_cuda_mul_mat_vec_q(
         ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
         const ggml_cuda_mm_fusion_args_host * fusion) {
@@ -1435,12 +1467,39 @@ void ggml_cuda_mul_mat_vec_q(
     }
 
     const int64_t ne10_padded = GGML_PAD(ne10, MATRIX_ROW_PADDING);
-    ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1);
+    const size_t  q8_bytes    = ne13*ne12 * ne11*ne10_padded * sizeof(block_q8_1)/QK8_1;
+    // q8_1 of src1: reused across the GEMVs of one graph that read the same activation (bit-identical bytes)
+    std::unique_ptr<ggml_cuda_pool_alloc<char>> src1_q8_1_own;
+    const char * src1_q8_1_d = nullptr;
     {
         const int64_t s11 = src1->nb[1] / ts_src1;
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
-        quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+        ggml_cuda_q8_cache & cache = ggml_cuda_q8_cache_get(ctx.device);
+        if (!ids && cache.active) {
+            for (auto & e : cache.entries) {
+                if (e.t == src1 && e.data == src1->data && e.bytes == q8_bytes &&
+                    memcmp(e.ne, src1->ne, sizeof(e.ne)) == 0 && memcmp(e.nb, src1->nb, sizeof(e.nb)) == 0) {
+                    src1_q8_1_d = e.buf->get();
+                    cache.hits++;
+                    break;
+                }
+            }
+            if (!src1_q8_1_d) {
+                ggml_cuda_q8_cache_entry e;
+                e.t = src1; e.data = src1->data; e.bytes = q8_bytes;
+                memcpy(e.ne, src1->ne, sizeof(e.ne)); memcpy(e.nb, src1->nb, sizeof(e.nb));
+                e.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_bytes);
+                quantize_row_q8_1_cuda(src1_d, nullptr, e.buf->get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+                src1_q8_1_d = e.buf->get();
+                cache.entries.push_back(std::move(e));
+                cache.misses++;
+            }
+        } else {
+            src1_q8_1_own = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_bytes);
+            quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_own->get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+            src1_q8_1_d = src1_q8_1_own->get();
+        }
     }
 
     const int64_t s01 = src0->nb[1] / ts_src0;
@@ -1466,7 +1525,7 @@ void ggml_cuda_mul_mat_vec_q(
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mul_mat_vec_q_switch_type(
-        src0->data, src0->type, src1_q8_1.get(), ids_d, fusion_local, dst_d, ne00,
+        src0->data, src0->type, src1_q8_1_d, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);

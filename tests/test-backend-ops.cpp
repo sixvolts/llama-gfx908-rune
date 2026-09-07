@@ -3907,6 +3907,43 @@ struct test_unary_mul : public test_case {
 // SNAKE activation fusion: y = x + sin(a*x)^2 * inv_b
 // CUDA backend matches the naive 5-op chain (mul, sin, sqr, mul, add)
 // and dispatches a single fused kernel.
+// HyperConnection combine as emitted by qwen4exp build_hc_combine (CUDA fuses the 7-op tail)
+struct test_hc_combine : public test_case {
+    const std::array<int64_t, 3> ne; // {ne0, hc, nt}
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "HC_COMBINE";
+    }
+
+    bool run_whole_graph() override { return true; }
+
+    std::string vars() override {
+        return VARS_TO_STR1(ne);
+    }
+
+    test_hc_combine(std::array<int64_t, 3> ne = {64, 4, 3}) : ne(ne) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        const int64_t ne0 = ne[0], hc = ne[1], nt = ne[2];
+        ggml_tensor * residual  = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, ne0, hc, nt);
+        ggml_tensor * block_out = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, ne0, nt);
+        ggml_tensor * inject    = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, hc, nt);
+        ggml_set_param(residual);  ggml_set_name(residual,  "residual");
+        ggml_set_param(block_out); ggml_set_name(block_out, "block_out");
+        ggml_set_param(inject);    ggml_set_name(inject,    "inject");
+
+        ggml_tensor * w = ggml_sigmoid(ctx, ggml_scale(ctx, inject, 1.0f / (float) hc));
+        w = ggml_scale(ctx, w, 2.0f);
+        w = ggml_reshape_3d(ctx, w, 1, hc, nt);
+        ggml_tensor * b = ggml_reshape_3d(ctx, block_out, ne0, 1, nt);
+        b = ggml_repeat_4d(ctx, b, ne0, hc, nt, 1);
+        ggml_tensor * out = ggml_add(ctx, residual, ggml_mul(ctx, b, w));
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_snake_fuse : public test_case {
     const ggml_type type;
     const std::array<int64_t, 4> ne;   // [T, C, D2, D3]
@@ -8594,6 +8631,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     // SNAKE activation fusion: x + sin(a*x)^2 * inv_b
     for (ggml_type type : { GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16 }) {
+        test_cases.emplace_back(new test_hc_combine({64, 4, 3}));
+        test_cases.emplace_back(new test_hc_combine({2560, 4, 1}));
+        test_cases.emplace_back(new test_hc_combine({2560, 4, 7}));
         test_cases.emplace_back(new test_snake_fuse(type, {   5,   7, 1, 1}));   // primes sub-block
         test_cases.emplace_back(new test_snake_fuse(type, {  33,  32, 1, 1}));   // boundary
         test_cases.emplace_back(new test_snake_fuse(type, {1025,  13, 1, 1}));   // large prime, grid-stride

@@ -11,6 +11,7 @@
 #include <cctype>
 #include <climits>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <unordered_map>
 #include <vector>
@@ -591,8 +592,22 @@ struct llama_sampler * common_sampler_get(const struct common_sampler * gsmpl) {
     return gsmpl->chain;
 }
 
+// COMMON_SAMPLER_TRACE=1: accumulate per-phase host times of common_sampler_sample (printed every 200 calls)
+static void sampler_trace(int64_t t_sync, int64_t t_set, int64_t t_chain, size_t n_cand, bool backend_tok) {
+    static const bool on = getenv("COMMON_SAMPLER_TRACE") && atoi(getenv("COMMON_SAMPLER_TRACE")) == 1;
+    if (!on) return;
+    static int64_t a_sync = 0, a_set = 0, a_chain = 0, a_cand = 0, a_bt = 0; static int n = 0;
+    a_sync += t_sync; a_set += t_set; a_chain += t_chain; a_cand += n_cand; a_bt += backend_tok; ++n;
+    if (n % 200 == 0) {
+        fprintf(stderr, "SAMPLER_TRACE n=%d: sync %.3f ms, set_logits %.3f ms, chain %.3f ms, candidates %.0f, backend_token %.0f%%\n",
+            n, a_sync/1000.0/n, a_set/1000.0/n, a_chain/1000.0/n, (double) a_cand/n, 100.0*a_bt/n);
+    }
+}
+
 llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_context * ctx, int idx, bool grammar_first) {
+    const int64_t tr0 = ggml_time_us();
     llama_synchronize(ctx);
+    const int64_t tr1 = ggml_time_us();
 
     // start measuring sampling time after the llama_context synchronization in order to not measure any ongoing async operations
     const auto tm = gsmpl->tm();
@@ -605,6 +620,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     auto & cur_p = gsmpl->cur_p; // initialized by set_logits
 
     gsmpl->set_logits(ctx, idx);
+    const int64_t tr2 = ggml_time_us();
 
     // Check if a backend sampler has already sampled a token in which case we
     // return that token id directly.
@@ -612,6 +628,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
         id = llama_get_sampled_token_ith(ctx, idx);
 
         if (id != LLAMA_TOKEN_NULL) {
+            sampler_trace(tr1 - tr0, tr2 - tr1, ggml_time_us() - tr2, cur_p.size, true);
             LOG_DBG("%s: Backend sampler selected token: '%d'. Will not run any CPU samplers\n", __func__, id);
 
             GGML_ASSERT(!gsmpl->grmr    && "using grammar in combination with backend sampling is not supported");
@@ -638,6 +655,7 @@ llama_token common_sampler_sample(struct common_sampler * gsmpl, struct llama_co
     llama_sampler_apply(chain, &cur_p);
 
     id = cur_p.data[cur_p.selected].id;
+    sampler_trace(tr1 - tr0, tr2 - tr1, ggml_time_us() - tr2, cur_p.size, false);
 
     if (grammar_first || !grammar_should_apply(gsmpl)) {
         return id;

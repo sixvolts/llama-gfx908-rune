@@ -16,6 +16,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstring>
+#include <cstdlib>
 #include <limits>
 #include <stdexcept>
 #include <string>
@@ -425,12 +426,18 @@ llama_context::llama_context(
 
         // TODO: move these checks to ggml_backend_sched
         // enabling pipeline parallelism in the scheduler increases memory usage, so it is only done when necessary
+        // LLAMA_PIPELINE_PARALLEL=1 keeps pipeline parallelism on despite tensor overrides (rune: the only override
+        // is the PLE n-gram table on the CPU, a fixed split at the head of every ubatch; the GPU chain still pipelines)
+        static const bool force_pp = getenv("LLAMA_PIPELINE_PARALLEL") && atoi(getenv("LLAMA_PIPELINE_PARALLEL")) == 1;
         bool pipeline_parallel =
             model.n_devices() > 1 &&
             model.n_gpu_layers() > model.hparams.n_layer_all &&
             model.split_mode() == LLAMA_SPLIT_MODE_LAYER &&
             cparams.offload_kqv &&
-            !model.has_tensor_overrides();
+            (!model.has_tensor_overrides() || force_pp);
+        if (force_pp && model.has_tensor_overrides()) {
+            LLAMA_LOG_WARN("%s: LLAMA_PIPELINE_PARALLEL=1: keeping pipeline parallelism despite tensor overrides\n", __func__);
+        }
 
         // pipeline parallelism requires support for async compute and events in all devices
         if (pipeline_parallel) {
@@ -479,6 +486,12 @@ llama_context::llama_context(
 }
 
 llama_context::~llama_context() {
+    for (auto & ev : nextn_events) {
+        if (ev != nullptr) {
+            ggml_backend_event_free(ev);
+            ev = nullptr;
+        }
+    }
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
@@ -716,6 +729,15 @@ void llama_context::synchronize() {
         return;
     }
 
+    // nothing was queued since the last synchronize (decode/encode add to n_queued_tokens, synchronize zeroes it):
+    // the devices are already idle, so skip the per-backend stream syncs. The output getters call this on every
+    // access (6-7 times per sampled token). LLAMA_SYNC_ALWAYS=1 restores the unconditional synchronize.
+    static const bool sync_always = getenv("LLAMA_SYNC_ALWAYS") && atoi(getenv("LLAMA_SYNC_ALWAYS")) == 1;
+    if (!sync_always && !sched_dirty && n_queued_tokens == 0) {
+        return;
+    }
+    sched_dirty = false;
+
     ggml_backend_sched_synchronize(sched.get());
 
     // FIXME: if multiple single tokens are evaluated without a synchronization,
@@ -944,10 +966,29 @@ float * llama_context::get_embeddings_seq(llama_seq_id seq_id) {
     return it->second.data();
 }
 
+float * llama_context::nextn_region(uint64_t seq) const {
+    if (!embd_nextn.data || !cparams.embeddings_nextn || cparams.embeddings_nextn_masked) {
+        return embd_nextn.data;
+    }
+    return embd_nextn.data + (seq % 2) * (embd_nextn.size / 2);
+}
+
+void llama_context::synchronize_nextn(uint64_t seq) {
+    if (seq == 0 || seq + 1 < nextn_seq || seq > nextn_seq || nextn_events[seq % 2] == nullptr) {
+        synchronize();
+        return;
+    }
+    ggml_backend_event_synchronize(nextn_events[seq % 2]);
+}
+
+const float * llama_context::get_embeddings_nextn_seq(uint64_t seq) {
+    return nextn_region(seq);
+}
+
 float * llama_context::get_embeddings_nextn() {
     output_reorder();
 
-    return embd_nextn.data;
+    return nextn_region(nextn_seq);
 }
 
 float * llama_context::get_embeddings_nextn_ith(int32_t i) {
@@ -961,11 +1002,11 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
         const uint32_t n_embd = model.hparams.n_embd_out();
 
         if (!cparams.embeddings_nextn_masked) {
-            // unmasked: nextn rows are stored densely, indexed by raw token position.
-            if (i < 0 || (size_t)(i + 1) * n_embd > embd_nextn.size) {
-                throw std::runtime_error(format("out of range [0, %zu)", embd_nextn.size / n_embd));
+            // unmasked: nextn rows are stored densely, indexed by raw token position (current region).
+            if (i < 0 || (size_t)(i + 1) * n_embd > embd_nextn.size / 2) {
+                throw std::runtime_error(format("out of range [0, %zu)", embd_nextn.size / 2 / n_embd));
             }
-            return embd_nextn.data + (size_t) i * n_embd;
+            return nextn_region(nextn_seq) + (size_t) i * n_embd;
         }
 
         const int64_t j = output_resolve_row(i);
@@ -1171,8 +1212,20 @@ void llama_context::set_embeddings(bool value) {
 void llama_context::set_embeddings_nextn(bool value, bool masked) {
     LLAMA_LOG_DEBUG("%s: value = %d, masked = %d\n", __func__, value, masked);
 
+    const bool changed = cparams.embeddings_nextn != value || cparams.embeddings_nextn_masked != masked;
+
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
+
+    // Unmasked nextn rows change the graph topology (the last layer keeps every token instead of gathering the
+    // outputs). The graphs were reserved before this call (the MTP driver enables it after context creation), so
+    // every later prompt ubatch would mismatch the reservation and the scheduler would reallocate - draining all
+    // devices - on each one (rune: with the MTP head attached, prefill fell from 1400 to 550 t/s). Re-reserve now.
+    if (changed && sched) {
+        LLAMA_LOG_INFO("%s: nextn mode changed, re-reserving the compute graphs\n", __func__);
+        sched_need_reserve = true;
+        sched_reserve();
+    }
 }
 
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
@@ -1352,7 +1405,31 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
         // that the previous compute is still reading.
         if (cparams.pipeline_parallel) {
-            ggml_backend_sched_synchronize(sched.get());
+            // Only device-resident inputs can race with the previous compute: host-resident inputs are copied into the
+            // scheduler's rotating per-split device copies at enqueue time, so overwriting them here is safe and the
+            // synchronize would serialize the ubatches (rune: 0% cross-GPU overlap, no prefill gain from pipelining).
+            // LLAMA_PP_INPUT_SYNC=1 restores the unconditional synchronize.
+            static const bool force_sync = getenv("LLAMA_PP_INPUT_SYNC") && atoi(getenv("LLAMA_PP_INPUT_SYNC")) == 1;
+            bool need_sync = force_sync;
+            for (ggml_tensor * t = ggml_get_first_tensor(res->get_ctx()); t && !need_sync; t = ggml_get_next_tensor(res->get_ctx(), t)) {
+                if ((t->flags & GGML_TENSOR_FLAG_INPUT) && t->buffer && !ggml_backend_buffer_is_host(t->buffer)) {
+                    need_sync = true;
+                    static bool warned = false;
+                    if (!warned) {
+                        warned = true;
+                        LLAMA_LOG_WARN("%s: pipeline parallelism: input '%s' lives in %s, synchronizing before set_inputs\n",
+                            __func__, t->name, ggml_backend_buffer_name(t->buffer));
+                    }
+                }
+            }
+            static bool reported = false;
+            if (!reported) {
+                reported = true;
+                LLAMA_LOG_INFO("%s: pipeline parallelism: pre-set_inputs synchronize %s\n", __func__, need_sync ? "ON" : "OFF (all inputs host-resident)");
+            }
+            if (need_sync) {
+                ggml_backend_sched_synchronize(sched.get());
+            }
         }
 
         n_reused++;
@@ -1557,7 +1634,8 @@ int llama_context::encode(const llama_batch & batch_inp) {
 
         const uint32_t n_embd = hparams.n_embd_out();
         GGML_ASSERT(n_tokens*n_embd <= (int64_t) embd_nextn.size);
-        ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn.data, 0, n_tokens*n_embd*sizeof(float));
+        ggml_backend_tensor_get_async(backend_h, t_h_nextn, nextn_region(nextn_seq), 0, n_tokens*n_embd*sizeof(float));
+        sched_dirty = true;
     }
 
     // TODO: hacky solution
@@ -1803,6 +1881,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
+    // nextn rows of this call go to the region of nextn_seq + 1; the event is recorded after the last ubatch
+    const uint64_t nextn_cur = nextn_seq + 1;
+    ggml_backend_t nextn_backend_cur = nullptr;
+
     do {
         const auto & ubatch = mctx->get_ubatch();
 
@@ -1822,9 +1904,20 @@ int llama_context::decode(const llama_batch & batch_inp) {
             n_outputs = n_outputs_new;
         }
 
+        // A ubatch with no outputs would shrink the last layer's tail to 0 rows, which changes the scheduler's
+        // split layout and forces a graph reallocation (draining every device) on each prompt ubatch, defeating
+        // pipeline parallelism. Build the graph with one discarded output row instead; the real count is
+        // restored below for the output extraction.
+        const int32_t n_outputs_real = n_outputs;
+        if (n_outputs == 0) {
+            n_outputs = 1;
+        }
+
         ggml_status status;
 
         const auto * res = process_ubatch(ubatch, ctx_type_to_graph_type(cparams.ctx_type), mctx.get(), status);
+
+        n_outputs = n_outputs_real;
 
         if (!res) {
             // the last ubatch failed or was aborted -> remove all positions of that ubatch from the memory module
@@ -1959,10 +2052,11 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 GGML_ASSERT(backend_h != nullptr);
 
                 const uint32_t n_embd  = hparams.n_embd_out();
-                float * embd_nextn_out = embd_nextn.data + offset*n_embd;
+                float * embd_nextn_out = nextn_region(nextn_cur) + offset*n_embd;
 
-                GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) embd_nextn.size);
+                GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) (masked ? embd_nextn.size : embd_nextn.size / 2));
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
+                nextn_backend_cur = backend_h;
             }
         }
 
@@ -1979,6 +2073,24 @@ int llama_context::decode(const llama_batch & batch_inp) {
         n_outputs_prev += n_outputs;
         n_tokens_prev  += ubatch.n_tokens;
     } while (mctx->next());
+
+    sched_dirty = true;   // output copies were issued asynchronously above
+
+    // nextn rows exported: publish the region and record the event that guards it (exporting backend only)
+    if (nextn_backend_cur != nullptr) {
+        ggml_backend_event_t & ev = nextn_events[nextn_cur % 2];
+        if (ev == nullptr || nextn_event_backend != nextn_backend_cur) {
+            if (ev != nullptr) {
+                ggml_backend_event_free(ev);
+            }
+            ev = ggml_backend_event_new(ggml_backend_get_device(nextn_backend_cur));
+            nextn_event_backend = nextn_backend_cur;
+        }
+        if (ev != nullptr) {
+            ggml_backend_event_record(ev, nextn_backend_cur);
+        }
+        nextn_seq = nextn_cur;
+    }
 
     // set to total number of outputs in the batch, for use in llama_get_logits_ith
     n_outputs = n_outputs_all;
@@ -2072,7 +2184,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
         // unmasked: nextn row exists for every token in the batch, not just
         // those flagged via batch.logits[i] -> size by token count instead.
-        embd_nextn.size = (size_t) n_embd_out * n_batch;
+        embd_nextn.size = (size_t) 2 * n_embd_out * n_batch;   // two regions, see nextn_region()
     }
 
     for (bool enabled : cparams.embeddings_layer_inp) {
@@ -2252,8 +2364,9 @@ void llama_context::output_reorder() {
         }
 
         if (embd_nextn.size > 0) {
+            float * nx = nextn_region(nextn_seq);
             for (uint64_t k = 0; k < n_embd_out; k++) {
-                std::swap(embd_nextn.data[i0*n_embd_out + k], embd_nextn.data[i1*n_embd_out + k]);
+                std::swap(nx[i0*n_embd_out + k], nx[i1*n_embd_out + k]);
             }
         }
 
@@ -2491,6 +2604,8 @@ llm_graph_params llama_context::graph_params(
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
+    sched_dirty = true;   // async work is being issued; see synchronize()
+
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -3902,6 +4017,18 @@ llama_memory_t llama_get_memory(const struct llama_context * ctx) {
     }
 
     return ctx->get_memory();
+}
+
+uint64_t llama_nextn_seq(llama_context * ctx) {
+    return ctx->get_nextn_seq();
+}
+
+void llama_synchronize_nextn(llama_context * ctx, uint64_t seq) {
+    ctx->synchronize_nextn(seq);
+}
+
+const float * llama_get_embeddings_nextn_seq(llama_context * ctx, uint64_t seq) {
+    return ctx->get_embeddings_nextn_seq(seq);
 }
 
 float * llama_get_embeddings_nextn(llama_context * ctx) {

@@ -7,6 +7,49 @@
 
 typedef void (*cpy_kernel_t)(const char * cx, char * cdst);
 
+// Contiguous same-type copies below this size run as a kernel instead of cudaMemcpyAsync. On ROCm a memcpy
+// node inside a HIP graph carries ~20 us of latency (blit engine + signaling) even for a few KB, and decode
+// graphs chain many of them (KV/state writes, cont) - ~60 such gaps per token were measured on gfx908.
+// A plain copy kernel is an ordinary ~4 us node. GGML_CUDA_CPY_MEMCPY_MIN=<bytes> overrides the threshold;
+// GGML_CUDA_CPY_NO_KERNEL=1 restores memcpy for everything (A/B).
+static size_t ggml_cuda_cpy_memcpy_min_bytes() {
+    static const size_t v = [] {
+        if (getenv("GGML_CUDA_CPY_NO_KERNEL") && atoi(getenv("GGML_CUDA_CPY_NO_KERNEL")) != 0) return (size_t) 0;
+        if (getenv("GGML_CUDA_CPY_MEMCPY_MIN")) return (size_t) atoll(getenv("GGML_CUDA_CPY_MEMCPY_MIN"));
+        return (size_t) 16*1024*1024;
+    }();
+    return v;
+}
+
+#define CUDA_CPY_BYTES_BLOCK_SIZE 256
+
+// raw byte copy: 16-byte chunks when both pointers are 16-byte aligned (thread 0 copies the <16 B tail), else bytes
+static __global__ void cpy_contiguous_bytes(const char * __restrict__ src, char * __restrict__ dst, const size_t n, const bool vec) {
+    const size_t i = (size_t) blockIdx.x * blockDim.x + threadIdx.x;
+    if (vec) {
+        const size_t nvec = n >> 4;
+        if (i < nvec) {
+            ((int4 *) dst)[i] = ((const int4 *) src)[i];
+        }
+        if (i == 0) {
+            for (size_t k = nvec << 4; k < n; ++k) {
+                dst[k] = src[k];
+            }
+        }
+    } else if (i < n) {
+        dst[i] = src[i];
+    }
+}
+
+static void ggml_cuda_cpy_contiguous_bytes(const char * src, char * dst, const size_t n, cudaStream_t stream) {
+    const bool vec = (((uintptr_t) src) % 16 == 0) && (((uintptr_t) dst) % 16 == 0);
+    const size_t work = vec ? (n >> 4) : n;
+    const int64_t num_blocks = (int64_t) ((work + CUDA_CPY_BYTES_BLOCK_SIZE - 1) / CUDA_CPY_BYTES_BLOCK_SIZE);
+    const ggml_cuda_kernel_launch_params launch_params =
+        ggml_cuda_kernel_launch_params((unsigned) (num_blocks > 0 ? num_blocks : 1), CUDA_CPY_BYTES_BLOCK_SIZE, 0, stream);
+    ggml_cuda_kernel_launch(cpy_contiguous_bytes, launch_params, src, dst, n, vec);
+}
+
 const int CUDA_CPY_TILE_DIM_2D = 32; // 2D tile dimension for transposed blocks
 const int CUDA_CPY_BLOCK_NM = 8;     // block size of 3rd dimension if available
 const int CUDA_CPY_BLOCK_ROWS = 8;   // block dimension for marching through rows
@@ -471,7 +514,12 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
         } else
 #endif // GGML_USE_MUSA && GGML_MUSA_MUDNN_COPY
         {
-            CUDA_CHECK(cudaMemcpyAsync(src1_ddc, src0_ddc, ggml_nbytes(src0), cudaMemcpyDeviceToDevice, main_stream));
+            const size_t nbytes = ggml_nbytes(src0);
+            if (nbytes < ggml_cuda_cpy_memcpy_min_bytes()) {
+                ggml_cuda_cpy_contiguous_bytes(src0_ddc, src1_ddc, nbytes, main_stream);
+            } else {
+                CUDA_CHECK(cudaMemcpyAsync(src1_ddc, src0_ddc, nbytes, cudaMemcpyDeviceToDevice, main_stream));
+            }
         }
     } else if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
         CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,

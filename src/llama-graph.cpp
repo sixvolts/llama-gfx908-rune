@@ -221,6 +221,11 @@ void llm_graph_input_out_ids::set_input(const llama_ubatch * ubatch) {
             data[n_outputs++] = i;
         }
     }
+
+    // a ubatch without outputs still gathers one (discarded) row so the graph topology stays constant
+    for (int i = n_outputs; i < this->n_outputs; ++i) {
+        data[i] = 0;
+    }
 }
 
 bool llm_graph_input_out_ids::can_reuse(const llm_graph_params & params) {

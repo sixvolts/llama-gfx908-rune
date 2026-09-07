@@ -4,6 +4,25 @@
 
 bool ggml_cuda_should_use_mmvq(enum ggml_type type, int cc, int64_t ne11);
 
+#include <memory>
+#include <vector>
+struct ggml_cuda_q8_cache_entry {
+    const ggml_tensor * t = nullptr;
+    const void * data = nullptr;
+    int64_t ne[4] = {0, 0, 0, 0};
+    size_t  nb[4] = {0, 0, 0, 0};
+    size_t  bytes = 0;
+    std::unique_ptr<ggml_cuda_pool_alloc<char>> buf;
+};
+struct ggml_cuda_q8_cache {
+    bool active = false;
+    std::vector<ggml_cuda_q8_cache_entry> entries;
+    size_t hits = 0, misses = 0;
+};
+ggml_cuda_q8_cache & ggml_cuda_q8_cache_get(int device);
+void ggml_cuda_q8_cache_begin(ggml_backend_cuda_context & ctx);   // call at the start of a graph evaluation
+void ggml_cuda_q8_cache_end(ggml_backend_cuda_context & ctx);     // releases the cached buffers
+
 // Returns the maximum batch size for which MMVQ should be used for MUL_MAT_ID,
 // based on the quantization type and GPU architecture (compute capability).
 int get_mmvq_mmid_max_batch(ggml_type type, int cc);

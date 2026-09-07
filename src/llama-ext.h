@@ -104,6 +104,14 @@ LLAMA_API void llama_set_nextn_layer_offset(struct llama_context * ctx, int32_t 
 // LLAMA_API float * llama_get_embeddings(struct llama_context * ctx);
 LLAMA_API float * llama_get_embeddings_nextn(struct llama_context * ctx);
 
+// Unmasked nextn rows are double-buffered per decode call. llama_nextn_seq() returns the sequence number of the
+// last decode that exported rows; llama_synchronize_nextn(seq) waits only for the backend that exported them
+// (the other devices keep running the next decode); llama_get_embeddings_nextn_seq(seq) reads that call's rows
+// without a scheduler-wide synchronize. Valid for the two most recent sequence numbers.
+LLAMA_API uint64_t      llama_nextn_seq(struct llama_context * ctx);
+LLAMA_API void          llama_synchronize_nextn(struct llama_context * ctx, uint64_t seq);
+LLAMA_API const float * llama_get_embeddings_nextn_seq(struct llama_context * ctx, uint64_t seq);
+
 // LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
 LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 

@@ -19,6 +19,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <execinfo.h>
 #include <algorithm>
 #include <unordered_map>
 #include <vector>
@@ -1677,6 +1678,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         // copy the input tensors to the split backend
+        //
+        // User inputs: the split backend must be done with its previous use of the input copies before they are
+        // overwritten. That is a per-backend condition, so wait once per split rather than once per input: with
+        // ~65 user inputs per token on a 4-GPU layer split, a sync + synchronous copy per input cost ~1.4 ms/token
+        // of host time while the split's GPU sat idle waiting to launch. Host-resident contiguous inputs then use
+        // the backend's stream-ordered set_tensor_async instead of the fully synchronous ggml_backend_tensor_copy;
+        // for pageable host memory the runtime has finished reading `input` when the call returns, so the user may
+        // still overwrite it afterwards. GGML_SCHED_SYNC_INPUTS=1 restores the original per-input path (A/B).
+        static const bool sync_inputs = getenv("GGML_SCHED_SYNC_INPUTS") != NULL && atoi(getenv("GGML_SCHED_SYNC_INPUTS")) != 0;
+        bool waited_for_split = false;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
@@ -1684,12 +1695,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
-                if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
-                    ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
-                } else {
-                    ggml_backend_synchronize(split_backend);
+                if (sync_inputs || !waited_for_split) {
+                    if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
+                        ggml_backend_event_synchronize(sched->events[split_backend_id][sched->cur_copy]);
+                    } else {
+                        ggml_backend_synchronize(split_backend);
+                    }
+                    waited_for_split = true;
                 }
-                ggml_backend_tensor_copy(input, input_cpy);
+                if (!sync_inputs && ggml_backend_buffer_is_host(input->buffer) && split_backend->iface.set_tensor_async != NULL &&
+                    ggml_is_contiguous(input) && ggml_is_contiguous(input_cpy)) {
+                    ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                } else {
+                    ggml_backend_tensor_copy(input, input_cpy);
+                }
             } else {
                 // wait for the split backend to finish using the input before overwriting it
                 if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -2034,6 +2053,18 @@ enum ggml_status ggml_backend_sched_graph_compute_async(ggml_backend_sched_t sch
 }
 
 void ggml_backend_sched_synchronize(ggml_backend_sched_t sched) {
+    // GGML_SCHED_SYNC_TRACE=N: print a backtrace on the N-th call (debugging per-ubatch synchronizes)
+    {
+        static int trace_n = -1; static int calls = 0;
+        if (trace_n < 0) { const char * e = getenv("GGML_SCHED_SYNC_TRACE"); trace_n = e ? atoi(e) : 0; }
+        if (trace_n > 0 && ++calls >= trace_n && calls < trace_n + 400) {
+            void * frames[8]; int nf = backtrace(frames, 8);
+            char ** syms = backtrace_symbols(frames, nf);
+            fprintf(stderr, "SYNCTRACE t=%.3f call #%d:", (double) ggml_time_us() / 1e6, calls);
+            for (int f = 1; f < nf && syms; ++f) { const char * q = strrchr(syms[f], '('); fprintf(stderr, " | %s", q ? q : syms[f]); }
+            fprintf(stderr, "\n"); free(syms);
+        }
+    }
     GGML_ASSERT(sched);
     for (int i = 0; i < sched->n_backends; i++) {
         ggml_backend_synchronize(sched->backends[i]);

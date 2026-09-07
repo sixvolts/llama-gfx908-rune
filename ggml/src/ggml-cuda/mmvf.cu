@@ -135,7 +135,39 @@ static __global__ void mul_mat_vec_f(
             }
         }
 
-        for (int col2 = tid; col2 < ncols2; col2 += block_size) {
+        // Unrolled main loop: MMVF_UNROLL independent float2 loads in flight per thread. The per-thread
+        // accumulation order (col2 = tid, tid+block_size, ...) is unchanged, so results are bit-identical;
+        // this only removes the one-load-latency-per-iteration serialization that made small-row matvecs
+        // (e.g. [10240 -> 4]) run at ~14 GB/s on gfx908.
+        constexpr int MMVF_UNROLL = 8;
+        int col2 = tid;
+        for (; col2 + (MMVF_UNROLL-1)*block_size < ncols2; col2 += MMVF_UNROLL*block_size) {
+            float2 tmpx[MMVF_UNROLL];
+            [[maybe_unused]] float2 tmpx_gate[MMVF_UNROLL];
+#pragma unroll
+            for (int u = 0; u < MMVF_UNROLL; ++u) {
+                tmpx[u] = x2[col2 + u*block_size];
+                if constexpr (has_fusion) {
+                    tmpx_gate[u] = use_gate ? gate_x2[col2 + u*block_size] : make_float2(0.0f, 0.0f);
+                }
+            }
+#pragma unroll
+            for (int u = 0; u < MMVF_UNROLL; ++u) {
+#pragma unroll
+                for (int j = 0; j < ncols_dst; ++j) {
+                    const float2 tmpy = y2[j*stride_col_y2 + col2 + u*block_size];
+                    ggml_cuda_mad(sumf[j], tmpx[u].x, tmpy.x);
+                    ggml_cuda_mad(sumf[j], tmpx[u].y, tmpy.y);
+                    if constexpr (has_fusion) {
+                        if (use_gate) {
+                            ggml_cuda_mad(sumf_gate[j], tmpx_gate[u].x, tmpy.x);
+                            ggml_cuda_mad(sumf_gate[j], tmpx_gate[u].y, tmpy.y);
+                        }
+                    }
+                }
+            }
+        }
+        for (; col2 < ncols2; col2 += block_size) {
             const float2 tmpx = x2[col2];
             float2 tmpx_gate = make_float2(0.0f, 0.0f);
             if constexpr (has_fusion) {
@@ -616,6 +648,20 @@ static void mul_mat_vec_f_cuda(
         const int64_t nsamples_dst, const int64_t stride_sample_x, const int64_t stride_sample_y, const int64_t stride_sample_dst,
         const int64_t ids_stride, enum ggml_prec prec, cudaStream_t stream) {
 
+    // More than 8 columns (CDNA1 keeps the vector kernel up to 16, see ggml_cuda_should_use_mmvf): run it in
+    // chunks of <= 8 columns. Each column's dot product is accumulated by the same thread partition and order
+    // regardless of the chunk, so the result is bit-identical per column.
+    if (!ids && ncols_dst > 8) {
+        for (int64_t c0 = 0; c0 < ncols_dst; c0 += 8) {
+            const int64_t nc = std::min<int64_t>(8, ncols_dst - c0);
+            mul_mat_vec_f_cuda<T>(x, y + c0*stride_col_y, ids, fusion, dst + c0*stride_col_dst, ncols, nrows, nc,
+                stride_row, stride_col_y, stride_col_dst, nchannels_x, nchannels_y, nchannels_dst,
+                stride_channel_x, stride_channel_y, stride_channel_dst, nsamples_x, nsamples_dst,
+                stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, prec, stream);
+        }
+        return;
+    }
+
     if constexpr(std::is_same_v<T, half>) {
         if (prec == GGML_PREC_DEFAULT) {
             mul_mat_vec_f_cuda_switch_ncols_dst<T, half>
@@ -817,10 +863,13 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 }
                 return ne11 <= 3;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
-                if (fp32_mma_hardware_available(cc)) {
+                // gfx908 (CDNA1): for ne11 in 4..8 the MFMA mmf path is far slower than the vector kernel and rows%64!=0
+                // shapes fall back to a single-workgroup rocBLAS SGEMM (measured on rune: 157 us for [10240->4] x 4 tokens),
+                // so keep the vector kernel up to 8 columns there.
+                if (fp32_mma_hardware_available(cc) && !GGML_CUDA_CC_IS_CDNA1(cc)) {
                     return ne11 <= 3;
                 }
-                return ne11 <= 8;
+                return GGML_CUDA_CC_IS_CDNA1(cc) ? ne11 <= 16 : ne11 <= 8;   // >8 columns run as chunks of 8
             }
             return ne11 <= 8;
         case GGML_TYPE_F16:
@@ -863,10 +912,10 @@ bool ggml_cuda_should_use_mmvf(enum ggml_type type, int cc, const int64_t * src0
                 }
                 return ne11 <= 8;
             } else if (GGML_CUDA_CC_IS_AMD(cc)) {
-                if (bf16_mma_hardware_available(cc)) {
+                if (bf16_mma_hardware_available(cc) && !GGML_CUDA_CC_IS_CDNA1(cc)) {   // see the F32 note above
                     return ne11 <= 3;
                 }
-                return ne11 <= 8;
+                return GGML_CUDA_CC_IS_CDNA1(cc) ? ne11 <= 16 : ne11 <= 8;
             }
             return ne11 <= 8;
         default:

@@ -141,6 +141,7 @@ struct common_speculative_impl {
     uint32_t n_seq;
     int32_t n_max; // maximum draft length after implementation-specific limits
 
+    uint64_t nextn_seq_hint = 0; // set by common_speculative_process_seq for the current process() call (0 = none)
     size_t n_call_begin  = 0; // number of times this implementation was called for refresh.
     size_t n_call_draft  = 0; // number of times this implementation was called for generation.
     size_t n_call_accept = 0; // number of times this implementation was called for accumulation.
@@ -1357,6 +1358,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // per-phase host timers for draft(): decode, sampling getters, hidden-row fetch (us) and decode count
+    int64_t t_dec_us = 0, t_smp_us = 0, t_emb_us = 0, t_all_us = 0; int64_t n_dec = 0;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq, params.draft.n_max)
         , params(params.draft)
@@ -1525,7 +1529,14 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             //                                                       ^--- this is a problem
             // TODO:this is generally true, but would be nice to assert it
             {
-                const float * h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+                const float * h_tgt = nullptr;
+                if (nextn_seq_hint != 0) {
+                    // rows of a specific target decode: wait for the exporting device only
+                    llama_synchronize_nextn(ctx_tgt, nextn_seq_hint);
+                    h_tgt = llama_get_embeddings_nextn_seq(ctx_tgt, nextn_seq_hint);
+                } else {
+                    h_tgt = llama_get_embeddings_nextn(ctx_tgt);
+                }
                 std::memcpy(batch.embd + (size_t) 1 * n_embd, h_tgt, row_bytes * (n_tokens-1));
             }
 
@@ -1583,10 +1594,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             verify_h_rows[seq_id] = n_rows;
             verify_h[seq_id].resize((size_t) n_rows * n_embd);
 
-            for (int32_t i = 0; i < n_rows; ++i) {
-                const float * h = llama_get_embeddings_nextn_ith(ctx_tgt, i_batch_beg[seq_id] + i);
-                std::memcpy(verify_h[seq_id].data() + (size_t) i * n_embd, h, row_bytes);
-            }
+            // the target exports unmasked nextn rows densely by batch position: one base pointer, one copy.
+            // llama_get_embeddings_nextn_ith synchronizes the whole scheduler on EVERY call (4 stream syncs
+            // per prompt token on a 4-GPU layer split: ~2.4 s of host waiting on a 4k prompt).
+            const float * h_base = nextn_seq_hint != 0 ? llama_get_embeddings_nextn_seq(ctx_tgt, nextn_seq_hint)
+                                                       : llama_get_embeddings_nextn(ctx_tgt);
+            GGML_ASSERT(h_base != nullptr);
+            std::memcpy(verify_h[seq_id].data(), h_base + (size_t) i_batch_beg[seq_id] * n_embd, row_bytes * n_rows);
 
             std::memcpy(pending_h[seq_id].data(),
                     verify_h[seq_id].data() + (size_t) (n_rows - 1) * n_embd, row_bytes);
@@ -1599,6 +1613,8 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         auto & ctx_dft = params.ctx_dft;
 
         common_batch_clear(batch);
+
+        struct t_guard { int64_t & acc; int64_t t0; ~t_guard() { acc += ggml_time_us() - t0; } } guard{t_all_us, ggml_time_us()};
 
         // keep track of which sequences are still drafting
         int n_drafting = 0;
@@ -1646,7 +1662,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 llama_set_nextn_layer_offset(ctx_dft, i);
             }
 
+            const int64_t t_d0 = ggml_time_us();
             int ret = llama_decode(ctx_dft, batch);
+            t_dec_us += ggml_time_us() - t_d0; n_dec++;
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 break;
@@ -1664,8 +1682,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 auto * smpl = smpls[seq_id].get();
 
+                const int64_t t_s0 = ggml_time_us();
                 common_sampler_sample(smpl, ctx_dft, i_last[seq_id], true);
+                const int64_t t_s1 = ggml_time_us();
                 const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, i_last[seq_id]);
+                t_smp_us += t_s1 - t_s0; t_emb_us += ggml_time_us() - t_s1;
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
@@ -2783,7 +2804,24 @@ bool common_speculative_process(common_speculative * spec, const llama_batch & b
     }
 
     for (auto & impl : spec->impls) {
+        impl->nextn_seq_hint = 0;
         result = result && impl->process(batch);
+    }
+
+    return result;
+}
+
+bool common_speculative_process_seq(common_speculative * spec, const llama_batch & batch, uint64_t nextn_seq) {
+    bool result = true;
+
+    if (spec == nullptr) {
+        return result;
+    }
+
+    for (auto & impl : spec->impls) {
+        impl->nextn_seq_hint = nextn_seq;
+        result = result && impl->process(batch);
+        impl->nextn_seq_hint = 0;
     }
 
     return result;
@@ -2948,6 +2986,17 @@ void common_speculative_print_stats(const common_speculative * spec) {
             oss << std::fixed << std::setprecision(3) << impl->t_draft_us / 1000.0 << ", ";
             oss << std::fixed << std::setprecision(3) << impl->t_accept_us / 1000.0;
             str_perf = ", dur(b,g,a) = " + oss.str() + " ms";
+            if (impl->type == COMMON_SPECULATIVE_TYPE_DRAFT_MTP) {
+                const auto * m = static_cast<const common_speculative_impl_draft_mtp *>(impl.get());
+                if (m->n_dec > 0) {
+                    std::ostringstream o2;
+                    o2 << std::fixed << std::setprecision(3)
+                       << " | mtp per draft-decode (n=" << m->n_dec << "): decode " << m->t_dec_us / 1000.0 / m->n_dec
+                       << " ms, sample " << m->t_smp_us / 1000.0 / m->n_dec << " ms, h_row " << m->t_emb_us / 1000.0 / m->n_dec
+                       << " ms, other " << (m->t_all_us - m->t_dec_us - m->t_smp_us - m->t_emb_us) / 1000.0 / m->n_dec << " ms";
+                    str_perf += o2.str();
+                }
+            }
         } else {
             str_perf = "";
         }

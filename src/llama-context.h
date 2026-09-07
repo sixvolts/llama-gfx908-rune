@@ -57,6 +57,15 @@ struct llama_context {
 
     void synchronize();
 
+    // nextn rows of decode call `seq` (the two most recent are valid): wait only for the exporting backend,
+    // then read without a scheduler-wide synchronize
+    uint64_t      get_nextn_seq() const { return nextn_seq; }
+    void          synchronize_nextn(uint64_t seq);
+
+    // async work (graph compute, output copies) issued since the last synchronize(); cleared by synchronize()
+    bool sched_dirty = false;
+    const float * get_embeddings_nextn_seq(uint64_t seq);
+
     const llama_model   & get_model()   const;
     const llama_cparams & get_cparams() const;
 
@@ -299,6 +308,15 @@ private:
     // populated only when cparams.embeddings_nextn is enabled and the model graph
     // sets llm_graph_result::t_h_nextn
     buffer_view<float> embd_nextn = {nullptr, 0};
+
+    // Unmasked nextn rows are double-buffered per decode call: a consumer (the MTP draft) can read the rows of the
+    // previous call while the next call is already in flight on the devices. nextn_seq counts decode calls that
+    // exported rows; nextn_events[seq % 2] is recorded on the exporting backend at the end of that call.
+    uint64_t             nextn_seq = 0;
+    ggml_backend_event_t nextn_events[2] = { nullptr, nullptr };
+    ggml_backend_t       nextn_event_backend = nullptr;
+
+    float * nextn_region(uint64_t seq) const;
 
     // host buffers for output layer input embeddings, per layer
     // populated when cparams.output_layer_inp[il] is true

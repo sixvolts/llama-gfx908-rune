@@ -1,3 +1,12 @@
+# llama-gfx908-rune
+
+llama.cpp (danielhanchen `qwen4exp/mtp` fork) tuned for AMD MI100 (gfx908) to serve Qwen3.8-Flash-Next:
+bit-exact HyperConnection fusions, batched-decode and pipelined-prefill fixes, and an MTP head that runs on a
+separate GPU with its prompt catch-up overlapped. Details, numbers, env knobs and the production launch:
+[docs/rune-gfx908.md](docs/rune-gfx908.md).
+
+---
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)

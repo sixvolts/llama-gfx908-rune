@@ -11,6 +11,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "../../src/llama-ext.h" // staging API: nextn sequence/event helpers (MTP catch-up overlap)
 #include "log.h"
 #include "sampling.h"
 #include "speculative.h"
@@ -894,6 +895,33 @@ private:
     common_context_seq_rm_type ctx_dft_seq_rm_type = COMMON_CONTEXT_SEQ_RM_TYPE_NO;
 
     common_speculative_ptr spec;
+
+    // Draft catch-up deferred by one prompt view: the draft's process() for view k runs after view k+1 has been
+    // issued to the target, waiting only for the exporting device, so the target keeps pipelining meanwhile.
+    struct {
+        bool        valid = false;
+        llama_batch view  = {};
+        uint64_t    seq   = 0;
+    } spec_pending;
+
+    void spec_run(const llama_batch & view, uint64_t seq) {
+        bool ok = true;
+        queue_tasks.yield_to_queue([&]() {
+            ok = common_speculative_process_seq(spec.get(), view, seq);
+        });
+        if (!ok) {
+            SRV_ERR("%s", "failed to process speculative batch\n");
+            // TODO: handle error
+            throw std::runtime_error("failed to process speculative batch");
+        }
+    }
+
+    void spec_flush() {
+        if (spec_pending.valid) {
+            spec_pending.valid = false;
+            spec_run(spec_pending.view, spec_pending.seq);
+        }
+    }
 
     bool add_bos_token = true;
 
@@ -2851,8 +2879,20 @@ private:
         llama_batch batch_view;
         int32_t off_next = 0;
         int32_t n_batch = llama_n_batch(ctx_tgt);
+        // with a draft attached, smaller prompt views let the draft's catch-up overlap the target's next view
+        // (the target pipeline is not drained between views); LLAMA_SPEC_PROMPT_CHUNK overrides (default 2048)
+        static const int32_t spec_chunk = getenv("LLAMA_SPEC_PROMPT_CHUNK") ? atoi(getenv("LLAMA_SPEC_PROMPT_CHUNK")) : 2048;
+        const int32_t n_view_max = (spec && spec_chunk > 0) ? std::min(n_batch, spec_chunk) : n_batch;
+        // only the last view's catch-up stays exposed (nothing left to overlap it with), so keep that view short
+        static const int32_t spec_tail = getenv("LLAMA_SPEC_PROMPT_TAIL") ? atoi(getenv("LLAMA_SPEC_PROMPT_TAIL")) : 0;   // measured: a short final view costs more than it hides (1198 vs 1279 t/s)
         for (int32_t off = 0; off < batch.size(); off = off_next) {
-            const int32_t n_tokens = std::min(n_batch, batch.size() - off);
+            int32_t n_tokens = std::min(n_view_max, batch.size() - off);
+            if (spec && spec_chunk > 0 && spec_tail > 0) {
+                const int32_t remaining = batch.size() - off;
+                if (remaining <= n_view_max && remaining > 2*spec_tail) {
+                    n_tokens = remaining - spec_tail;   // leaves a final view of spec_tail tokens
+                }
+            }
             try {
                 scoped_timer t(t_decode, n_decode);
                 // TODO @ngxson : maybe handle n_batch == 1 here instead of inside decode()
@@ -2881,6 +2921,9 @@ private:
 
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
+                if (off_next >= batch.size()) {
+                    spec_flush();                 // last view of this batch
+                }
                 post_decode(n_tokens, off, batch_view);
             } catch (const std::exception & e) {
                 SRV_ERR("post_decode() failed: %s\n", e.what());
@@ -3726,16 +3769,11 @@ private:
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
-            bool ok = true;
-            queue_tasks.yield_to_queue([&]() {
-                ok = common_speculative_process(spec.get(), batch_view);
-            });
-
-            if (!ok) {
-                SRV_ERR("%s", "failed to process speculative batch\n");
-
-                // TODO: handle error
-                throw std::runtime_error("failed to process speculative batch");
+            const uint64_t seq = llama_nextn_seq(ctx_tgt);
+            spec_flush();                         // previous view: waits for its export only, overlaps this decode
+            spec_pending = { true, batch_view, seq };
+            if (has_output) {
+                spec_flush();                     // outputs follow: the draft must be caught up before drafting
             }
         }
 
