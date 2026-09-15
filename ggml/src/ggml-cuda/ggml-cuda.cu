@@ -1411,6 +1411,14 @@ struct batched_mul_mat_traits<GGML_TYPE_F16> {
 
 template<ggml_type compute_type>
 static void ggml_cuda_mul_mat_cublas_impl(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    // Diagnostics: GGML_CUDA_DUMP_MM=1 logs every GEMM routed to cuBLAS/rocBLAS (type, K, M rows, N cols, batch).
+    {
+        static const bool dump = getenv("GGML_CUDA_DUMP_MM") != nullptr;
+        if (dump) {
+            fprintf(stderr, "[mm cublas] %s%s K=%lld M=%lld N=%lld ne02=%lld ne12=%lld src0=%s\n", ggml_type_name(src0->type), ggml_is_quantized(src0->type) ? "->f16" : "",
+                (long long) src0->ne[0], (long long) src0->ne[1], (long long) src1->ne[1], (long long) src0->ne[2], (long long) src1->ne[2], src0->name);
+        }
+    }
     using traits = batched_mul_mat_traits<compute_type>;
     using cuda_t = typename traits::cuda_type;
 
@@ -1857,6 +1865,17 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
         return;
     }
+    // gfx908: thin F32 projections (M <= GGML_MMVF_SMALL_M rows, default 64) at prefill go through the F32 vector kernel
+    // with swapped roles instead of rocBLAS SGEMM (0.3 TFLOPS for M=4/48 at N=512). 0 disables.
+    {
+        static const int64_t small_m = [] { const char * e = getenv("GGML_MMVF_SMALL_M"); return e ? atoll(e) : 64; }();
+        if (small_m > 0 && GGML_CUDA_CC_IS_CDNA1(cc) && src0->type == GGML_TYPE_F32 && ne01 <= small_m && ne01 > 1
+                && ne11 > MMVF_MAX_BATCH_SIZE && ne2 == 1 && ne3 == 1 && ne00 % 64 == 0
+                && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+            ggml_cuda_mul_mat_vec_f_small_m(ctx, src0, src1, dst);
+            return;
+        }
+    }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
@@ -1868,6 +1887,18 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
+    }
+    // gfx908: rocBLAS/Tensile picks a 64x32 macro-tile for the tall Q8_0 projections at prefill (K=2560, M>=6144,
+    // N=512: ~28 TFLOPS) while MMQ (int8 MFMA) runs them 1.5x faster; small-K and small-M shapes stay on rocBLAS
+    // (measured). Numerics: MMQ quantizes the activations to Q8_1 blocks (as the decode mmvq path already does).
+    // GGML_MMQ_DENSE_MIN_M=<rows> sets the threshold (0 disables).
+    {
+        static const int64_t min_m = [] { const char * e = getenv("GGML_MMQ_DENSE_MIN_M"); return e ? atoll(e) : 6144; }();
+        if (min_m > 0 && GGML_CUDA_CC_IS_CDNA1(cc) && src0->type == GGML_TYPE_Q8_0 && ne11 > 128 && ne01 >= min_m
+                && ne00 % 256 == 0 && ne02 == 1 && ne03 == 1 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+            ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+            return;
+        }
     }
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }

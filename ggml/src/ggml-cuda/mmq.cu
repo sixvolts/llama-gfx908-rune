@@ -3,7 +3,10 @@
 #include "quantize.cuh"
 #include "mmid.cuh"
 
+#include <algorithm>
+#include <vector>
 #include <cstdint>
+#include <cstdlib>
 
 static void ggml_cuda_mul_mat_q_switch_type(ggml_backend_cuda_context & ctx, const mmq_args & args, cudaStream_t stream) {
     switch (args.type_x) {
@@ -171,7 +174,7 @@ void ggml_cuda_mul_mat_q(
             ne00, ne01, ne1, s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ne1};
+            ne1, 0};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
@@ -202,6 +205,29 @@ void ggml_cuda_mul_mat_q(
         CUDA_CHECK(cudaGetLastError());
     }
 
+    // Diagnostics: GGML_MMQ_DUMP_IDS=1 prints the rows-per-expert histogram of this call (host sync; not for production).
+    {
+        static const bool dump = getenv("GGML_MMQ_DUMP_IDS") != nullptr;
+        static int ncall = 0;
+        if (dump && (ncall++ % 96) == 0) {
+            std::vector<int32_t> eb(ne02 + 1);
+            CUDA_CHECK(cudaMemcpyAsync(eb.data(), expert_bounds.get(), eb.size()*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            std::vector<int> rows(ne02);
+            for (int64_t e = 0; e < ne02; ++e) { rows[e] = eb[e+1] - eb[e]; }
+            std::sort(rows.begin(), rows.end());
+            int hist[8] = {0}; // 0, 1-16, 17-32, 33-48, 49-64, 65-128, 129-256, >256
+            int64_t tiles = 0, full16 = 0, rows_tot = 0;
+            for (int r : rows) {
+                rows_tot += r;
+                int b = r == 0 ? 0 : r <= 16 ? 1 : r <= 32 ? 2 : r <= 48 ? 3 : r <= 64 ? 4 : r <= 128 ? 5 : r <= 256 ? 6 : 7; hist[b]++;
+                tiles += (r + 63) / 64; full16 += (r + 15) / 16;
+            }
+            fprintf(stderr, "[mmq ids] tokens=%lld used=%lld experts=%lld rows: max=%d p50=%d p90=%d | experts with rows 0:%d 1-16:%d 17-32:%d 33-48:%d 49-64:%d 65-128:%d 129-256:%d >256:%d | 64-wide tiles=%lld, 16-col steps=%lld (of %lld if all tiles full)\n",
+                (long long) ne12, (long long) n_expert_used, (long long) ne02, rows[ne02-1], rows[ne02/2], rows[(ne02*9)/10],
+                hist[0],hist[1],hist[2],hist[3],hist[4],hist[5],hist[6],hist[7], (long long) tiles, (long long) full16, (long long) tiles*4);
+        }
+    }
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
         ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
@@ -244,6 +270,18 @@ void ggml_cuda_mul_mat_q(
                                          ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
     const int64_t s13 = ne12*s12;
 
+    // Expected rows per expert = tokens * experts_used / n_experts; give the J selection 2x that (skew headroom),
+    // rounded up to a multiple of 8, never below 8 and never above the token count. Env GGML_MMQ_MOE_J_MULT overrides
+    // the multiplier (0 = old behaviour: J from the total token count).
+    int64_t ncols_hint = 0;
+    {
+        static const int64_t mult = [] { const char * e = getenv("GGML_MMQ_MOE_J_MULT"); return e ? atoll(e) : 0; }();   // default OFF: on the real model (skewed routing) small J costs x-tile re-reads (pp2048 1563 -> 1450)
+        if (mult > 0) {
+            const int64_t rows_mean = (ne12*n_expert_used + ne02 - 1) / ne02;
+            ncols_hint = std::min<int64_t>(ne12, std::max<int64_t>(8, GGML_PAD(mult*rows_mean, 8)));
+        }
+    }
+
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
     const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
@@ -251,7 +289,7 @@ void ggml_cuda_mul_mat_q(
         ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12};
+        ne12, ncols_hint};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }

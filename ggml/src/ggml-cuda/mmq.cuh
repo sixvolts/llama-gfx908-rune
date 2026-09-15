@@ -2,6 +2,8 @@
 
 #include "common.cuh"
 
+#include <type_traits>
+
 #include <climits>
 #include <cstdint>
 
@@ -11,7 +13,9 @@
 #define MMQ_NWARPS               8
 
 typedef void (*ggml_cuda_mmq_load_tiles_t)(const char * __restrict__ x, int * x_tile, const int kbx0, const int i_max, const int stride);
-typedef void (*ggml_cuda_mmq_vec_dot_t)(const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00);
+// j_lim: number of valid y columns in this tile (<= J). MMA variants stop their column loop there; columns beyond
+// j_lim are never written back, so skipping them is bit-exact (gfx908 MoE: ~10 valid rows in a J=128 tile).
+typedef void (*ggml_cuda_mmq_vec_dot_t)(const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_lim);
 typedef void (*ggml_cuda_mmq_write_back_t)(const float * __restrict__ sum, const int32_t * __restrict__ get_rows_to_sorted,
     float * __restrict__ dst, const float * __restrict__ y_scale, const int stride, const int i_max, const int j_max);
 
@@ -882,8 +886,9 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
     constexpr ggml_cuda_mmq_write_back_t write_back = ggml_cuda_mmq_get_write_back<type, J, fallback>();
 
     extern __shared__ int data_mul_mat_q[];
-    int * tile_y = data_mul_mat_q + J;
-    int * tile_x = tile_y + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
+    int * tile_y  = data_mul_mat_q + J;
+    int * tile_y2 = tile_y  + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size); // second K half of the same iteration
+    int * tile_x  = tile_y2 + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
     // FP4 tile stores 8 blocks
@@ -897,42 +902,99 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     float sum[J*I / (nwarps*warp_size)] = {0.0f};
 
+    // Valid y columns in this tile; the MMA vec_dot variants stop their column loop there (bit-exact: the
+    // skipped columns are never written back).
+    const int j_lim = min(J, tile_y_max_j + 1);
+
     constexpr int sz = sizeof(block_q8_1_mmq) / sizeof(int);
 
+    if constexpr (mmq_x_prefetch<type, J, fallback>::available) {
+        // Software-pipelined K loop: the NEXT step's x and y tiles are loaded into registers right after the
+        // barrier and before this step's vec_dot, so their global round trip overlaps the matrix ops.
+        // LDS contents per step are identical to the plain loop below (bit-exact).
+        // The y tile is fetched in NYC chunks of nwarps*warp_size ints; NYC is chosen ONCE per tile from the valid
+        // row count (rows beyond GGML_PAD(j_lim, 16) are never read by vec_dot) and dispatched to a fixed-size
+        // variant, because per-load branches serialize issue (measured -10%) while a fixed trip count does not.
+        using XP = mmq_x_prefetch<type, J, fallback>;
+        constexpr int NY = GGML_PAD(J * MMQ_TILE_Y_K, nwarps * warp_size) / (nwarps * warp_size);
+        const int tid = threadIdx.y*warp_size + threadIdx.x;
+        auto kloop = [&](auto nyc_) {
+            constexpr int NYC = decltype(nyc_)::value;
+            typename XP::regs xr;
+            int y0r[NYC];
+            int y1r[NYC];
+            auto load_y = [&](const int kb0) {
+                const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+                const int * by1 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
+#pragma unroll
+                for (int n = 0; n < NYC; ++n) {
+                    y0r[n] = by0[n*nwarps*warp_size + tid];
+                    y1r[n] = by1[n*nwarps*warp_size + tid];
+                }
+            };
+            int kb0 = kb0_start;
+            if (kb0 < kb0_stop) {
+                XP::load(xr, x, offset_x + kb0, tile_x_max_i, stride_row_x);
+                load_y(kb0);
+            }
+            for (; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+                XP::store(xr, tile_x, tile_x_max_i);
+#pragma unroll
+                for (int n = 0; n < NYC; ++n) {
+                    tile_y [n*nwarps*warp_size + tid] = y0r[n];
+                    tile_y2[n*nwarps*warp_size + tid] = y1r[n];
+                }
+
+                __syncthreads();
+
+                const int kb0_next = kb0 + blocks_per_iter;
+                if (kb0_next < kb0_stop) {
+                    XP::load(xr, x, offset_x + kb0_next, tile_x_max_i, stride_row_x);
+                    load_y(kb0_next);
+                }
+#ifdef GGML_USE_HIP
+                __builtin_amdgcn_sched_barrier(0); // keep the prefetch loads ahead of the MFMAs
+#endif // GGML_USE_HIP
+
+                vec_dot(tile_x, tile_y,  sum, 0,             j_lim);
+                vec_dot(tile_x, tile_y2, sum, MMQ_TILE_NE_K, j_lim);
+
+                __syncthreads();
+            }
+        };
+        const int ny = min(NY, (GGML_PAD(j_lim, 16)*MMQ_TILE_Y_K + nwarps*warp_size - 1) / (nwarps*warp_size));
+        if (ny <= 2) {
+            kloop(std::integral_constant<int, (NY < 2 ? NY : 2)>{});
+        } else if (ny <= 3) {
+            kloop(std::integral_constant<int, (NY < 3 ? NY : 3)>{});
+        } else {
+            kloop(std::integral_constant<int, NY>{});
+        }
+    } else {
     for (int kb0 = kb0_start; kb0 < kb0_stop; kb0 += blocks_per_iter) {
         load_tiles(x, tile_x, offset_x + kb0, tile_x_max_i, stride_row_x);
         {
+            // both K halves of this iteration are fetched together so the second half's global round trip
+            // is not exposed between the two vec_dot calls (gfx908: the K loop is global-latency bound)
             const int * by0 = y + ncols_y * (kb0 * qk / ne_block) * sz;
+            const int * by1 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
 #pragma unroll
             for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
                 int l = l0 + threadIdx.y*warp_size + threadIdx.x;
 
-                tile_y[l] = by0[l];
+                tile_y[l]  = by0[l];
+                tile_y2[l] = by1[l];
             }
         }
 
         __syncthreads();
 
-        vec_dot(tile_x, tile_y, sum, 0);
-
-        __syncthreads();
-
-        {
-            const int * by0 = y + ncols_y * ((kb0 * qk / ne_block) * sz + sz);
-#pragma unroll
-            for (int l0 = 0; l0 < J * MMQ_TILE_Y_K; l0 += nwarps * warp_size) {
-                int l = l0 + threadIdx.y*warp_size + threadIdx.x;
-
-                tile_y[l] = by0[l];
-            }
-        }
-
-        __syncthreads();
-
-        vec_dot(tile_x, tile_y, sum, MMQ_TILE_NE_K);
+        vec_dot(tile_x, tile_y,  sum, 0,             j_lim);
+        vec_dot(tile_x, tile_y2, sum, MMQ_TILE_NE_K, j_lim);
 
         __syncthreads();
     }
+    } // prefetch available
 
     if (fixup) {
         write_back(sum, ids_dst, tmp_fixup + blockIdx.x*(J*I), y_scale, I, I, J);
@@ -1376,13 +1438,17 @@ struct mmq_args {
     int64_t nchannels_x; int64_t nchannels_y; int64_t stride_channel_x; int64_t stride_channel_y; int64_t stride_channel_dst;
     int64_t nsamples_x; int64_t nsamples_y; int64_t stride_sample_x; int64_t stride_sample_y; int64_t stride_sample_dst;
     int64_t ncols_max;
+    // MoE (ids_dst != nullptr): expected rows per expert, used to pick the J tile width. ncols_max stays the
+    // hard upper bound (ntx tiles) so an expert with more rows than the hint is still fully covered.
+    int64_t ncols_hint;
 };
 
 static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const int cc) {
     const size_t nbs_ids = config.J*sizeof(int);
     const size_t nbs_x = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);
     const size_t nbs_y = config.J * (sizeof(block_q8_1_mmq));
-    return nbs_ids + nbs_x + GGML_PAD(nbs_y, config.nthreads*sizeof(int));
+    // two y buffers: both K halves of an iteration are loaded together (one exposed global round trip per K step)
+    return nbs_ids + nbs_x + 2*GGML_PAD(nbs_y, config.nthreads*sizeof(int));
 }
 
 template <ggml_type type, int J, bool fallback>
@@ -1476,6 +1542,10 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
     int J_best        = 0;
     int ntiles_J_best = INT_MAX;
 
+    // For MoE the y tile is per expert: size J from the expected rows per expert (ncols_hint) rather than the
+    // total token count, otherwise every expert runs a J=128 tile that is mostly padding (gfx908: ~12x wasted MFMA).
+    const int64_t ncols_for_J = (args.ids_dst != nullptr && args.ncols_hint > 0) ? args.ncols_hint : args.ncols_max;
+
     for (int J = 8; J <= 128 && ntiles_J_best > 1; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
         if (config.type == GGML_TYPE_COUNT) {
@@ -1486,7 +1556,7 @@ void mul_mat_q_switch_J(ggml_backend_cuda_context & ctx, const mmq_args & args, 
             continue;
         }
 
-        const int ntiles_x = (args.ncols_max + config.J - 1) / config.J;
+        const int ntiles_x = (ncols_for_J + config.J - 1) / config.J;
 
         if (ntiles_x < ntiles_J_best) {
             J_best = J;
