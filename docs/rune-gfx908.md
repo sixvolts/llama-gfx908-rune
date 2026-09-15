@@ -68,3 +68,36 @@ this model (perplexity-checked at 8k chunks).
 ## Diagnostics added
 `GGML_GALLOC_DEBUG=1` (allocator reallocation reasons, stderr), `GGML_SCHED_SYNC_TRACE=N` (backtraces of
 scheduler synchronizes), `COMMON_SAMPLER_TRACE=1` (sampler phase times), `GGML_SCHED_DEBUG_REALLOC` (upstream).
+
+## 2026-09-15: prefill campaign (5th production build)
+
+Ground truth came from a `rocprofv3` kernel trace of 512-token prefill ubatches: the MoE expert GEMM (`mul_mat_q` with ids) was
+49% of kernel time, dense projections through rocBLAS 23%, the gated delta-net recurrence 13%. Hardware counters ruled out LDS
+bank conflicts; the MoE kernel was bound by exposed global-load round trips (one block per CU, load -> barrier -> MFMA -> barrier).
+
+Bit-exact (verified byte-identical against the previous production library with `golden/mmq_ab`):
+- `mmq.cuh`: both K halves of the activation tile are loaded together (second LDS buffer, two fewer barriers per K step).
+- `mmq-load-tiles.cuh`: `mmq_x_prefetch<Q4_K|Q5_1|Q8_0>` split the tile loaders into register load / LDS store halves so the
+  next K step's weights and activations are fetched during the current step's MFMAs (`__builtin_amdgcn_sched_barrier`).
+- `mmq-vec-dot.cuh`: the MFMA column loop is dispatched once per tile to 1/2/4/full straight-line variants sized by the tile's
+  valid rows (`j_lim`); a runtime bound or an early break inside the loop spills the accumulators and is slower.
+- `mmid.cu`: the ids helper scans each expert's tokens with 8 warps over in-order slices (same output order).
+Result: MoE GEMM 3914 -> 2908 ms, ids helper 174 -> 56 ms per 2x2048-token trace.
+
+Tolerance-only (gated by KL divergence against saved reference logits, `llama-perplexity --kl-divergence`; the previous build
+is itself non-deterministic at prefill with max KL 0.18 run-to-run, the new build lands at max KL 0.17 against it and is
+deterministic run-to-run):
+- `gated_delta_net.cu`: `gated_delta_net_lpc_cuda` for batches of >= 8 tokens: 16 lanes per state column, 4-step DPP sums
+  (`__builtin_amdgcn_update_dpp`), one wave per block, per-lane float4 k/q register ring 8 tokens ahead, `__launch_bounds__(64, 1)`
+  (at 2 waves/SIMD the ring spills to AGPRs and every spill of a pending load forces a `vmcnt(0)` drain). GDN 1026 -> 452 ms.
+  `GGML_GDN_LPC=0` disables, `=2` forces for all batch sizes.
+- `ggml-cuda.cu`: gfx908 dense Q8_0 GEMMs with >= 6144 rows and > 128 columns run on MMQ instead of rocBLAS (Tensile picks a
+  64x32 macro-tile at ~28 TFLOPS; MMQ is 1.4-1.5x faster). `GGML_MMQ_DENSE_MIN_M=0` disables.
+- `mmvf.cu`: thin F32 projections (M <= 64) run through the F32 vector kernel with swapped roles (each activation column is a
+  channel, the M weight rows are broadcast vector columns). `GGML_MMVF_SMALL_M=0` disables.
+
+Measured on the production layout (Hive A + head on the orphan, 6 x 128k, `-b 8192`): pp8192 2052 -> 2704 t/s, server 5.5k
+prompt 1438 -> 1716 t/s, decode unchanged (60 t/s chat with MTP, 45 t/s without). Dead ends: sizing the MoE J tile from the
+mean rows per expert (routing is heavily skewed; -8%), I=64/occupancy-2 tiles (-19%), per-load branches to skip unused
+activation rows (-10%), forcing all dense GEMMs onto MMQ (-3%), prefetching inputs in the warp-per-column GDN kernel (issue-bound).
+Diagnostics: `GGML_MMQ_DUMP_IDS=1` (rows-per-expert histogram), `GGML_CUDA_DUMP_MM=1` (shapes routed to rocBLAS).

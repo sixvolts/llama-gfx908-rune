@@ -8,7 +8,8 @@ using namespace ggml_cuda_mma;
 #include "mmq.cuh"
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q4_0_q8_1_dp4a(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_lim) {
+    GGML_UNUSED(j_lim);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
@@ -58,7 +59,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q4_1_q8_1_dp4a(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_lim) {
+    GGML_UNUSED(j_lim);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
@@ -108,7 +110,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_dp4a(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_lim) {
+    GGML_UNUSED(j_lim);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
@@ -139,8 +142,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
-template <ggml_type type, int J, bool fallback, mmq_q8_1_ds_layout ds_layout>
-static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
+template <ggml_type type, int J, bool fallback, mmq_q8_1_ds_layout ds_layout, int NJ>
+static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma_impl(
     const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     constexpr data_layout input_layout = get_input_data_layout();
@@ -151,6 +154,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
     constexpr int sram_stride   = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
     constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
     constexpr int ntx           = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
+    constexpr int J_EFF = (NJ*ntx*tile_C::J < J) ? NJ*ntx*tile_C::J : J; // columns actually computed (NJ column steps)
 
     y += (threadIdx.y % ntx) * (tile_C::J*MMQ_TILE_Y_K);
 
@@ -172,7 +176,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
         }
 
 #pragma unroll
-        for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+        for (int j0 = 0; j0 < J_EFF; j0 += ntx*tile_C::J) {
             tile_B B;
             load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
 
@@ -206,6 +210,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
     constexpr int sram_stride   = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
     constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
     constexpr int ntx           = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
+    constexpr int J_EFF = (NJ*ntx*tile_C::J < J) ? NJ*ntx*tile_C::J : J; // columns actually computed (NJ column steps)
 
     y += (threadIdx.y % ntx) * (tile_C::J*MMQ_TILE_Y_K);
 
@@ -243,7 +248,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
     }
 
 #pragma unroll
-    for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+    for (int j0 = 0; j0 < J_EFF; j0 += ntx*tile_C::J) {
 #pragma unroll
         for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_0) {
             tile_B B;
@@ -276,10 +281,34 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
     }
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 }
+// Dispatcher: pick a fully unrolled straight-line variant for the number of valid column steps (j_lim). A runtime
+// loop bound or an early break splits the MFMA/LDS-read sequence into basic blocks and costs more than it saves.
+template <ggml_type type, int J, bool fallback, mmq_q8_1_ds_layout ds_layout>
+static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma(
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_lim) {
+#if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    constexpr int step = (ggml_cuda_mmq_get_rows_per_warp(type, J, fallback)/16) * 16; // ntx*tile_C::J (16x16 tiles)
+    const int nj = (j_lim + step - 1) / step;
+    if (nj <= 1) {
+        ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma_impl<type, J, fallback, ds_layout, 1>(x, y, sum, k00);
+    } else if (nj <= 2) {
+        ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma_impl<type, J, fallback, ds_layout, 2>(x, y, sum, k00);
+    } else if (nj <= 4) {
+        ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma_impl<type, J, fallback, ds_layout, 4>(x, y, sum, k00);
+    } else {
+        ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma_impl<type, J, fallback, ds_layout, 1024>(x, y, sum, k00);
+    }
+#else
+    GGML_UNUSED(j_lim);
+    ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma_impl<type, J, fallback, ds_layout, 1024>(x, y, sum, k00);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+}
+
 
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_1_q8_1_dp4a(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_lim) {
+    GGML_UNUSED(j_lim);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
@@ -310,7 +339,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
-template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma(
+template <ggml_type type, int J, bool fallback, int NJ> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma_impl(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     constexpr data_layout input_layout = get_input_data_layout();
@@ -321,6 +350,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr int sram_stride   = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
     constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
     constexpr int ntx           = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
+    constexpr int J_EFF = (NJ*ntx*tile_C::J < J) ? NJ*ntx*tile_C::J : J; // columns actually computed (NJ column steps)
 
     y += (threadIdx.y % ntx) * (tile_C::J*MMQ_TILE_Y_K);
 
@@ -341,7 +371,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         }
 
 #pragma unroll
-        for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+        for (int j0 = 0; j0 < J_EFF; j0 += ntx*tile_C::J) {
             tile_B B;
             load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
 
@@ -371,6 +401,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr int sram_stride   = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
     constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
     constexpr int ntx           = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
+    constexpr int J_EFF = (NJ*ntx*tile_C::J < J) ? NJ*ntx*tile_C::J : J; // columns actually computed (NJ column steps)
 
     y += (threadIdx.y % ntx) * (tile_C::J*MMQ_TILE_Y_K);
 
@@ -407,7 +438,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 
 #pragma unroll
-    for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+    for (int j0 = 0; j0 < J_EFF; j0 += ntx*tile_C::J) {
 #pragma unroll
         for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) {
             tile_B   B;
@@ -437,10 +468,34 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 #endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
 }
+// Dispatcher: pick a fully unrolled straight-line variant for the number of valid column steps (j_lim). A runtime
+// loop bound or an early break splits the MFMA/LDS-read sequence into basic blocks and costs more than it saves.
+template <ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma(
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_lim) {
+#if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    constexpr int step = (ggml_cuda_mmq_get_rows_per_warp(type, J, fallback)/16) * 16; // ntx*tile_C::J (16x16 tiles)
+    const int nj = (j_lim + step - 1) / step;
+    if (nj <= 1) {
+        ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma_impl<type, J, fallback, 1>(x, y, sum, k00);
+    } else if (nj <= 2) {
+        ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma_impl<type, J, fallback, 2>(x, y, sum, k00);
+    } else if (nj <= 4) {
+        ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma_impl<type, J, fallback, 4>(x, y, sum, k00);
+    } else {
+        ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma_impl<type, J, fallback, 1024>(x, y, sum, k00);
+    }
+#else
+    GGML_UNUSED(j_lim);
+    ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma_impl<type, J, fallback, 1024>(x, y, sum, k00);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+}
+
 
 // Used for NVFP4, Q3_K, IQ2_S, and IQ2_XS
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_dp4a(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_lim) {
+    GGML_UNUSED(j_lim);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
@@ -474,7 +529,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 }
 
 // Used for Q3_K, IQ2_S, and IQ2_XS:
-template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma(
+template <ggml_type type, int J, bool fallback, int NJ> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma_impl(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     constexpr data_layout input_layout = get_input_data_layout();
@@ -485,6 +540,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr int sram_stride   = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
     constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
     constexpr int ntx           = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
+    constexpr int J_EFF = (NJ*ntx*tile_C::J < J) ? NJ*ntx*tile_C::J : J; // columns actually computed (NJ column steps)
 
     y += (threadIdx.y % ntx) * (tile_C::J*MMQ_TILE_Y_K);
 
@@ -505,7 +561,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         }
 
 #pragma unroll
-        for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+        for (int j0 = 0; j0 < J_EFF; j0 += ntx*tile_C::J) {
             tile_B B;
             load_ldmatrix(B, y_qs + j0*MMQ_TILE_Y_K + k01, MMQ_TILE_Y_K);
 
@@ -535,6 +591,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr int sram_stride   = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
     constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
     constexpr int ntx           = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
+    constexpr int J_EFF = (NJ*ntx*tile_C::J < J) ? NJ*ntx*tile_C::J : J; // columns actually computed (NJ column steps)
 
     y += (threadIdx.y % ntx) * (tile_C::J*MMQ_TILE_Y_K);
 
@@ -571,7 +628,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 
 #pragma unroll
-    for (int j0 = 0; j0 < J; j0 += ntx*tile_C::J) {
+    for (int j0 = 0; j0 < J_EFF; j0 += ntx*tile_C::J) {
 #pragma unroll
         for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QR3_K*VDR_Q3_K_Q8_1_MMQ) {
             tile_B B[2];
@@ -606,9 +663,33 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     NO_DEVICE_CODE;
 #endif // AMD_MFMA_AVAILABLE || AMD_WMMA_AVAILABLE
 }
+// Dispatcher: pick a fully unrolled straight-line variant for the number of valid column steps (j_lim). A runtime
+// loop bound or an early break splits the MFMA/LDS-read sequence into basic blocks and costs more than it saves.
+template <ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma(
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_lim) {
+#if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+    constexpr int step = (ggml_cuda_mmq_get_rows_per_warp(type, J, fallback)/16) * 16; // ntx*tile_C::J (16x16 tiles)
+    const int nj = (j_lim + step - 1) / step;
+    if (nj <= 1) {
+        ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma_impl<type, J, fallback, 1>(x, y, sum, k00);
+    } else if (nj <= 2) {
+        ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma_impl<type, J, fallback, 2>(x, y, sum, k00);
+    } else if (nj <= 4) {
+        ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma_impl<type, J, fallback, 4>(x, y, sum, k00);
+    } else {
+        ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma_impl<type, J, fallback, 1024>(x, y, sum, k00);
+    }
+#else
+    GGML_UNUSED(j_lim);
+    ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma_impl<type, J, fallback, 1024>(x, y, sum, k00);
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+}
+
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q2_K_q8_1_dp4a(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_lim) {
+    GGML_UNUSED(j_lim);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
@@ -673,7 +754,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q2_K_q8_1_mma(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_lim) {
+    GGML_UNUSED(j_lim);
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     constexpr data_layout input_layout = get_input_data_layout();
     typedef tile<16,  4, int, input_layout>        tile_A;
@@ -868,7 +950,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q3_K_q8_1_dp4a(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_lim) {
+    GGML_UNUSED(j_lim);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
@@ -903,7 +986,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q4_K_q8_1_dp4a(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_lim) {
+    GGML_UNUSED(j_lim);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
@@ -938,7 +1022,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q5_K_q8_1_dp4a(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_lim) {
+    GGML_UNUSED(j_lim);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
@@ -973,7 +1058,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q6_K_q8_1_dp4a(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_lim) {
+    GGML_UNUSED(j_lim);
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
@@ -1008,7 +1094,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 }
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q6_K_q8_1_mma(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_lim) {
+    GGML_UNUSED(j_lim);
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
     constexpr data_layout input_layout = get_input_data_layout();
     typedef tile<16,  4, int, input_layout>        tile_A;
@@ -1174,7 +1261,8 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 // m16n8k64 MMA call; only the PTX kind (scale_vec::2X ue8m0 vs scale_vec::4X ue4m3)
 // and the per-type stride constant differ.
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_fp4_fp4_mma(
-        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
+        const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00, const int j_lim) {
+    GGML_UNUSED(j_lim);
 
     typedef tile<16, 8, int>   tile_A;
     typedef tile<8,  8, int>   tile_B;

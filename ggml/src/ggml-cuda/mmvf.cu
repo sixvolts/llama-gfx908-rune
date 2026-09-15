@@ -677,6 +677,34 @@ static void mul_mat_vec_f_cuda(
         stride_channel_dst, nsamples_x, nsamples_dst, stride_sample_x, stride_sample_y, stride_sample_dst, ids_stride, stream);
 }
 
+// Thin F32 projections at prefill (gfx908): M <= 64 weight rows against N >> 16 activation columns. rocBLAS SGEMM runs
+// these at ~0.3 TFLOPS (M=4 inject, M=48 alpha/beta). Swap the roles: every activation column is one "channel" of a
+// single-row matrix and the M weight rows are the (broadcast, stride 0) vector columns, so dst[n*M + m] lands in the
+// right place via stride_channel_dst = M. Numerics: mmvf's per-column accumulation order (same as decode), not rocBLAS.
+void ggml_cuda_mul_mat_vec_f_small_m(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
+    GGML_ASSERT(src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32 && dst->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst));
+    const int64_t K = src0->ne[0], M = src0->ne[1], N = src1->ne[1];
+    const int64_t s01 = src0->nb[1] / sizeof(float); // weight row stride
+    const int64_t s11 = src1->nb[1] / sizeof(float); // activation column stride
+    const int64_t s1  = dst->nb[1]  / sizeof(float); // == M
+    const float * w = (const float *) src0->data;
+    const float * x = (const float *) src1->data;
+    float       * d = (float *) dst->data;
+    ggml_cuda_mm_fusion_args_device fusion{};
+    cudaStream_t stream = ctx.stream();
+    for (int64_t m0 = 0; m0 < M; m0 += 16) {
+        const int64_t nm = std::min<int64_t>(16, M - m0);
+        mul_mat_vec_f_cuda<float>(x, w + m0*s01, nullptr, fusion, d + m0,
+            /*ncols=*/K, /*nrows=*/1, /*ncols_dst=*/nm,
+            /*stride_row=*/s11, /*stride_col_y=*/s01, /*stride_col_dst=*/1,
+            /*nchannels_x=*/N, /*nchannels_y=*/1, /*nchannels_dst=*/N,
+            /*stride_channel_x=*/s11, /*stride_channel_y=*/0, /*stride_channel_dst=*/s1,
+            /*nsamples_x=*/1, /*nsamples_dst=*/1, /*stride_sample_x=*/0, /*stride_sample_y=*/0, /*stride_sample_dst=*/0,
+            /*ids_stride=*/0, GGML_PREC_F32, stream);
+    }
+}
+
 void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, const ggml_tensor * ids, ggml_tensor * dst,
     const ggml_cuda_mm_fusion_args_host * fusion) {
     GGML_ASSERT(        src1->type == GGML_TYPE_F32);

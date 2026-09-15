@@ -1766,3 +1766,216 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         x_u32_scale[i*sram_stride] = get_int_b4(bxi->d, 0);
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// Register prefetch (software pipelining) of the x tile for the MMA SRAM layout.
+// gfx908 has no asynchronous global->LDS path wide enough to matter, and the MMQ K loop was measured to be bound by
+// exposed global-load round trips (one block per CU, load -> sync -> MFMA -> sync). Splitting each loader into a
+// "load into registers" and a "store to LDS" half lets process_tile issue the NEXT K step's loads before the current
+// step's vec_dot, so the HBM latency overlaps the matrix ops. The LDS contents and the store indices are exactly
+// those of the fused loader (bit-exact); only the timing changes.
+
+template <ggml_type type, int J, bool fallback> struct mmq_x_prefetch { static constexpr bool available = false; };
+
+#if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
+
+template <int J, bool fallback> struct mmq_x_prefetch<GGML_TYPE_Q4_K, J, fallback> {
+    static constexpr bool available = true;
+    static constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
+    static constexpr int nwarps          = ggml_cuda_mmq_get_nthreads(GGML_TYPE_Q4_K, J, fallback) / warp_size;
+    static constexpr int I               = ggml_cuda_mmq_get_I(GGML_TYPE_Q4_K, J, fallback);
+    static constexpr int sram_stride     = ggml_cuda_mmq_get_sram_stride(GGML_TYPE_Q4_K, J, fallback);
+    static constexpr int threads_per_row = MMQ_ITER_K / (4 * QR4_K);
+    static constexpr int nrows           = warp_size / threads_per_row;
+    static constexpr int NQ              = (I + nrows*nwarps - 1) / (nrows*nwarps);
+    static constexpr int rows_per_warp   = warp_size / 2;
+    static constexpr int NS              = (I + nwarps*rows_per_warp - 1) / (nwarps*rows_per_warp);
+    struct regs { int qs[NQ]; int sc[NS][3]; half2 dm[NS]; };
+
+    static __device__ __forceinline__ int row_q(const int n, const int i_max) {
+        int i = n*nrows*nwarps + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+        if (fallback) { i = min(i, i_max); }
+        return i;
+    }
+    static __device__ __forceinline__ void load(regs & r, const char * __restrict__ x, const int kbx0, const int i_max, const int stride) {
+        const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+#pragma unroll
+        for (int n = 0; n < NQ; ++n) {
+            const block_q4_K * bxi = (const block_q4_K *) x + kbx0 + row_q(n, i_max)*stride;
+            r.qs[n] = get_int_b4(bxi->qs, txi);
+        }
+#pragma unroll
+        for (int n = 0; n < NS; ++n) {
+            int i = n*nwarps*rows_per_warp + threadIdx.y*rows_per_warp + threadIdx.x/2;
+            if (i < I) {
+                if (fallback) { i = min(i, i_max); }
+                const block_q4_K * bxi = (const block_q4_K *) x + kbx0 + i*stride;
+                const int * scales = (const int *) bxi->scales;
+                r.sc[n][0] = scales[0]; r.sc[n][1] = scales[1]; r.sc[n][2] = scales[2];
+                r.dm[n] = bxi->dm;
+            }
+        }
+    }
+    static __device__ __forceinline__ void store(const regs & r, int * __restrict__ x_tile, const int i_max) {
+        int   * x_qs = (int   *)  x_tile;
+        half2 * x_dm = (half2 *) (x_qs + 2*MMQ_TILE_NE_K);
+        const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+#pragma unroll
+        for (int n = 0; n < NQ; ++n) {
+            const int i = row_q(n, i_max);
+            x_qs[i*sram_stride + 16*(txi/8) + txi % 8 + 0] = (r.qs[n] >> 0) & 0x0F0F0F0F;
+            x_qs[i*sram_stride + 16*(txi/8) + txi % 8 + 8] = (r.qs[n] >> 4) & 0x0F0F0F0F;
+        }
+#pragma unroll
+        for (int n = 0; n < NS; ++n) {
+            int i = n*nwarps*rows_per_warp + threadIdx.y*rows_per_warp + threadIdx.x/2;
+            if (i < I) {
+                if (fallback) { i = min(i, i_max); }
+                const int ksc = threadIdx.x % 2;
+                const int sc32 = unpack_scales_q45_K(r.sc[n], ksc + 0);
+                const int  m32 = unpack_scales_q45_K(r.sc[n], ksc + 2);
+                const uint8_t * sc8 = (const uint8_t *) &sc32;
+                const uint8_t *  m8 = (const uint8_t *)  &m32;
+                const half2 dm = r.dm[n] * make_half2(1.0f, -1.0f);
+#pragma unroll
+                for (int l = 0; l < sizeof(int); ++l) {
+                    x_dm[i*sram_stride + sizeof(int)*ksc + l] = dm*make_half2(sc8[l], m8[l]);
+                }
+            }
+        }
+    }
+};
+
+template <int J, bool fallback> struct mmq_x_prefetch<GGML_TYPE_Q5_1, J, fallback> {
+    static constexpr bool available = true;
+    static constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
+    static constexpr int nwarps          = ggml_cuda_mmq_get_nthreads(GGML_TYPE_Q5_1, J, fallback) / warp_size;
+    static constexpr int I               = ggml_cuda_mmq_get_I(GGML_TYPE_Q5_1, J, fallback);
+    static constexpr int sram_stride     = ggml_cuda_mmq_get_sram_stride(GGML_TYPE_Q5_1, J, fallback);
+    static constexpr int threads_per_row = MMQ_ITER_K / (4 * QR5_1);
+    static constexpr int nrows           = warp_size / threads_per_row;
+    static constexpr int NQ              = (I + nrows*nwarps - 1) / (nrows*nwarps);
+    static constexpr int blocks_per_tile_x_row = MMQ_TILE_NE_K / QI5_1;
+    static constexpr int rows_per_warp   = warp_size / blocks_per_tile_x_row;
+    static constexpr int ND              = (I + nwarps*rows_per_warp - 1) / (nwarps*rows_per_warp);
+    struct regs { int ql[NQ]; int qh[NQ]; half2 dm[ND]; };
+
+    static __device__ __forceinline__ int row_q(const int n, const int i_max) {
+        int i = n*nrows*nwarps + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+        if (fallback) { i = min(i, i_max); }
+        return i;
+    }
+    static __device__ __forceinline__ int row_d(const int n, const int i_max) {
+        int i = n*nwarps*rows_per_warp + threadIdx.y*rows_per_warp + threadIdx.x/blocks_per_tile_x_row;
+        if (fallback) { i = min(i, i_max); }
+        return i;
+    }
+    static __device__ __forceinline__ void load(regs & r, const char * __restrict__ x, const int kbx0, const int i_max, const int stride) {
+        const int txi  = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+        const int kbx  = txi / QI5_1;
+        const int kqsx = txi % QI5_1;
+#pragma unroll
+        for (int n = 0; n < NQ; ++n) {
+            const block_q5_1 * bxi = (const block_q5_1 *) x + kbx0 + row_q(n, i_max)*stride + kbx;
+            r.ql[n] = get_int_b4(bxi->qs, kqsx);
+            r.qh[n] = get_int_b4(bxi->qh, 0) >> (4 * kqsx);
+        }
+        const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+#pragma unroll
+        for (int n = 0; n < ND; ++n) {
+            const block_q5_1 * bxi = (const block_q5_1 *) x + kbx0 + row_d(n, i_max)*stride + kbxd;
+            r.dm[n] = bxi->dm;
+        }
+    }
+    static __device__ __forceinline__ void store(const regs & r, int * __restrict__ x_tile, const int i_max) {
+        int   * x_qs = (int   *)  x_tile;
+        half2 * x_dm = (half2 *) (x_qs + 2*MMQ_TILE_NE_K);
+        const int txi  = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+        const int kbx  = txi / QI5_1;
+        const int kqsx = txi % QI5_1;
+#pragma unroll
+        for (int n = 0; n < NQ; ++n) {
+            const int i  = row_q(n, i_max);
+            const int ql = r.ql[n];
+            const int qh = r.qh[n];
+            int qs0 = (ql >>  0) & 0x0F0F0F0F;
+            qs0    |= (qh <<  4) & 0x00000010; // 0 ->  4
+            qs0    |= (qh << 11) & 0x00001000; // 1 -> 12
+            qs0    |= (qh << 18) & 0x00100000; // 2 -> 20
+            qs0    |= (qh << 25) & 0x10000000; // 3 -> 28
+            int qs1 = (ql >>  4) & 0x0F0F0F0F;
+            qs1    |= (qh >> 12) & 0x00000010; // 16 ->  4
+            qs1    |= (qh >>  5) & 0x00001000; // 17 -> 12
+            qs1    |= (qh <<  2) & 0x00100000; // 18 -> 20
+            qs1    |= (qh <<  9) & 0x10000000; // 19 -> 28
+            x_qs[i*sram_stride + kbx*(2*QI5_1) + kqsx + 0]     = qs0;
+            x_qs[i*sram_stride + kbx*(2*QI5_1) + kqsx + QI5_1] = qs1;
+        }
+        const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+#pragma unroll
+        for (int n = 0; n < ND; ++n) {
+            x_dm[row_d(n, i_max)*sram_stride + kbxd] = r.dm[n];
+        }
+    }
+};
+
+template <int J, bool fallback> struct mmq_x_prefetch<GGML_TYPE_Q8_0, J, fallback> {
+    static constexpr bool available = true;
+    static constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
+    static constexpr int nwarps          = ggml_cuda_mmq_get_nthreads(GGML_TYPE_Q8_0, J, fallback) / warp_size;
+    static constexpr int I               = ggml_cuda_mmq_get_I(GGML_TYPE_Q8_0, J, fallback);
+    static constexpr int sram_stride     = ggml_cuda_mmq_get_sram_stride(GGML_TYPE_Q8_0, J, fallback);
+    static constexpr int threads_per_row = 32;
+    static constexpr int nrows           = warp_size / threads_per_row;
+    static constexpr int NQ              = (I + nrows*nwarps - 1) / (nrows*nwarps);
+    static constexpr int blocks_per_tile_x_row = 2*MMQ_TILE_NE_K / QI8_0;
+    static constexpr int rows_per_warp   = warp_size / blocks_per_tile_x_row;
+    static constexpr int ND              = (I + nwarps*rows_per_warp - 1) / (nwarps*rows_per_warp);
+    struct regs { int q0[NQ]; int q1[NQ]; float d[ND]; };
+
+    static __device__ __forceinline__ int row_q(const int n, const int i_max) {
+        int i = n*nrows*nwarps + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
+        if (fallback) { i = min(i, i_max); }
+        return i;
+    }
+    static __device__ __forceinline__ int row_d(const int n, const int i_max) {
+        int i = n*nwarps*rows_per_warp + threadIdx.y*rows_per_warp + threadIdx.x/blocks_per_tile_x_row;
+        if (fallback) { i = min(i, i_max); }
+        return i;
+    }
+    static __device__ __forceinline__ void load(regs & r, const char * __restrict__ x, const int kbx0, const int i_max, const int stride) {
+        const int txi  = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+        const int kbx  = txi / QI8_0;
+        const int kqsx = txi % QI8_0;
+#pragma unroll
+        for (int n = 0; n < NQ; ++n) {
+            const block_q8_0 * bxi = (const block_q8_0 *) x + kbx0 + row_q(n, i_max)*stride + kbx;
+            r.q0[n] = get_int_b2(bxi[0].qs,                   kqsx);
+            r.q1[n] = get_int_b2(bxi[MMQ_TILE_NE_K/QI8_0].qs, kqsx);
+        }
+        const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+#pragma unroll
+        for (int n = 0; n < ND; ++n) {
+            const block_q8_0 * bxi = (const block_q8_0 *) x + kbx0 + row_d(n, i_max)*stride + kbxd;
+            r.d[n] = bxi->d;
+        }
+    }
+    static __device__ __forceinline__ void store(const regs & r, int * __restrict__ x_tile, const int i_max) {
+        int   * x_qs = (int   *)  x_tile;
+        float * x_df = (float *) (x_tile + 2*MMQ_TILE_NE_K);
+        const int txi = warp_size > threads_per_row ? threadIdx.x % threads_per_row : threadIdx.x;
+#pragma unroll
+        for (int n = 0; n < NQ; ++n) {
+            const int i = row_q(n, i_max);
+            x_qs[i*sram_stride + 0             + txi] = r.q0[n];
+            x_qs[i*sram_stride + MMQ_TILE_NE_K + txi] = r.q1[n];
+        }
+        const int kbxd = threadIdx.x % blocks_per_tile_x_row;
+#pragma unroll
+        for (int n = 0; n < ND; ++n) {
+            x_df[row_d(n, i_max)*sram_stride + kbxd] = r.d[n];
+        }
+    }
+};
+
+#endif // defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
