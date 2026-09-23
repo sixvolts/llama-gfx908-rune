@@ -243,3 +243,12 @@ GGML_MMVQ_Q8_V2=0 disables; GGML_MMVQ_Q8_RPB=<n> overrides rows per block.
 - Tolerance-class dense GEMV (lane owns whole Q8_0 blocks, LDS activations, prefetch) was tried and dropped: slower than
   the bit-exact unrolled kernel on every model shape (e.g. 6144x2560 at 3 columns 28.7 vs 24.0 us).
 Server (seeded chats, hash-identical): draft phase 3.27 -> 3.13 ms, MTP step 33.62 -> 33.34 ms.
+
+Addendum (pool epoch): captured graphs also bake in the addresses of the context's memory-pool temporaries (quantized
+activations, split-K partials), which no node property covers. A layout key that matches a rebuilt graph could therefore
+replay a capture whose pool buffers had since moved: under 3 concurrent streams the candidate diverged from eager runs and
+faulted ("Memory access fault by GPU node-6"). `ggml_cuda_pool::epoch` now counts every map/unmap of pool memory, each
+captured graph records the epoch it was captured under, and a mismatch forces a re-capture (even on the uid shortcut).
+Oracles: 3 concurrent seeded streams (slots joining and leaving) match GGML_CUDA_DISABLE_GRAPHS=1 three times in a row;
+the single-stream alternating-shape case matches eager too. GGML_CUDA_GRAPH_KEY_MODE=0 / GGML_CUDA_GRAPH_PROPS_MODE=0..2
+restore the old key / property comparison for bisection.
