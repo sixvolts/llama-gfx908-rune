@@ -144,3 +144,22 @@ with the head attached (1954 -> 956 t/s at 5.5k); not enabled yet.
 - Not adopted: `--backend-sampling` (GPU target sampling). Its per-row sampler subgraphs change the graph node count
   between decode and prompt ubatches, so after any decode each prompt ubatch reallocates (a KV-sized QSA input grows by
   512 per ubatch) and pipeline parallelism drains: 5.5k prefill 1954 -> 956 t/s.
+
+## 2026-09-23: MTP verify path (9th production build)
+
+The MTP n=2 step verifies 3 tokens in one trunk pass; several decode-only paths fell back to generic kernels at nt=3.
+- `hc-fused.cu` / `ggml-cuda.cu`: the HC low-rank megakernel (down GEMV + scale/silu + per-block q8_1 replay + up GEMV +
+  sigmoid mix epilogue) now takes 1..4 token columns; each column accumulates exactly as the ncols=nt mmvq path it
+  replaces. Its butterflies (`hc_shfl_xor`) use one ds_swizzle and four DPP moves per 32-lane level set instead of
+  ds_bpermute (same pairings, so every lane gets the same value as `__shfl_xor_sync`; row_ror:4 is only exact because the
+  order is top-down), the replay skips the q8_1 block sum (Q8_0 x Q8_1 never reads it), and the epilogue runs one
+  thread per (column, output). Byte-identical to the unfused graph (golden/hc_bitcheck, nt 1..4, 5 shapes, all J).
+  hc_up_mix at nt=3 26.9 -> 17.4 us; at nt=1 11.5 -> 10.2 us. In-place fusion is limited to nt=1.
+  GGML_HC_MEGA_MT_DISABLE=1 restores the nt=1-only matcher; GGML_HC_MEGA_J_MT picks J (default 4) for nt > 1.
+- `gated_delta_net.cu`: for 2..4 tokens (S_v=128) the warp-per-column kernel preloads every token's k/q/v/g/beta before
+  the recurrence (constant-trip loop with `continue`, so it fully unrolls and stays in VGPRs). Byte-identical vs the
+  previous library at n = 1..5, K = 1 and 3; test-backend-ops GATED_DELTA_NET 36/36; 3 tokens 25.3 -> 22.6 us.
+  GGML_GDN_PRELOAD=0 disables.
+Measured (server, production layout, seeded chat A/B back to back): MTP step 36.23 -> 35.69 ms (65.6 -> 66.7 t/s pooled);
+seeded generations hash-identical to the 8th build. Without the DPP butterflies the nt=3 megakernel was a net loss
+(+0.8 ms/step): inside a HIP graph the unfused small kernels cost little, so the fused path has to win on latency.
