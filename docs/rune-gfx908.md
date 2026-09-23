@@ -163,3 +163,24 @@ The MTP n=2 step verifies 3 tokens in one trunk pass; several decode-only paths 
 Measured (server, production layout, seeded chat A/B back to back): MTP step 36.23 -> 35.69 ms (65.6 -> 66.7 t/s pooled);
 seeded generations hash-identical to the 8th build. Without the DPP butterflies the nt=3 megakernel was a net loss
 (+0.8 ms/step): inside a HIP graph the unfused small kernels cost little, so the fused path has to win on latency.
+
+## 2026-09-23: few-token MoE kernel with expert dedup (10th production build)
+
+`mmvq-moe.cu` (tolerance class): MUL_MAT_ID for 1..4 tokens with Q4_K gate/up (fused SWIGLU) and Q5_1 down at the
+Flash-Next shapes (K = 2560 / 640). mul_mat_vec_q_moe ran one warp per (token, slot) through vec_dot_*_q8_1, re-unpacking
+every weight fragment per token: at 3 tokens it was VALU/latency bound (7.6M VALU instructions for gate/up, ~49% VALU
+busy, ~640 GB/s) and re-read each shared expert per token. Now a lane owns whole quant blocks (Q4_K: a 64-weight pair with
+16-byte loads; Q5_1: one block), unpacks them once and applies them to every token routed to that expert; activations are
+staged in LDS, work items are streamed with a one-item register prefetch, and the batch routing is read with one load +
+ballot so each distinct expert is computed by one block (verify batches in real chat: 69-77% of pairs are distinct).
+Each 32-weight block is scaled after its integer dot product (the Q4_K min term uses the exact fp32 d8*sum(q8) as the
+reference does), so the summation order differs: 3.5e-5..1e-4 relative RMS vs the reference at op level.
+Per layer on MI100 (golden/moe_bench, random routing): nt=1 65 -> 44 us, nt=3 147 -> 114 us (73 us when the 3 tokens
+share experts), nt=4 189 -> 145 us. Q5_K gate/up (1 layer), Q8_0 down (5 layers) and the Q8_0 MTP head keep the old path.
+KL gate (perplexity with -ub 3 so the decode kernels run, 8x512 tokens of ppl_long.txt, base = reference kernels):
+mean KLD 0.0186, top-1 94.8%, PPL ratio 0.9997 +- 0.005; for scale, the prefill kernels (-ub 512) vs the same base give
+mean KLD 0.031, top-1 93.5%; the reference against itself 0.
+Server (production layout, seeded chat): MTP step 36.08 -> 34.12 ms, 65.9 -> 70.5 t/s pooled.
+GGML_MOE_V2=0 disables; GGML_MOE_V2_Q4K / GGML_MOE_V2_Q51 = 10*waves_per_block + row_groups (default 41);
+GGML_MOE_DEDUP_STATS=1 prints distinct-expert counts per device at exit. `reduce-dpp.cuh`: the exact DPP butterfly
+helper, shared with hc-fused.cu.

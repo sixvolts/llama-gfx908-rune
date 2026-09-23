@@ -1,4 +1,5 @@
 #include "mmvq.cuh"
+#include "mmvq-moe.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1102,6 +1103,12 @@ static void mul_mat_vec_q_switch_ncols_dst(
         return idle * 8 <= iters_wide * 2;
     };
 
+    // MUL_MAT_ID with 1..4 tokens: expert-deduplicated few-token kernel where supported (mmvq-moe.cu, tolerance class)
+    if (has_ids && ggml_cuda_mmvq_moe_dedup(type, vx, vy, ids, fusion, dst, ncols_x, nrows_x, nchannels_y,
+            stride_row_x, stride_col_y, stride_col_dst, stride_channel_x, stride_channel_y, stride_channel_dst,
+            ncols_dst, nchannels_dst, ids_stride, stream)) {
+        return;
+    }
     if (has_ids && ncols_dst > 1) {
         // Multi-token MUL_MAT_ID path - dedicated MoE kernel
         mul_mat_vec_q_moe_launch<type>(
