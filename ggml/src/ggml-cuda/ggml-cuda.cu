@@ -495,6 +495,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         size_t look_ahead_size = (size_t) (1.05 * size);
         look_ahead_size = 256 * ((look_ahead_size + 255)/256);
         ggml_cuda_set_device(device);
+        epoch++;
         cudaError_t err = ggml_cuda_device_malloc(&ptr, look_ahead_size, device);
         if (err == cudaErrorMemoryAllocation) {
             (void)cudaGetLastError();
@@ -529,6 +530,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         }
         GGML_LOG_DEBUG(GGML_CUDA_NAME " buffer pool full, increase MAX_CUDA_BUFFERS\n");
         ggml_cuda_set_device(device);
+        epoch++;
         CUDA_CHECK(cudaFree(ptr));
         pool_size -= size;
     }
@@ -589,6 +591,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
             prop.location.type = CU_MEM_LOCATION_TYPE_DEVICE;
             prop.location.id = physical_device;
             CUmemGenericAllocationHandle handle;
+            epoch++;
             CU_CHECK(cuMemCreate(&handle, reserve_size, &prop, 0));
 
             // reserve virtual address space (if not already reserved)
@@ -2690,12 +2693,14 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     // of its current rotation, so a struct-address key would start a fresh warmup (2 eager runs + a 7 ms capture) at
     // every shape change. Data pointers of the first/last node and of the first node's inputs, plus the shapes, identify
     // a captured instance exactly (node properties are still compared in full before it is launched).
+    // GGML_CUDA_GRAPH_KEY_MODE=0 restores the struct-address key (bisection aid)
+    static const int key_mode = getenv("GGML_CUDA_GRAPH_KEY_MODE") ? atoi(getenv("GGML_CUDA_GRAPH_KEY_MODE")) : 1;
     const ggml_tensor * first = cgraph->nodes[0];
     const ggml_tensor * last  = cgraph->nodes[cgraph->n_nodes - 1];
-    uint64_t h = (uint64_t) (uintptr_t) first->data;
+    uint64_t h = key_mode ? (uint64_t) (uintptr_t) first->data : (uint64_t) (uintptr_t) first;
     auto mix = [&h](uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); };
     mix((uint64_t) cgraph->n_nodes);
-    mix((uint64_t) (uintptr_t) last->data);
+    mix(key_mode ? (uint64_t) (uintptr_t) last->data : 0);
     for (int j = 0; j < GGML_MAX_SRC; ++j) {
         mix((uint64_t) (uintptr_t) (first->src[j] ? first->src[j]->data : nullptr));
     }
@@ -2714,12 +2719,17 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
+    const uint64_t pool_epoch = cuda_ctx->pool().epoch;
+    const bool pool_changed = graph->pool_epoch != pool_epoch;
+    graph->pool_epoch = pool_epoch;
+
     if (cgraph->uid != 0 &&
-        cgraph->uid == graph->uid) {
+        cgraph->uid == graph->uid && !pool_changed) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
         GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
         return false;
     }
+    res = pool_changed;
 
     graph->uid = cgraph->uid;
 
@@ -2734,12 +2744,17 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
         // struct addresses do not affect the captured kernels (data pointers, shapes, strides and params do): blank
         // them so a rebuilt graph with the same layout matches its captured instance
-        prop.node.view_src = nullptr;
-        prop.node.buffer   = nullptr;
-        prop.node.extra    = nullptr;
-        memset(prop.node.src,  0, sizeof(prop.node.src));
-        memset(prop.node.name, 0, sizeof(prop.node.name));
-        if (ggml_nelements(cgraph->nodes[i]) == 0) {
+        // GGML_CUDA_GRAPH_PROPS_MODE: 0 = full struct compare (upstream), 1 = blank struct pointers, 2 = 1 + ignore the
+        // data pointer of empty views (bisection aid)
+        static const int props_mode = getenv("GGML_CUDA_GRAPH_PROPS_MODE") ? atoi(getenv("GGML_CUDA_GRAPH_PROPS_MODE")) : 2;
+        if (props_mode >= 1) {
+            prop.node.view_src = nullptr;
+            prop.node.buffer   = nullptr;
+            prop.node.extra    = nullptr;
+            memset(prop.node.src,  0, sizeof(prop.node.src));
+            memset(prop.node.name, 0, sizeof(prop.node.name));
+        }
+        if (props_mode >= 2 && ggml_nelements(cgraph->nodes[i]) == 0) {
             prop.node.data = nullptr;   // an empty view (e.g. a rollback-slot view of a recurrent state) touches no bytes
         }
 
