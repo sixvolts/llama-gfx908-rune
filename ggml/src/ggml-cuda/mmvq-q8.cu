@@ -124,6 +124,7 @@ static void mmvq_q8_0_v2_launch(const void * vx, const void * vy, float * dst, i
     const dim3 block_nums((nrows + RPB - 1)/RPB, 1, 1);
     const dim3 block_dims(64, 2, 1);
     mmvq_q8_0_v2<NB, ncols, RPB><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, stride_row_x, stride_col_y, stride_col_dst);
+    CUDA_CHECK(cudaGetLastError());
 }
 
 // rows per block: a row's accumulation order does not depend on it (each row is one lane-sequence over its blocks),
