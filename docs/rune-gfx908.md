@@ -184,3 +184,18 @@ Server (production layout, seeded chat): MTP step 36.08 -> 34.12 ms, 65.9 -> 70.
 GGML_MOE_V2=0 disables; GGML_MOE_V2_Q4K / GGML_MOE_V2_Q51 = 10*waves_per_block + row_groups (default 41);
 GGML_MOE_DEDUP_STATS=1 prints distinct-expert counts per device at exit. `reduce-dpp.cuh`: the exact DPP butterfly
 helper, shared with hc-fused.cu.
+
+## 2026-09-23: orphan GPU and speculative-loop measurements (experimental, not in production)
+
+- `ggml-cuda.cu` (c1fb8c054): device pairs without peer access (the PCIe-only orphans) copy through a pinned host ring
+  instead of hipMemcpyPeerAsync, which faulted. This makes a 5-stage layer split with the orphan possible
+  (`-dev ROCm0..ROCm4 -ts 10,10,10,10,8`, head on ROCm4 as before).
+- 5-stage results on Hive A: trunk VRAM 28.9-31.8 -> 24.1-26.2 GB/GPU at 6 x 128k; 7.4k prompt 2095 -> 2207 t/s; 114k
+  prompt 1319 -> 1393 t/s; MTP step unchanged. Decode logits identical to the 4-GPU split; the prefill path depends on the
+  split points at KLD 0.006 (same tolerance class as prefill vs decode kernels, 0.031). 6 x 256k loads but leaves
+  ~0.1 GB free on GPUs 2 and 4 (the 12 attention layers, which hold the KV, land 2/3/2/3/2); ~46 KB of VRAM per context
+  token. At 220k depth: prompt 987 t/s average, MTP decode 22.5 t/s (31 t/s at 114k).
+- `--spec-draft-n-max 3`: 70.1 vs 70.5 t/s, no gain (output hash-identical: MTP is lossless).
+- LLAMA_SPEC_TIMING=1 (server): median host timeline of the MTP loop. Single stream, 10th build: step 33.6 ms =
+  target verify 28.7 + draft 3.45 (2 head decodes: 0.31 ms enqueue + 1.39 ms GPU incl. the 0.77 ms lm_head each) +
+  catch-up 0.55 + sample/accept/rest 0.96 + build 0.09. Draft sampling already runs on the GPU (top-k 10).
