@@ -136,38 +136,11 @@ void ggml_cuda_op_scale_silu(ggml_backend_cuda_context & ctx,
 #include <type_traits>
 #include <cstdlib>
 #include "quantize.cuh"
+#include "reduce-dpp.cuh"
 
 #define HC_MEGA_QI  8   // ggml_cuda_type_traits<GGML_TYPE_Q8_0>::qi
 #define HC_MEGA_VDR 2   // VDR_Q8_0_Q8_1_MMVQ
 
-// Inside a fully unrolled top-down butterfly `for (offset = W/2; offset > 0; offset >>= 1)`, hc_shfl_xor<W>(x, offset)
-// returns at EVERY lane exactly what __shfl_xor_sync(0xffffffff, x, offset, W) would, so the reductions stay
-// bit-identical to warp_reduce_* while (on CDNA) only the xor-32 level still goes through the LDS permute unit:
-// xor 16 is ds_swizzle in bit mode (lane ^ 16 within 32), xor 8 is DPP row_ror:8 (exact), xor 2 / xor 1 are quad_perm
-// moves (exact). xor 4 is row_ror:4, which reads lane (i +- 4) & 15 of the row: after the xor-16 and xor-8 levels
-// lanes i and i ^ 8 hold equal values, so that is the value of lane i ^ 4. This relies on the top-down order.
-template <int W>
-static __device__ __forceinline__ float hc_shfl_xor(const float x, const int offset) {
-#if defined(GGML_USE_HIP) && defined(CDNA)
-    static_assert(W == 32 || W == 64, "hc_shfl_xor: 32- or 64-lane butterflies only");
-    if (offset == 16) {
-        return __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(x), 0x401F));
-    }
-    if (offset == 8) {
-        return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), 0x128, 0xF, 0xF, false));   // row_ror:8
-    }
-    if (offset == 4) {
-        return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), 0x124, 0xF, 0xF, false));   // row_ror:4
-    }
-    if (offset == 2) {
-        return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), 0x4E, 0xF, 0xF, false));    // quad_perm [2,3,0,1]
-    }
-    if (offset == 1) {
-        return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), 0xB1, 0xF, 0xF, false));    // quad_perm [1,0,3,2]
-    }
-#endif // defined(GGML_USE_HIP) && defined(CDNA)
-    return __shfl_xor_sync(0xffffffff, x, offset, W);
-}
 
 template <int NB, int NT>   // NB > 0: compile-time block count (K loop fully unrolled, same per-lane order); NB == 0: runtime loop
 // NT token columns per block (MTP verify: 3): each column accumulates exactly as the ncols=1 kernel (and as
@@ -233,7 +206,7 @@ static __global__ void __launch_bounds__(2*ggml_cuda_get_physical_warp_size(), 1
     for (int offset = warp_size/2; offset > 0; offset >>= 1) {
 #pragma unroll
         for (int t = 0; t < NT; ++t) {
-            tmp[t] += hc_shfl_xor<warp_size>(tmp[t], offset);
+            tmp[t] += ggml_cuda_shfl_xor_td<warp_size>(tmp[t], offset);
         }
     }
 
@@ -349,7 +322,7 @@ static __global__ void __launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1
             for (int t = 0; t < NT; ++t) {
 #pragma unroll
                 for (int ps = 0; ps < n_pass; ++ps) {
-                    amax[t][ps] = fmaxf(amax[t][ps], hc_shfl_xor<QK8_1>(amax[t][ps], offset));
+                    amax[t][ps] = fmaxf(amax[t][ps], ggml_cuda_shfl_xor_td<QK8_1>(amax[t][ps], offset));
                 }
             }
         }
@@ -408,7 +381,7 @@ static __global__ void __launch_bounds__(4*ggml_cuda_get_physical_warp_size(), 1
             for (int t = 0; t < NT; ++t) {
 #pragma unroll
                 for (int jj = 0; jj < J; ++jj) {
-                    tmp[t][jj] += hc_shfl_xor<warp_size>(tmp[t][jj], offset);
+                    tmp[t][jj] += ggml_cuda_shfl_xor_td<warp_size>(tmp[t][jj], offset);
                 }
             }
         }
