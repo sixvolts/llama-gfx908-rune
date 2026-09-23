@@ -13,6 +13,7 @@
 #include "../src/llama-ext.h" // staging API: llama_set_embeddings_nextn / llama_get_embeddings_nextn_ith (used by MTP)
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <cmath>
 #include <cstring>
@@ -1355,6 +1356,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<std::vector<float>> verify_h;
     std::vector<int32_t> verify_h_rows;
 
+    // LLAMA_SPEC_LOG=<file>: per step "p1 p2 n_drafted n_accepted" (head top-1 prob at each draft position, normalized
+    // over its top-k candidates) to fit confidence-gated draft lengths offline. Diagnostics only.
+    std::vector<std::array<float, 4>> draft_p;
+    std::vector<int32_t> draft_n;
+
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
@@ -1698,6 +1704,9 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 // add drafted token for each sequence
                 const llama_token id = cur_p->data[0].id;
+                if (draft_p.empty()) { draft_p.assign(n_seq, {}); draft_n.assign(n_seq, 0); }
+                if (i == 0) { draft_p[seq_id] = {}; draft_n[seq_id] = 0; }
+                if (i < 4) { draft_p[seq_id][i] = cur_p->data[0].p; draft_n[seq_id] = i + 1; }
 
                 // only collect very high-confidence draft tokens
                 if (cur_p->data[0].p < params.p_min) {
@@ -1714,7 +1723,24 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 result.push_back(id);
 
-                if (params.n_max <= (int) result.size()) {
+                // LLAMA_SPEC_ADAPTIVE=1: confidence-gated draft length. The head's top-1 probability is well calibrated
+                // (rune, 10th build: p >= 0.99 -> 99.5% accepted, p < 0.5 -> ~35%). An extra verify row costs ~4.7 ms and
+                // a head decode ~1.7 ms, so a 3rd draft pays only when both earlier drafts were confident and a 2nd draft
+                // does not pay when the 1st was not. Output is unaffected: the target's own sample decides every token.
+                static const bool  adaptive  = getenv("LLAMA_SPEC_ADAPTIVE") && atoi(getenv("LLAMA_SPEC_ADAPTIVE")) != 0;
+                static const float th_draft2 = getenv("LLAMA_SPEC_DRAFT2_MIN_P") ? atof(getenv("LLAMA_SPEC_DRAFT2_MIN_P")) : 0.5f;
+                static const float th_draft3 = getenv("LLAMA_SPEC_DRAFT3_MIN_P") ? atof(getenv("LLAMA_SPEC_DRAFT3_MIN_P")) : 0.9f;
+                bool stop = params.n_max <= (int) result.size();
+                if (adaptive && !stop) {
+                    const float p = cur_p->data[0].p;
+                    if (i == 0 && p < th_draft2) {
+                        stop = true;
+                    }
+                    if (i == 1 && std::min(draft_p[seq_id][0], p) < th_draft3) {
+                        stop = true;
+                    }
+                }
+                if (stop) {
                     drafting[seq_id] = false;
                     n_drafting--;
                     continue;
@@ -1768,6 +1794,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     }
 
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool /*is_other*/) override {
+        static FILE * spec_log = getenv("LLAMA_SPEC_LOG") ? fopen(getenv("LLAMA_SPEC_LOG"), "a") : nullptr;
+        if (spec_log && seq_id >= 0 && seq_id < (llama_seq_id) draft_p.size()) {
+            fprintf(spec_log, "%.4f %.4f %.4f %d %d\n", draft_p[seq_id][0], draft_p[seq_id][1], draft_p[seq_id][2], draft_n[seq_id], (int) n_accepted);
+        }
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
         }

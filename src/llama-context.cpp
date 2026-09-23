@@ -1398,7 +1398,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
     const auto gparams = graph_params(res, ubatch, mctx, gtype);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    // LLAMA_GRAPH_TIMING=1: host cost of the reuse vs rebuild paths (build, sched alloc, set_inputs, compute enqueue)
+    static const bool graph_timing = getenv("LLAMA_GRAPH_TIMING") && atoi(getenv("LLAMA_GRAPH_TIMING")) != 0;
+    static double  gt_sum[2][4] = {};
+    static int64_t gt_n[2] = {};
+    int64_t gt_t[5] = {};
+    const bool reused = !graph_reuse_disable && res->can_reuse(gparams);
+    if (graph_timing) { gt_t[0] = ggml_time_us(); }
+    if (reused) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1451,12 +1458,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             return nullptr;
         }
 
+        if (graph_timing) { gt_t[1] = ggml_time_us(); }
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
     }
+    if (graph_timing) { gt_t[2] = ggml_time_us(); if (reused) { gt_t[1] = gt_t[2]; } }
 
     // set the input data for the input tensors
     {
@@ -1467,12 +1476,23 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
+    if (graph_timing) { gt_t[3] = ggml_time_us(); }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;
         return nullptr;
+    }
+    if (graph_timing) {
+        gt_t[4] = ggml_time_us();
+        const int r = reused ? 1 : 0;
+        gt_sum[r][0] += gt_t[1] - gt_t[0]; gt_sum[r][1] += gt_t[2] - gt_t[1]; gt_sum[r][2] += gt_t[3] - gt_t[2]; gt_sum[r][3] += gt_t[4] - gt_t[3];
+        if (++gt_n[r] % 200 == 0) {
+            LLAMA_LOG_WARN("%s: graph timing %s (n=%lld, n_tokens=%u): build %.2f | sched alloc %.2f | set_inputs %.2f | compute enqueue %.2f ms\n",
+                __func__, reused ? "REUSED " : "REBUILT", (long long) gt_n[r], ubatch.n_tokens,
+                gt_sum[r][0]/gt_n[r]/1e3, gt_sum[r][1]/gt_n[r]/1e3, gt_sum[r][2]/gt_n[r]/1e3, gt_sum[r][3]/gt_n[r]/1e3);
+        }
     }
 
     ret = GGML_STATUS_SUCCESS;
