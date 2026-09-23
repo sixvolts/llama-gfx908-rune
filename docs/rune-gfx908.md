@@ -118,3 +118,19 @@ Diagnostics: `GGML_MMQ_DUMP_IDS=1` (rows-per-expert histogram), `GGML_CUDA_DUMP_
   other slots generate. Measured trade-off (30k prompt arriving while a slot generates): off 17.9 s TTFT / generating slot
   1.5 t/s, 4.9 s worst stall; 2048: 22.8 s / 2.6 t/s / 1.7 s; 1024: 26.5 s / 4.0 t/s / 1.0 s.
 Result on the production layout: 5.5k prompt 1716 -> 1988 t/s, decode unchanged (59 t/s chat).
+
+## 2026-09-23: decode path, first pass (7th production build)
+
+- `topk-moe.cu` (CDNA only): the 10-round expert selection uses DPP row moves plus one `ds_swizzle` per reduction
+  instead of 5 butterfly shuffles on value and index. Byte-identical ids/weights (300 randomized cases incl. heavy
+  ties); 14.6 -> 10.1 us per call (x48 per token).
+- `concat.cu`: non-contiguous concats with short rows (the GDN conv-state concat for multi-token decode, [3+n, 10240]
+  with a transposed src1) use one thread per element instead of one 256-thread block per row. Pure copy.
+- `ggml-cuda.cu`: the HIP graph cache key mixes the node count and first/last node shapes into nodes[0]; graphs of
+  different shapes from the same context (the MTP head's 3-row catch-up and 1-row drafts, the trunk at different slot
+  counts) no longer evict each other. hipGraphExecUpdate per 192-token MTP run 91 -> 16.
+- `llama-context.cpp`: the "at least one output row" workaround is limited to pipeline-parallel contexts, so the
+  head's zero-output catch-up decode no longer runs a 0.77 ms lm_head on a dummy row.
+Measured (production layout, llama-cli): MTP 59.4 -> 61.8 t/s, no-MTP tg64 44.3 -> 45.2 t/s.
+`--backend-sampling` (GPU target sampling) saves ~1.4 ms per MTP step (36.0 vs 37.4 ms) but halves long-prompt prefill
+with the head attached (1954 -> 956 t/s at 5.5k); not enabled yet.

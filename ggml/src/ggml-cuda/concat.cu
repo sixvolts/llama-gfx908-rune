@@ -1,5 +1,7 @@
 #include "concat.cuh"
 
+#include <cstdint>
+
 #include <stdint.h>
 
 // contiguous kernels
@@ -139,6 +141,46 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     }
 }
 
+// non-contiguous, short rows (e.g. the GDN conv-state concat [3 + n_tokens, channels] with a transposed src1):
+// the per-row kernel above launches one 256-thread block per row with only ne0 active threads, so use one thread
+// per destination element instead. Pure copy: identical bytes.
+template <typename T, int dim>
+static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
+    concat_non_cont_flat(
+        const char * src0, const char * src1, char * dst,
+        const int ne00, const int ne01, const int ne02, const int ne03,
+        const uint64_t nb00, const uint64_t nb01, const uint64_t nb02, const uint64_t nb03,
+        const uint64_t nb10, const uint64_t nb11, const uint64_t nb12, const uint64_t nb13,
+        const int ne0, const int ne1, const int ne2,
+        const uint64_t nb0, const uint64_t nb1, const uint64_t nb2, const uint64_t nb3, const int n) {
+    const int idx = blockIdx.x*blockDim.x + threadIdx.x;
+    if (idx >= n) {
+        return;
+    }
+    const int i0 = idx % ne0;
+    int t = idx / ne0;
+    const int i1 = t % ne1;
+    t /= ne1;
+    const int i2 = t % ne2;
+    const int i3 = t / ne2;
+
+    const T * x;
+    if (i0 < ne00 && i1 < ne01 && i2 < ne02 && i3 < ne03) {
+        x = (const T *)(src0 + i3*nb03 + i2*nb02 + i1*nb01 + i0*nb00);
+    } else {
+        if constexpr (dim == 0) {
+            x = (const T *)(src1 + i3*nb13 + i2*nb12 + i1*nb11 + (i0 - ne00)*nb10);
+        } else if constexpr (dim == 1) {
+            x = (const T *)(src1 + i3*nb13 + i2*nb12 + (i1 - ne01)*nb11 + i0*nb10);
+        } else if constexpr (dim == 2) {
+            x = (const T *)(src1 + i3*nb13 + (i2 - ne02)*nb12 + i1*nb11 + i0*nb10);
+        } else {
+            x = (const T *)(src1 + (i3 - ne03)*nb13 + i2*nb12 + i1*nb11 + i0*nb10);
+        }
+    }
+    *(T *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0) = *x;
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
@@ -160,6 +202,27 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
 
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data,         src0->data, size0, cudaMemcpyDeviceToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
+    } else if (dst->ne[0] <= 32 && ggml_nelements(dst) < INT32_MAX) {
+        GGML_ASSERT(!ggml_is_quantized(src0->type));
+
+        const int n = (int) ggml_nelements(dst);
+        const dim3 grid_dim((n + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE, 1, 1);
+        auto launch_kernel = [&](auto dim) {
+            concat_non_cont_flat<T, dim><<<grid_dim, CUDA_CONCAT_BLOCK_SIZE, 0, stream>>>(
+                (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+                (int) src0->ne[0], (int) src0->ne[1], (int) src0->ne[2], (int) src0->ne[3],
+                src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+                src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+                (int) dst->ne[0], (int) dst->ne[1], (int) dst->ne[2],
+                dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3], n);
+        };
+        switch (dim) {
+            case 0: launch_kernel(std::integral_constant<int, 0>{}); break;
+            case 1: launch_kernel(std::integral_constant<int, 1>{}); break;
+            case 2: launch_kernel(std::integral_constant<int, 2>{}); break;
+            case 3: launch_kernel(std::integral_constant<int, 3>{}); break;
+            default: GGML_ABORT("Invalid dim: %d", dim);
+        }
     } else {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 
