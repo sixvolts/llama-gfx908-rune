@@ -134,3 +134,13 @@ Result on the production layout: 5.5k prompt 1716 -> 1988 t/s, decode unchanged 
 Measured (production layout, llama-cli): MTP 59.4 -> 61.8 t/s, no-MTP tg64 44.3 -> 45.2 t/s.
 `--backend-sampling` (GPU target sampling) saves ~1.4 ms per MTP step (36.0 vs 37.4 ms) but halves long-prompt prefill
 with the head attached (1954 -> 956 t/s at 5.5k); not enabled yet.
+- `common/sampling.cpp` (8th build): top-K prefilter for the CPU sampler chain. When top-k (<= 62) comes first among the
+  active samplers and everything before it is a no-op (neutral penalties, DRY off, top-n-sigma off, only -inf logit
+  biases / model suppress tokens), cur_p is built from the 64 largest logits (vectorized block-max scan) instead of the
+  full 248k vocabulary. Falls back to the full path on any tie among the top k+1 or any non-finite logit, so the sampled
+  token is identical (3000/3000 randomized trials incl. ties/NaN; seeded server generations hash-identical).
+  0.48 -> 0.19 ms per sampled row; MTP step 37.2 -> 36.1 ms. COMMON_SAMPLER_PREFILTER=0 disables it.
+- `ggml-alloc.c`: GGML_GALLOC_DEBUG also prints the consumers of a tensor that forces a reallocation.
+- Not adopted: `--backend-sampling` (GPU target sampling). Its per-row sampler subgraphs change the graph node count
+  between decode and prompt ubatches, so after any decode each prompt ubatch reallocates (a KV-sized QSA input grows by
+  512 per ubatch) and pipeline parallelism drains: 5.5k prefill 1954 -> 956 t/s.
