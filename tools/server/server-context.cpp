@@ -2807,6 +2807,48 @@ private:
     };
 #endif
 
+    // LLAMA_SPEC_TIMING=1: host-side timeline of the speculative loop. A step runs from one draft to the next; phases are
+    // draft (head decodes), build (checkpoints, batch), target (decode + sync), catch-up (head process()), sample
+    // (sample + accept + rest of the loop). Medians over the last 256 drafting steps are logged. Diagnostics only.
+    enum spec_tm_ev { SPEC_TM_DRAFT0, SPEC_TM_DRAFT1, SPEC_TM_DEC0, SPEC_TM_DEC1, SPEC_TM_PROC1, SPEC_TM_N };
+    void spec_tm(spec_tm_ev ev) {
+        static const bool on = getenv("LLAMA_SPEC_TIMING") && atoi(getenv("LLAMA_SPEC_TIMING")) != 0;
+        if (!on) {
+            return;
+        }
+        static int64_t t[SPEC_TM_N] = {};
+        static bool    seen[SPEC_TM_N] = {};
+        static std::vector<float> ph[6];
+        const int64_t now = ggml_time_us();
+        if (ev == SPEC_TM_DRAFT0) {
+            if (seen[SPEC_TM_DRAFT1] && seen[SPEC_TM_DEC0] && seen[SPEC_TM_DEC1] && seen[SPEC_TM_PROC1]) {
+                const float v[6] = {
+                    (t[SPEC_TM_DRAFT1] - t[SPEC_TM_DRAFT0]) / 1e3f, (t[SPEC_TM_DEC0] - t[SPEC_TM_DRAFT1]) / 1e3f,
+                    (t[SPEC_TM_DEC1]   - t[SPEC_TM_DEC0])   / 1e3f, (t[SPEC_TM_PROC1] - t[SPEC_TM_DEC1]) / 1e3f,
+                    (now - t[SPEC_TM_PROC1]) / 1e3f,                 (now - t[SPEC_TM_DRAFT0]) / 1e3f,
+                };
+                for (int i = 0; i < 6; ++i) {
+                    ph[i].push_back(v[i]);
+                }
+                if (ph[0].size() == 256) {
+                    float med[6];
+                    for (int i = 0; i < 6; ++i) {
+                        std::nth_element(ph[i].begin(), ph[i].begin() + 128, ph[i].end());
+                        med[i] = ph[i][128];
+                        ph[i].clear();
+                    }
+                    SRV_INF("spec timing, median of 256 steps (ms): draft %.2f | build %.2f | target %.2f | catch-up %.2f | "
+                            "sample+rest %.2f | step %.2f\n", med[0], med[1], med[2], med[3], med[4], med[5]);
+                }
+            }
+            for (bool & b : seen) {
+                b = false;
+            }
+        }
+        t[ev]    = now;
+        seen[ev] = true;
+    }
+
     void update_slots() {
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
@@ -3074,9 +3116,11 @@ private:
 
         // generate the actual drafts (if any)
         if (!drafting.empty()) {
+            spec_tm(SPEC_TM_DRAFT0);
             queue_tasks.yield_to_queue([&]() {
                 common_speculative_draft(spec.get());
             });
+            spec_tm(SPEC_TM_DRAFT1);
         }
 
         // make checkpoints if needed
@@ -3716,12 +3760,18 @@ private:
         // yield to the queue, so we can still handle metrics tasks while decoding
         // note: the sync is done here too, so that the wait is also covered by the yield
         int ret = 0;
+        if (has_output) {
+            spec_tm(SPEC_TM_DEC0);
+        }
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        if (has_output) {
+            spec_tm(SPEC_TM_DEC1);
+        }
 
         if (ret != 0) {
             {
@@ -3785,6 +3835,7 @@ private:
             spec_pending = { true, batch_view, seq };
             if (has_output) {
                 spec_flush();                     // outputs follow: the draft must be caught up before drafting
+                spec_tm(SPEC_TM_PROC1);
             }
         }
 
