@@ -138,6 +138,27 @@ int ggml_cuda_get_device() {
     return id;
 }
 
+// GGML_CUDA_ALLOC_LOG=1 (diagnostics): every device/pinned allocation and free with its address range
+static thread_local const ggml_tensor * ggml_cuda_alloc_log_op = nullptr;   // op being computed (diagnostics)
+static void ggml_cuda_alloc_log(const char * what, int device, const void * ptr, size_t size) {
+    static const bool on = getenv("GGML_CUDA_ALLOC_LOG") && atoi(getenv("GGML_CUDA_ALLOC_LOG")) != 0;
+    if (on) {
+        const ggml_tensor * t = ggml_cuda_alloc_log_op;
+        if (t) {
+            const ggml_tensor * s0 = t->src[0];
+            const ggml_tensor * s1 = t->src[1];
+            GGML_LOG_WARN("[alloc] %-10s dev%d %p - %p (%zu) op %s %s [%lld,%lld,%lld,%lld] src0 %s %s [%lld,%lld,%lld,%lld] src1 %s [%lld,%lld,%lld,%lld]\n",
+                what, device, ptr, (const char *) ptr + size, size, t->name, ggml_op_desc(t),
+                (long long) t->ne[0], (long long) t->ne[1], (long long) t->ne[2], (long long) t->ne[3],
+                s0 ? s0->name : "-", s0 ? ggml_type_name(s0->type) : "-",
+                s0 ? (long long) s0->ne[0] : 0, s0 ? (long long) s0->ne[1] : 0, s0 ? (long long) s0->ne[2] : 0, s0 ? (long long) s0->ne[3] : 0,
+                s1 ? s1->name : "-", s1 ? (long long) s1->ne[0] : 0, s1 ? (long long) s1->ne[1] : 0, s1 ? (long long) s1->ne[2] : 0, s1 ? (long long) s1->ne[3] : 0);
+        } else {
+            GGML_LOG_WARN("[alloc] %-10s dev%d %p - %p (%zu) op -\n", what, device, ptr, (const char *) ptr + size, size);
+        }
+    }
+}
+
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
     cudaError_t err;
@@ -164,6 +185,9 @@ static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device)
 #endif // defined(GGML_USE_HIP)
     } else {
         err = cudaMalloc(ptr, size);
+    }
+    if (err == cudaSuccess) {
+        ggml_cuda_alloc_log("dev_malloc", device, *ptr, size);
     }
     return err;
 }
@@ -442,6 +466,9 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         for (int i = 0; i < MAX_BUFFERS; ++i) {
             ggml_cuda_buffer & b = buffer_pool[i];
             if (b.ptr != nullptr) {
+                epoch++;
+                free_epoch++;
+                ggml_cuda_alloc_log("pool_clear", device, b.ptr, b.size);
                 CUDA_CHECK(cudaFree(b.ptr));
                 pool_size -= b.size;
                 b.ptr  = nullptr;
@@ -497,7 +524,7 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
         if (err == cudaErrorMemoryAllocation) {
             (void)cudaGetLastError();
             const size_t cached_bytes = pool_size;
-            GGML_LOG_DEBUG(GGML_CUDA_NAME " pool[%d]: alloc of %.2f MiB failed, flushing %.2f MiB of cached buffers and retrying\n",
+            GGML_LOG_WARN(GGML_CUDA_NAME " pool[%d]: alloc of %.2f MiB failed, flushing %.2f MiB of cached buffers and retrying\n",
                            device, look_ahead_size/1024.0/1024.0, cached_bytes/1024.0/1024.0);
             CUDA_CHECK(cudaDeviceSynchronize());
             clear_pool();
@@ -525,9 +552,11 @@ struct ggml_cuda_pool_leg : public ggml_cuda_pool {
                 return;
             }
         }
-        GGML_LOG_DEBUG(GGML_CUDA_NAME " buffer pool full, increase MAX_CUDA_BUFFERS\n");
+        GGML_LOG_WARN(GGML_CUDA_NAME " buffer pool full, increase MAX_CUDA_BUFFERS\n");
         ggml_cuda_set_device(device);
         epoch++;
+        free_epoch++;
+        ggml_cuda_alloc_log("pool_free", device, ptr, size);
         CUDA_CHECK(cudaFree(ptr));
         pool_size -= size;
     }
@@ -738,6 +767,7 @@ struct ggml_backend_cuda_buffer_context {
     }
 
     ~ggml_backend_cuda_buffer_context() {
+        ggml_cuda_alloc_log("buf_free", device, dev_ptr, 0);
         CUDA_CHECK(cudaFree(dev_ptr));
     }
 };
@@ -1274,6 +1304,7 @@ static bool ggml_backend_buft_is_cuda_host(ggml_backend_buffer_type_t buft) {
 }
 
 static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buffer) {
+    ggml_cuda_alloc_log("host_free", -1, buffer->context, buffer->size);
     CUDA_CHECK(cudaFreeHost(buffer->context));
 }
 
@@ -1292,6 +1323,7 @@ static void * ggml_cuda_host_malloc(size_t size) {
         return nullptr;
     }
 
+    ggml_cuda_alloc_log("host_malloc", -1, ptr, size);
     return ptr;
 }
 
@@ -2100,6 +2132,8 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
+    ggml_cuda_alloc_log_op = dst;
+
     switch (dst->op) {
         case GGML_OP_ARGMAX:
             ggml_cuda_argmax(ctx, dst);
@@ -2700,6 +2734,9 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     // a captured instance exactly (node properties are still compared in full before it is launched).
     // GGML_CUDA_GRAPH_KEY_MODE=0 restores the struct-address key (bisection aid)
     static const int key_mode = getenv("GGML_CUDA_GRAPH_KEY_MODE") ? atoi(getenv("GGML_CUDA_GRAPH_KEY_MODE")) : 1;
+    if (cgraph->n_nodes <= 0) {
+        return nullptr;
+    }
     const ggml_tensor * first = cgraph->nodes[0];
     const ggml_tensor * last  = cgraph->nodes[cgraph->n_nodes - 1];
     uint64_t h = key_mode ? (uint64_t) (uintptr_t) first->data : (uint64_t) (uintptr_t) first;
@@ -2713,7 +2750,10 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     // cached instance instead of a property change that restarts this instance's warmup
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * n = cgraph->nodes[i];
-        mix(((uint64_t) n->ne[0] << 40) ^ ((uint64_t) n->ne[1] << 24) ^ ((uint64_t) n->ne[2] << 8) ^ (uint64_t) n->ne[3] ^ ((uint64_t) n->op << 56));
+        mix((uint64_t) n->op);
+        for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+            mix((uint64_t) n->ne[d]);
+        }
     }
     return (const void *) (uintptr_t) h;
 }
@@ -2724,11 +2764,21 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     const void * graph_key = ggml_cuda_graph_get_key(cgraph);
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
 
-    const uint64_t pool_epoch = cuda_ctx->pool().epoch;
+    static const int harden = getenv("GGML_CUDA_GRAPH_HARDEN") ? atoi(getenv("GGML_CUDA_GRAPH_HARDEN")) : 15;
+    const uint64_t pool_epoch = (harden & 4) ? cuda_ctx->pool_epoch_all() : cuda_ctx->pool().epoch;
     const bool pool_changed = graph->pool_epoch != pool_epoch;
-    graph->pool_epoch = pool_epoch;
+    graph->pool_epoch      = pool_epoch;
+    graph->pool_free_epoch = cuda_ctx->pool_free_epoch_all();
 
-    if (cgraph->uid != 0 &&
+    // GGML_CUDA_GRAPH_DIAG bits (diagnostics): 1 = never take the uid shortcut (compare node properties every call),
+    // 2 = re-capture on every call, 4 = re-instantiate instead of cudaGraphExecUpdate
+    static const int diag = getenv("GGML_CUDA_GRAPH_DIAG") ? atoi(getenv("GGML_CUDA_GRAPH_DIAG")) : 0;
+    if (diag & 2) {
+        graph->uid = cgraph->uid;
+        graph->node_props.resize(cgraph->n_nodes);
+        return true;
+    }
+    if (!(diag & 1) && cgraph->uid != 0 &&
         cgraph->uid == graph->uid && !pool_changed) {
         GGML_LOG_DEBUG("CUDA Graph id %zu reused\n", cgraph->uid);
         GGML_ASSERT((int)graph->node_props.size() == cgraph->n_nodes);
@@ -2744,14 +2794,14 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         graph->node_props.resize(cgraph->n_nodes);
     }
 
+    // GGML_CUDA_GRAPH_PROPS_MODE: 0 = full struct compare (upstream), 1 = blank struct pointers, 2 = 1 + ignore the
+    // data pointer of empty views (bisection aid)
+    static const int props_mode = getenv("GGML_CUDA_GRAPH_PROPS_MODE") ? atoi(getenv("GGML_CUDA_GRAPH_PROPS_MODE")) : 2;
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_cuda_graph::node_properties prop = {};
         memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
         // struct addresses do not affect the captured kernels (data pointers, shapes, strides and params do): blank
         // them so a rebuilt graph with the same layout matches its captured instance
-        // GGML_CUDA_GRAPH_PROPS_MODE: 0 = full struct compare (upstream), 1 = blank struct pointers, 2 = 1 + ignore the
-        // data pointer of empty views (bisection aid)
-        static const int props_mode = getenv("GGML_CUDA_GRAPH_PROPS_MODE") ? atoi(getenv("GGML_CUDA_GRAPH_PROPS_MODE")) : 2;
         if (props_mode >= 1) {
             prop.node.view_src = nullptr;
             prop.node.buffer   = nullptr;
@@ -2765,9 +2815,13 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             if (cgraph->nodes[i]->src[j]) {
-                prop.node_src_data_ptrs[j] = cgraph->nodes[i]->src[j]->data;
-                memcpy(prop.node_src_ne[j], cgraph->nodes[i]->src[j]->ne, sizeof(prop.node_src_ne[j]));
-                memcpy(prop.node_src_nb[j], cgraph->nodes[i]->src[j]->nb, sizeof(prop.node_src_nb[j]));
+                const ggml_tensor * src = cgraph->nodes[i]->src[j];
+                prop.node_src_data_ptrs[j] = src->data;
+                memcpy(prop.node_src_ne[j], src->ne, sizeof(prop.node_src_ne[j]));
+                memcpy(prop.node_src_nb[j], src->nb, sizeof(prop.node_src_nb[j]));
+                prop.node_src_type[j] = (int32_t) src->type;
+                prop.node_src_op[j]   = (int32_t) src->op;
+                prop.node_src_view[j] = src->view_src != nullptr;
             }
         }
 
@@ -2809,7 +2863,8 @@ static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_c
     cudaError_t stat = cudaGraphExecUpdate(graph->instance, graph->graph, &errorNode, &result_info);
 #endif // CUDART_VERSION >= 12000
 
-    if (stat == cudaErrorGraphExecUpdateFailure) {
+    static const int diag = getenv("GGML_CUDA_GRAPH_DIAG") ? atoi(getenv("GGML_CUDA_GRAPH_DIAG")) : 0;
+    if (stat == cudaErrorGraphExecUpdateFailure || (diag & 4)) {
 #ifndef NDEBUG
         GGML_LOG_DEBUG("%s: CUDA graph update failed\n", __func__);
 #endif
@@ -3663,7 +3718,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 ggml_is_contiguous(residual) && ggml_is_contiguous(block_out) &&
                 ggml_is_contiguous(inject) && ggml_is_contiguous(add) &&
                 // block_out and inject are read at shifted indices: refuse any in-place overlap with the output
-                !ggml_cuda_hc_ranges_overlap(add, block_out) && !ggml_cuda_hc_ranges_overlap(add, inject);
+                !ggml_cuda_hc_ranges_overlap(add, block_out) && !ggml_cuda_hc_ranges_overlap(add, inject) &&
+                // gathered variant: the unfused graph reads block_out (REPEAT) before the gather writes grows, so the
+                // allocator may have placed grows on block_out's memory; here the gather runs first, so refuse overlap
+                (!gr || (!ggml_cuda_hc_ranges_overlap(grows, block_out) && !ggml_cuda_hc_ranges_overlap(grows, residual)));
 
             if (contig_ok) {
                 int out_nodes[] = { i + gr + 6 };
@@ -3672,7 +3730,8 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 const ggml_tensor * may_alias = (residual->data == add->data) ? residual : nullptr;
                 if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 7 + gr, out_nodes, 1, false, may_alias)) {
                     if (gr) {
-                        ggml_cuda_compute_forward(*cuda_ctx, grows);   // the gather itself, unchanged
+                        const bool ok = ggml_cuda_compute_forward(*cuda_ctx, grows);   // the gather itself, unchanged
+                        GGML_ASSERT(ok);
                     }
                     float s1, b1, s2, b2;
                     memcpy(&s1, (const float *) scale1->op_params + 0, sizeof(float));
@@ -4639,8 +4698,9 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
-static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph, const bool cuda_graph_update_required, const void * graph_key) {
+static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph_in, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
+    bool use_cuda_graph = use_cuda_graph_in;
 
     // flag used to determine whether it is an integrated_gpu
     const bool integrated            = ggml_cuda_info().devices[cuda_ctx->device].integrated;
@@ -4831,9 +4891,24 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
             CUDA_CHECK(cudaStreamEndCapture(cuda_ctx->stream(), &graph->graph));
             graph_evaluated_or_captured = true; // CUDA graph has been captured
 
-            std::lock_guard<std::mutex> lock(ggml_cuda_lock);
-            if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
-                ggml_cuda_lock_cv.notify_all();
+            {
+                std::lock_guard<std::mutex> lock(ggml_cuda_lock);
+                if (ggml_cuda_lock_counter.fetch_sub(1, std::memory_order_relaxed) == 1) {
+                    ggml_cuda_lock_cv.notify_all();
+                }
+            }
+            // pool memory unmapped DURING the capture (a full pool evicting a buffer): a recorded kernel may hold
+            // that address, so the capture is discarded and the graph runs eagerly this time; growth alone is fine
+            static const int harden = getenv("GGML_CUDA_GRAPH_HARDEN") ? atoi(getenv("GGML_CUDA_GRAPH_HARDEN")) : 15;
+            if ((harden & 2) && cuda_ctx->pool_free_epoch_all() != graph->pool_free_epoch) {
+                GGML_LOG_WARN("cuda graph dev%d: pool memory freed during capture, running eagerly\n", cuda_ctx->device);
+                CUDA_CHECK(cudaGraphDestroy(graph->graph));
+                graph->graph = nullptr;
+                graph->warmup_complete = false;
+                use_cuda_graph = false;
+                graph_evaluated_or_captured = false;
+            } else if (harden & 1) {
+                graph->pool_epoch = (harden & 4) ? cuda_ctx->pool_epoch_all() : cuda_ctx->pool().epoch;   // growth during the capture is already recorded in it
             }
         } else {
             graph_evaluated_or_captured = true; // ggml graph has been directly evaluated

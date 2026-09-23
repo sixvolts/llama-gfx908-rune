@@ -1212,7 +1212,8 @@ struct ggml_cuda_pool {
 
     // bumped whenever the pool maps or unmaps device memory: captured graphs bake in the addresses of their pool
     // temporaries, which the node properties do not cover, so a graph captured under another epoch is re-captured
-    uint64_t epoch = 0;
+    uint64_t epoch      = 0;
+    uint64_t free_epoch = 0;   // only unmaps: the case that leaves a captured address dangling
 };
 
 template<typename T>
@@ -1289,13 +1290,17 @@ struct ggml_cuda_graph {
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
     uint64_t uid = 0;
-    uint64_t pool_epoch = 0;   // ggml_cuda_pool::epoch at capture
+    uint64_t pool_epoch      = 0;   // sum of the device's pool epochs at capture
+    uint64_t pool_free_epoch = 0;   // sum of the pools' free epochs when the capture started
     int64_t last_used_time = 0;
     struct node_properties {
         ggml_tensor node;
         void *   node_src_data_ptrs[GGML_MAX_SRC];
         int64_t  node_src_ne[GGML_MAX_SRC][GGML_MAX_DIMS];
         size_t   node_src_nb[GGML_MAX_SRC][GGML_MAX_DIMS];
+        int32_t  node_src_type[GGML_MAX_SRC];   // struct pointers are blanked from `node`; pin what an input IS
+        int32_t  node_src_op[GGML_MAX_SRC];
+        int8_t   node_src_view[GGML_MAX_SRC];
     };
     std::vector<node_properties> node_props;
 
@@ -1476,6 +1481,26 @@ struct ggml_backend_cuda_context {
 
     int64_t last_graph_eviction_sweep = 0;
 
+    // every pool of this device (graph optimization puts branch temporaries in the other streams' pools)
+    uint64_t pool_epoch_all() const {
+        uint64_t e = 0;
+        for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+            if (pools[device][s]) {
+                e += pools[device][s]->epoch;
+            }
+        }
+        return e;
+    }
+    uint64_t pool_free_epoch_all() const {
+        uint64_t e = 0;
+        for (int s = 0; s < GGML_CUDA_MAX_STREAMS; ++s) {
+            if (pools[device][s]) {
+                e += pools[device][s]->free_epoch;
+            }
+        }
+        return e;
+    }
+
     ggml_cuda_graph * cuda_graph(const void * first_node_ptr) {
         const int64_t time_now = ggml_time_us();
 
@@ -1493,6 +1518,18 @@ struct ggml_backend_cuda_context {
 
         auto it = cuda_graphs.find(first_node_ptr);
         if (it == cuda_graphs.end()) {
+            // keys carry every node shape (KV length buckets, batch shapes, input-copy rotation): cap the map, LRU
+            static const int harden = getenv("GGML_CUDA_GRAPH_HARDEN") ? atoi(getenv("GGML_CUDA_GRAPH_HARDEN")) : 15;
+            if ((harden & 8) && cuda_graphs.size() >= 64) {
+                auto victim = cuda_graphs.end();
+                for (auto jt = cuda_graphs.begin(); jt != cuda_graphs.end(); ++jt) {
+                    if (victim == cuda_graphs.end() || jt->second->last_used_time < victim->second->last_used_time) {
+                        victim = jt;
+                    }
+                }
+                GGML_LOG_WARN("cuda graph dev%d: evicting LRU graph entry (%zu keys)\n", device, cuda_graphs.size());
+                cuda_graphs.erase(victim);
+            }
             it = cuda_graphs.emplace(first_node_ptr, std::make_unique<ggml_cuda_graph>()).first;
         }
         it->second->last_used_time = time_now;

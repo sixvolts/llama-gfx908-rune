@@ -21,6 +21,7 @@
 #include <algorithm>
 #include <cstddef>
 #include <cinttypes>
+#include <thread>
 #include <exception>
 #include <memory>
 #include <filesystem>
@@ -2903,6 +2904,27 @@ private:
                 server_task task(SERVER_TASK_TYPE_NEXT_RESPONSE);
                 task.id = queue_tasks.get_new_id();
                 queue_tasks.post(std::move(task));
+            }
+        }
+
+        // LLAMA_SERVER_TEST_BARRIER=N (test hook): hold the first batch until N slots are launched, so a multi-stream
+        // oracle starts all its prompts in one batch in queue order instead of whatever the arrival timing produced
+        // (with 3 requests arriving within a few ms the prompts were batched 1+2 or 3 at random, and the seeded
+        // outputs differ per composition)
+        {
+            static const int barrier = getenv("LLAMA_SERVER_TEST_BARRIER") ? atoi(getenv("LLAMA_SERVER_TEST_BARRIER")) : 0;
+            static bool released = false;
+            if (barrier > 0 && !released) {
+                int n_proc = 0;
+                for (auto & slot : slots) {
+                    n_proc += slot.is_processing() ? 1 : 0;
+                }
+                if (n_proc < barrier) {
+                    std::this_thread::sleep_for(std::chrono::milliseconds(1));
+                    return;
+                }
+                released = true;
+                SRV_WRN("test barrier released with %d slots\n", n_proc);
             }
         }
 

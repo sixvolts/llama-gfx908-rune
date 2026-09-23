@@ -251,7 +251,8 @@ static __global__ void __launch_bounds__(256, 1) top_k_small_partial(
     for (int e = 0; e < EPT; ++e) {
         const int c = c0 + e*256 + threadIdx.x;
         const bool ok = c < c0 + slice && c < ncols;
-        v[e]  = ok ? x[c] : -INFINITY;
+        const float xv = ok ? x[c] : -INFINITY;
+        v[e]  = xv == xv ? xv : -INFINITY;   // NaN would break the argmax ordering (the radix path ranks it as +inf)
         ix[e] = ok ? c : 0x7fffffff;
     }
     __shared__ float s_v[4]; __shared__ int s_i[4];
@@ -280,7 +281,8 @@ static __global__ void __launch_bounds__(256, 1) top_k_small_merge(
     for (int e = 0; e < EPT; ++e) {
         const int c = e*256 + threadIdx.x;
         const bool ok = c < n;
-        v[e]  = ok ? cand_v[row*n + c] : -INFINITY;
+        const float cv = ok ? cand_v[row*n + c] : -INFINITY;
+        v[e]  = cv == cv ? cv : -INFINITY;
         ix[e] = ok ? cand_i[row*n + c] : 0x7fffffff;
     }
     __shared__ float s_v[4]; __shared__ int s_i[4];
@@ -291,7 +293,7 @@ static __global__ void __launch_bounds__(256, 1) top_k_small_merge(
             if (v[e] > bv || (v[e] == bv && ix[e] < bi)) { bv = v[e]; bi = ix[e]; }
         }
         top_k_small_argmax_block(bv, bi, s_v, s_i);
-        if (threadIdx.x == 0) { dst[row*k + r] = bi; }
+        if (threadIdx.x == 0) { dst[row*k + r] = bi == 0x7fffffff ? 0 : bi; }   // never emit the sentinel as an index
 #pragma unroll
         for (int e = 0; e < EPT; ++e) {
             if (ix[e] == bi) { v[e] = -INFINITY; ix[e] = 0x7fffffff; }
@@ -306,6 +308,9 @@ static bool top_k_small_cuda(ggml_cuda_pool & pool, const float * src, int * dst
     }
     const int slice = (ncols + TOP_K_SMALL_NBLK - 1) / TOP_K_SMALL_NBLK;
     const int ept = (slice + 255) / 256;
+    if (ept > 16) {
+        return false;
+    }
     ggml_cuda_pool_alloc<float> cv(pool, (size_t) nrows*TOP_K_SMALL_NBLK*k);
     ggml_cuda_pool_alloc<int>   ci(pool, (size_t) nrows*TOP_K_SMALL_NBLK*k);
     const dim3 grid(nrows*TOP_K_SMALL_NBLK);

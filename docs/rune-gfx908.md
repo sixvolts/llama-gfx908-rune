@@ -252,3 +252,45 @@ captured graph records the epoch it was captured under, and a mismatch forces a 
 Oracles: 3 concurrent seeded streams (slots joining and leaving) match GGML_CUDA_DISABLE_GRAPHS=1 three times in a row;
 the single-stream alternating-shape case matches eager too. GGML_CUDA_GRAPH_KEY_MODE=0 / GGML_CUDA_GRAPH_PROPS_MODE=0..2
 restore the old key / property comparison for bisection.
+
+## 2026-09-23: 12th production build - MMQ activation-buffer over-read (a latent production fault), graph-cache hardening, deterministic multi-stream oracle
+
+Correction to the pool-epoch addendum above: the 3-stream fault was not the graph cache. It reproduced with the frozen
+11th-build backend and with every graph-cache switch (upstream key/props, no uid shortcut, re-instantiate instead of
+exec update), and only disappeared under settings that happened to change the memory-pool layout (eager, re-capture
+on every call, no prompt cache). rocgdb caught `mul_mat_q<Q8_0,16,false>` at an `s_waitcnt vmcnt(0)`; the allocation
+log (GGML_CUDA_ALLOC_LOG=1) placed the faulting address exactly at the end of a 2 MiB pool chunk, 1088 bytes past an
+8192-byte pool buffer holding the quantized activations of `hc_up` (K = 320 padded to 512, 12 columns).
+
+- `mmq.cuh` / `mmq.cu`: the MMQ y tile of a K block is fetched as whole chunks of nthreads ints (the prefetch loop and
+  the plain loop both index `l = l0 + tid` up to the padded LDS tile), so the last K block's load reads up to
+  `J*MMQ_TILE_Y_K + nthreads - 1` ints from its start, past the ne11 valid columns. The buffer was padded by
+  `ggml_cuda_mmq_get_J_max()*sizeof(block_q8_1_mmq)` only, and J_max is 0 for ne11 < 16 on CDNA (no J = 8 config) while
+  the dispatcher still launches J = 16: no padding at all for 9..15-column batches (exactly what slots joining a running
+  decode produce). `ggml_cuda_mmq_get_y_padding()` now pads by `(max(16, J_max)*MMQ_TILE_Y_K + nthreads_max)*4` bytes at
+  both allocation sites (dense and MoE). The columns read past ne11 are never written back, so results are unchanged;
+  only the pages must exist. Present since the 5th build (chunked prefetch) and in production on both hives.
+- `tools/server/server-context.cpp`: `LLAMA_SERVER_TEST_BARRIER=N` (test hook) holds the first batch until N slots are
+  launched. Without it the "3 concurrent seeded streams" oracle was only deterministic by timing luck: the 3 requests
+  arrive within a few ms, and whether the prompts are batched 3 or 1+2 (and which slot gets which prompt) changes the
+  batch composition, so tolerance-class kernels give different per-token numerics and different text. The 11th build
+  "failed" its own reference this way for an hour of misdirected bisection. With the barrier (client: conc_hash3.py,
+  requests 80 ms apart) pass 1 is `b6c553c1 f739b818 114f17a1` for the 11th backend, the 12th, graphs and eager alike;
+  pass 2 (slots re-launched from the prompt cache, staggered joins) is `db769488 7f5f2970 114f17a1` and is the
+  reproduction of the fault above.
+- `ggml-cuda.cu` / `common.cuh` graph-cache hardening from the review: the pool epoch is summed over every stream's
+  pool of the device and bumped by `clear_pool()`; a free during a capture (`free_epoch`) discards that capture and runs
+  the graph eagerly once; node properties also pin each input's type/op/view flag; the key mixes op and each ne
+  separately; the graph map is LRU-capped at 64 entries. `GGML_CUDA_GRAPH_HARDEN=<bits>` (1 post-capture epoch,
+  2 discard, 4 all pools, 8 LRU) and `GGML_CUDA_GRAPH_DIAG=<bits>` (1 no uid shortcut, 2 re-capture every call,
+  4 re-instantiate) exist for bisection only.
+- Diagnostics kept (env-gated, free when off): `GGML_CUDA_ALLOC_LOG=1` logs every device/pinned allocation and free
+  with the op being computed, and every MMQ launch with its y pointer and tiling; rocgdb procedure in the memory notes.
+- `top-k.cu` (small-k path): NaN scores rank as -inf (the radix path ranks them as +inf), the sentinel index is never
+  emitted, and rows wider than 64*256*16 columns fall back to the radix path. `mmvq-q8.cu`: launch error check.
+- The per-shape decode-scheduler experiment (LLAMA_DECODE_SCHEDS) was reviewed and dropped: its payoff is capped at the
+  host graph-rebuild cost (~1.5 ms per shape change, and llama's graph reuse already covers the steady state), while it
+  broke the re-reserve invalidation rules and the backend-sampler binding.
+Validation (12th build): barrier 3-stream passes 1/2/3 = `b6c553c1 f739b818 114f17a1` / `db769488 7f5f2970 114f17a1` /
+same, no fault (the 11th backend faulted on pass 2 every time); seeded single-stream chats hash-identical to the 11th
+(37b4304d...), MTP step 33.42 ms (11th: 33.50); adaptive-shape chats hash-identical to eager (90b15b34...).
