@@ -276,7 +276,7 @@ gated_delta_net_lpc_cuda(const float * q, const float * k, const float * v, cons
     // One token step. Kept branch-free (unconditional attn store from all 16 lanes of the group, same value and
     // address) so that a group of D tokens compiles to one straight-line block: the compiler's wait-count
     // analysis then keeps the ring loads pending across tokens instead of draining them at every block boundary.
-    auto step = [&](const int t, const int d) {
+    auto step = [&](const int t, const int d, const bool do_store) {
         float kr[RPL], qr[RPL], ge[KDA ? RPL : 1];
 #pragma unroll
         for (int r = 0; r < RPL; r++) {
@@ -307,7 +307,7 @@ gated_delta_net_lpc_cuda(const float * q, const float * k, const float * v, cons
         attn = gdn_sum16(attn);
         attn_data[(int64_t) t * S_v * H + col] = attn * scale;
 
-        if constexpr (keep_rs_t) {
+        if (keep_rs_t && do_store) {
             const int target_slot = (int) n_tokens - 1 - t;
             if (target_slot >= 0 && target_slot < K) {
                 float * st = state + target_slot * state_slot_stride + col * S_v + row0;
@@ -319,18 +319,25 @@ gated_delta_net_lpc_cuda(const float * q, const float * k, const float * v, cons
         }
     };
 
+    // keep_rs (MTP rollback snapshots): only the last K tokens store a state. Doing that check inside the
+    // straight-line D-token group breaks it into basic blocks and the wait-count pass drains the ring every token
+    // (2.47x slower, measured), so the tokens that never store run in a separate branch-free main loop.
+    // Same per-token arithmetic and order either way (bit-exact).
     int t0 = 0;
-    for (; t0 + D <= n_tokens; t0 += D) {
+    const int n_main = keep_rs_t ? (int) n_tokens - K : (int) n_tokens;
+    for (; t0 + D <= n_main; t0 += D) {
 #pragma unroll
         for (int d = 0; d < D; d++) {
-            step(t0 + d, d);
+            step(t0 + d, d, false);
         }
     }
-    // tail (< D tokens)
+    // remainder (< D tokens without snapshots, plus the snapshot tokens), t0 stays a multiple of D so the ring slot is t % D
+    for (; t0 < n_tokens; t0 += D) {
 #pragma unroll
-    for (int d = 0; d < D; d++) {
-        if (t0 + d < n_tokens) {
-            step(t0 + d, d);
+        for (int d = 0; d < D; d++) {
+            if (t0 + d < n_tokens) {
+                step(t0 + d, d, true);
+            }
         }
     }
 

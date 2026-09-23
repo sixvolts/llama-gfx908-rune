@@ -310,15 +310,20 @@ struct server_slot {
         SRV_TRC(" - saving prompt with length %d, total state size = %.3f MiB (draft: %.3f MiB)\n",
                 (int) prompt.tokens.size(), cur_size / (1024.0 * 1024.0), cur_size_dft / (1024.0 * 1024.0));
 
+        const int64_t t0 = ggml_time_us();
         auto * cur = prompt_cache.alloc(prompt, cur_size_tgt, cur_size_dft);
         if (cur == nullptr) {
             return false;
         }
+        const int64_t t1 = ggml_time_us();
 
         llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), cur_size_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
+        const int64_t t2 = ggml_time_us();
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
+        const int64_t t3 = ggml_time_us();
+        SRV_TRC(" - prompt_save timing: alloc %.1f ms, target state %.1f ms, draft state %.1f ms\n", (t1 - t0)/1e3, (t2 - t1)/1e3, (t3 - t2)/1e3);
 
         return true;
     }
@@ -3134,12 +3139,18 @@ private:
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
+        // while other slots are generating (their tokens are already in the batch), cap the prompt tokens added in
+        // this iteration: every generating slot waits for the whole batch, so an 8192-token prefill chunk stalls their
+        // decode for seconds. LLAMA_SERVER_BUSY_PROMPT_CAP=<tokens> (0/unset = off, i.e. up to n_batch as upstream).
+        static const int32_t busy_prompt_cap = getenv("LLAMA_SERVER_BUSY_PROMPT_CAP") ? atoi(getenv("LLAMA_SERVER_BUSY_PROMPT_CAP")) : 0;
+        const int32_t n_batch_prompt = (busy_prompt_cap > 0 && batch.size() > 0) ? std::min<int32_t>(n_batch, batch.size() + busy_prompt_cap) : n_batch;
+
         // next, batch any pending prompts without exceeding n_batch
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
             iterate(slots, [&](server_slot & slot) {
-                if (!add_ok || batch.size() >= n_batch) {
+                if (!add_ok || batch.size() >= n_batch_prompt) {
                     return; // batch is full, skip remaining slots
                 }
 
@@ -3548,7 +3559,7 @@ private:
                     const auto last_user_pos = spans.last_user_message_pos();
 
                     // add prompt tokens for processing in the current batch
-                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+                    while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch_prompt) {
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
