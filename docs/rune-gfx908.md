@@ -216,3 +216,16 @@ call; GGML_CUDA_GRAPH_STATS=1 / GGML_CUDA_GRAPH_DEBUG=1 report reuse counts and 
 Validation rule for any graph-cache change: seeded chats (scratch chatab2.py) must hash-equal GGML_CUDA_DISABLE_GRAPHS=1.
 The remaining cost of a shape change is the llama graph rebuild path (~0.75 ms build + ~0.8 ms sched alloc + ~1.6 ms
 extra enqueue), which is why per-step adaptive draft lengths measure +1.3% today and +5.9% without it.
+
+## 2026-09-23: dense Q8_0 GEMV for 1..4 columns (mmvq-q8.cu)
+
+The 3-row MTP verify spends ~7.5 ms/step in ~300 dense Q8_0 GEMVs (attn_qkv/gate/q/k, ssm_out, shared-expert
+gate/up/down, output) at 160-700 GB/s: mul_mat_vec_q reads the 34-byte Q8_0 blocks with 16-bit loads and its runtime
+K loop keeps little in flight. `mmvq_q8_0_v2<NB, ncols, RPB>` replays mul_mat_vec_q's GCN partition exactly (nwarps 2,
+kbx = tid/4 + 32*it, kqs = 2*(tid%4), same _impl, warp-1 partials through shared memory, warp_reduce_sum<64>) with the
+K loop unrolled at compile time (K = 640/2560/6144), every load issued first and one 8-byte load per lane and block
+(2-byte aligned; CDNA accepts it). Bit-identical to the reference on all 8 model shapes x 1..4 columns (golden/gemv_bench).
+Rows per block is a free knob (a row's order is one lane sequence): 1 for one column, 4 for 2..4 columns on >= 2048 rows.
+Isolated: 6144x2560 at 3 cols 28.3 -> 24.0 us, at 4 cols 33.4 -> 26.6; output layer at 1 col 804 -> 717 us.
+Server: MTP step 34.26 -> 33.62 ms (2 drafts), 39.87 -> 39.13 (3 drafts); seeded outputs unchanged.
+GGML_MMVQ_Q8_V2=0 disables; GGML_MMVQ_Q8_RPB=<n> overrides rows per block.

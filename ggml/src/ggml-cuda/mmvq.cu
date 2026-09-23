@@ -1,5 +1,6 @@
 #include "mmvq.cuh"
 #include "mmvq-moe.cuh"
+#include "mmvq-q8.cuh"
 #include "quantize.cuh"
 #include "unary.cuh"
 #include "vecdotq.cuh"
@@ -1036,6 +1037,16 @@ static void mul_mat_vec_q_switch_ncols_dst(
     const mmvq_parameter_table_id table_id  = get_device_table_id(cc);
 
     const bool has_ids = ids != nullptr;
+
+    // dense Q8_0, 1..4 columns, no fusion: unrolled bit-identical kernel where the shape is supported (mmvq-q8.cu)
+    if constexpr (type == GGML_TYPE_Q8_0) {
+        const bool fused = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
+                           fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+        if (!has_ids && !fused && ggml_cuda_mmvq_q8_v2(vx, vy, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y,
+                stride_col_dst, nchannels_x, nchannels_y, nchannels_dst, nsamples_x, nsamples_dst, stream)) {
+            return;
+        }
+    }
 
     // How the K loop divides up at the baseline block width, both decisions below use these.
     constexpr int qk                    = ggml_cuda_type_traits<type>::qk;
