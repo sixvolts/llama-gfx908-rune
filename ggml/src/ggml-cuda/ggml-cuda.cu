@@ -2509,6 +2509,67 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
+// Device pairs without peer access (rune's PCIe-only "orphan" GPUs): hipMemcpyPeerAsync faults there, so the copy is staged
+// through a small ring of pinned host buffers per (src, dst) pair: D2H on the src stream, H2D on the dst stream after an
+// event, slot reuse gated by an event recorded after its H2D. Both streams stay asynchronous (pipeline parallelism keeps
+// overlapping); the host only waits if a slot is still in flight N copies later.
+static bool ggml_cuda_can_access_peer(const int dev, const int dev_other) {
+    static int cache[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES] = {};   // 0 unknown, 1 yes, 2 no
+    int & c = cache[dev][dev_other];
+    if (c == 0) {
+        int can = 0;
+        CUDA_CHECK(cudaDeviceCanAccessPeer(&can, dev, dev_other));
+        c = can ? 1 : 2;
+    }
+    return c == 1;
+}
+
+struct ggml_cuda_stage_ring {
+    static constexpr int N = 4;
+    void *      buf[N]      = {};
+    size_t      size[N]     = {};
+    cudaEvent_t d2h_done[N] = {};   // created on the src device
+    cudaEvent_t h2d_done[N] = {};   // created on the dst device
+    bool        used[N]     = {};
+    int         next        = 0;
+};
+
+static void ggml_cuda_cpy_host_staged(ggml_backend_cuda_context * ctx_src, ggml_backend_cuda_context * ctx_dst,
+        void * dst, const void * src, const size_t nbytes) {
+    static std::mutex mtx;
+    static ggml_cuda_stage_ring rings[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES];
+    std::lock_guard<std::mutex> lock(mtx);
+
+    ggml_cuda_stage_ring & r = rings[ctx_src->device][ctx_dst->device];
+    const int i = r.next;
+    r.next = (r.next + 1) % ggml_cuda_stage_ring::N;
+    if (r.used[i]) {
+        CUDA_CHECK(cudaEventSynchronize(r.h2d_done[i]));   // slot i's previous H2D has consumed the buffer
+    }
+    if (r.size[i] < nbytes) {
+        if (r.buf[i]) {
+            CUDA_CHECK(cudaFreeHost(r.buf[i]));
+        }
+        CUDA_CHECK(cudaMallocHost(&r.buf[i], nbytes));
+        r.size[i] = nbytes;
+    }
+    if (!r.d2h_done[i]) {
+        ggml_cuda_set_device(ctx_src->device);
+        CUDA_CHECK(cudaEventCreateWithFlags(&r.d2h_done[i], cudaEventDisableTiming));
+        ggml_cuda_set_device(ctx_dst->device);
+        CUDA_CHECK(cudaEventCreateWithFlags(&r.h2d_done[i], cudaEventDisableTiming));
+    }
+    ggml_cuda_set_device(ctx_src->device);
+    CUDA_CHECK(cudaMemcpyAsync(r.buf[i], src, nbytes, cudaMemcpyDeviceToHost, ctx_src->stream()));
+    CUDA_CHECK(cudaEventRecord(r.d2h_done[i], ctx_src->stream()));
+    ggml_cuda_set_device(ctx_dst->device);
+    CUDA_CHECK(cudaStreamWaitEvent(ctx_dst->stream(), r.d2h_done[i], 0));
+    CUDA_CHECK(cudaMemcpyAsync(dst, r.buf[i], nbytes, cudaMemcpyHostToDevice, ctx_dst->stream()));
+    CUDA_CHECK(cudaEventRecord(r.h2d_done[i], ctx_dst->stream()));
+    r.used[i] = true;
+    ggml_cuda_set_device(ctx_src->device);
+}
+
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
     ggml_backend_buffer_t buf_src = src->view_src ? src->view_src->buffer : src->buffer;
     ggml_backend_buffer_t buf_dst = dst->view_src ? dst->view_src->buffer : dst->buffer;
@@ -2547,7 +2608,11 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
-            CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), cuda_ctx_src->stream()));
+            if (ggml_cuda_can_access_peer(src_physical, dst_physical)) {
+                CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(dst), cuda_ctx_src->stream()));
+            } else {
+                ggml_cuda_cpy_host_staged(cuda_ctx_src, cuda_ctx_dst, dst->data, src->data, ggml_nbytes(dst));
+            }
 #endif // GGML_CUDA_NO_PEER_COPY
         }
 
