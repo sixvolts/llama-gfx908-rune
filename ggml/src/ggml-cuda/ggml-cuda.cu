@@ -2616,7 +2616,20 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    // A context builds every graph into the same buffer, so nodes[0] alone is the same pointer for graphs of
+    // different shapes (e.g. the MTP head's 3-row catch-up and 1-row draft, or the trunk at different slot counts),
+    // which then evict each other's instance and re-capture on every call. Mix the node count and the first/last
+    // node shapes into the key. The key only selects a cache slot; node properties are still compared in full.
+    const ggml_tensor * first = cgraph->nodes[0];
+    const ggml_tensor * last  = cgraph->nodes[cgraph->n_nodes - 1];
+    uint64_t h = (uint64_t) (uintptr_t) first;
+    auto mix = [&h](uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); };
+    mix((uint64_t) cgraph->n_nodes);
+    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
+        mix((uint64_t) first->ne[d]);
+        mix((uint64_t) last->ne[d]);
+    }
+    return (const void *) (uintptr_t) h;
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {

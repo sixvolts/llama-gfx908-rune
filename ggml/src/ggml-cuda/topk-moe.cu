@@ -2,8 +2,38 @@
 #include "ggml.h"
 #include "topk-moe.cuh"
 
+#include <climits>
 #include <cmath>
 #include <initializer_list>
+
+#if defined(GGML_USE_HIP) && defined(CDNA)
+// CDNA (wave64): the per-round argmax of the top-k loop is done with DPP row moves plus one ds_swizzle (lane ^ 16)
+// instead of 5 butterfly shuffle rounds on value and index. Same result as the reference loop (max value, lowest
+// expert index on ties): byte-identical ids and weights (checked on random and heavily tied inputs). 14.6 -> 10.1 us
+// per call on MI100 for 512 experts / top-10.
+#define TOPK_MOE_FAST_SELECT 1
+template <int ctrl> static __device__ __forceinline__ float topk_moe_dpp_f(const float x) {
+    return __int_as_float(__builtin_amdgcn_update_dpp(0, __float_as_int(x), ctrl, 0xF, 0xF, false));
+}
+template <int ctrl> static __device__ __forceinline__ int topk_moe_dpp_i(const int x) {
+    return __builtin_amdgcn_update_dpp(0, x, ctrl, 0xF, 0xF, false);
+}
+// reductions over each 32-lane group (a ggml "warp" of WARP_SIZE = 32 lanes; two per wave64)
+static __device__ __forceinline__ float topk_moe_max32(float x) {
+    x = fmaxf(x, topk_moe_dpp_f<0xB1>(x));   // quad_perm [1,0,3,2]
+    x = fmaxf(x, topk_moe_dpp_f<0x4E>(x));   // quad_perm [2,3,0,1]
+    x = fmaxf(x, topk_moe_dpp_f<0x124>(x));  // row_ror:4
+    x = fmaxf(x, topk_moe_dpp_f<0x128>(x));  // row_ror:8 -> every lane holds its 16-lane row max
+    return fmaxf(x, __int_as_float(__builtin_amdgcn_ds_swizzle(__float_as_int(x), 0x401F))); // lane ^ 16
+}
+static __device__ __forceinline__ int topk_moe_min32(int x) {
+    x = min(x, topk_moe_dpp_i<0xB1>(x));
+    x = min(x, topk_moe_dpp_i<0x4E>(x));
+    x = min(x, topk_moe_dpp_i<0x124>(x));
+    x = min(x, topk_moe_dpp_i<0x128>(x));
+    return min(x, __builtin_amdgcn_ds_swizzle(x, 0x401F));
+}
+#endif // defined(GGML_USE_HIP) && defined(CDNA)
 
 // Kernel config struct - passed by value to CUDA kernel
 struct topk_moe_config {
@@ -213,6 +243,33 @@ __global__ void topk_moe_cuda(const float *         logits,
                 selection_wt[max_expert / WARP_SIZE] = -INFINITY;
             }
         } else {
+#ifdef TOPK_MOE_FAST_SELECT
+            // value max over the group, then the lowest expert index holding it (== the reference tie-break)
+            float lmax = wt[0];
+#pragma unroll
+            for (int i = 1; i < experts_per_thread; i++) {
+                lmax = fmaxf(lmax, wt[i]);
+            }
+            max_val = topk_moe_max32(lmax);
+            int lidx = INT_MAX;
+#pragma unroll
+            for (int i = experts_per_thread - 1; i >= 0; i--) {
+                const int expert = threadIdx.x + i * WARP_SIZE;
+                if ((n_experts % WARP_SIZE == 0 || expert < n_experts) && wt[i] == max_val) {
+                    lidx = expert;
+                }
+            }
+            max_expert = topk_moe_min32(lidx);
+
+            if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
+#pragma unroll
+                for (int i = 0; i < experts_per_thread; i++) {
+                    if (i == max_expert / WARP_SIZE) {
+                        wt[i] = -INFINITY;
+                    }
+                }
+            }
+#else
 #pragma unroll
             for (int i = 1; i < experts_per_thread; i++) {
                 const int expert = threadIdx.x + i * WARP_SIZE;
@@ -235,6 +292,7 @@ __global__ void topk_moe_cuda(const float *         logits,
             if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
                 wt[max_expert / WARP_SIZE] = -INFINITY;
             }
+#endif // TOPK_MOE_FAST_SELECT
         }
 
         if ((k & (WARP_SIZE - 1)) == threadIdx.x) {

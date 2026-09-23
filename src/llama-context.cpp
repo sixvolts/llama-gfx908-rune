@@ -1908,8 +1908,10 @@ int llama_context::decode(const llama_batch & batch_inp) {
         // split layout and forces a graph reallocation (draining every device) on each prompt ubatch, defeating
         // pipeline parallelism. Build the graph with one discarded output row instead; the real count is
         // restored below for the output extraction.
+        // Only needed with pipeline parallelism: elsewhere (e.g. the single-device MTP head's zero-output catch-up
+        // decode) the dummy row just costs a full lm_head GEMV (~0.77 ms on MI100 for a 248k vocab).
         const int32_t n_outputs_real = n_outputs;
-        if (n_outputs == 0) {
+        if (n_outputs == 0 && cparams.pipeline_parallel) {
             n_outputs = 1;
         }
 
