@@ -3600,22 +3600,34 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (node->op == GGML_OP_REPEAT && !hc_fuse_disabled) {
         std::initializer_list<enum ggml_op> hc_combine_ops = {
             GGML_OP_REPEAT, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_RESHAPE, GGML_OP_MUL, GGML_OP_ADD };
+        // when only some rows are output (the trunk's last layer, every layer of the MTP head) the graph gathers
+        // inject's rows first: REPEAT, GET_ROWS, SCALE, ... The gather runs as its own op, the other seven fuse.
+        std::initializer_list<enum ggml_op> hc_combine_ops_gr = {
+            GGML_OP_REPEAT, GGML_OP_GET_ROWS, GGML_OP_SCALE, GGML_OP_UNARY, GGML_OP_SCALE, GGML_OP_RESHAPE, GGML_OP_MUL, GGML_OP_ADD };
         bool matched = false;
+        int  gr = -1;   // 0: plain pattern, 1: with the gather
         if (i + 6 < cgraph->n_nodes && ggml_can_fuse_subgraph(cgraph, i, hc_combine_ops, { i + 6 })) {
+            gr = 0;
+        } else if (i + 7 < cgraph->n_nodes && ggml_can_fuse_subgraph(cgraph, i, hc_combine_ops_gr, { i + 7 })) {
+            gr = 1;
+        }
+        if (gr >= 0) {
             const ggml_tensor * repeat = cgraph->nodes[i];
-            const ggml_tensor * scale1 = cgraph->nodes[i + 1];
-            const ggml_tensor * sigm   = cgraph->nodes[i + 2];
-            const ggml_tensor * scale2 = cgraph->nodes[i + 3];
-            const ggml_tensor * resh_w = cgraph->nodes[i + 4];
-            const ggml_tensor * mul    = cgraph->nodes[i + 5];
-            ggml_tensor *       add    = cgraph->nodes[i + 6];
+            ggml_tensor *       grows  = gr ? cgraph->nodes[i + 1] : nullptr;
+            const ggml_tensor * scale1 = cgraph->nodes[i + gr + 1];
+            const ggml_tensor * sigm   = cgraph->nodes[i + gr + 2];
+            const ggml_tensor * scale2 = cgraph->nodes[i + gr + 3];
+            const ggml_tensor * resh_w = cgraph->nodes[i + gr + 4];
+            const ggml_tensor * mul    = cgraph->nodes[i + gr + 5];
+            ggml_tensor *       add    = cgraph->nodes[i + gr + 6];
 
             const ggml_tensor * residual  = add->src[0];
             const ggml_tensor * block_out = repeat->src[0];   // reshape view of the block output
-            const ggml_tensor * inject    = scale1->src[0];
+            const ggml_tensor * inject    = scale1->src[0];   // = grows when gathered
 
-            const bool wired = ggml_get_unary_op(sigm) == GGML_UNARY_OP_SIGMOID &&
-                ggml_check_edges(cgraph, i, {{2, 0, 1}, {3, 0, 2}, {4, 0, 3}, {5, 0, 0}, {5, 1, 4}, {6, 1, 5}});
+            const bool wired = ggml_get_unary_op(sigm) == GGML_UNARY_OP_SIGMOID && (!gr || inject == grows) &&
+                (gr ? ggml_check_edges(cgraph, i, {{2, 0, 1}, {3, 0, 2}, {4, 0, 3}, {5, 0, 4}, {6, 0, 0}, {6, 1, 5}, {7, 1, 6}})
+                    : ggml_check_edges(cgraph, i, {{2, 0, 1}, {3, 0, 2}, {4, 0, 3}, {5, 0, 0}, {5, 1, 4}, {6, 1, 5}}));
 
             const int64_t ne0 = add->ne[0], hc = add->ne[1], nt = add->ne[2];
             const bool shapes_ok = wired && add->ne[3] == 1 &&
@@ -3634,11 +3646,14 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 !ggml_cuda_hc_ranges_overlap(add, block_out) && !ggml_cuda_hc_ranges_overlap(add, inject);
 
             if (contig_ok) {
-                int out_nodes[] = { i + 6 };
+                int out_nodes[] = { i + gr + 6 };
                 // residual is read and written at the same index, so exact in-place reuse of its buffer is safe;
                 // a shifted partial overlap is not, and still rejects
                 const ggml_tensor * may_alias = (residual->data == add->data) ? residual : nullptr;
-                if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 7, out_nodes, 1, false, may_alias)) {
+                if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 7 + gr, out_nodes, 1, false, may_alias)) {
+                    if (gr) {
+                        ggml_cuda_compute_forward(*cuda_ctx, grows);   // the gather itself, unchanged
+                    }
                     float s1, b1, s2, b2;
                     memcpy(&s1, (const float *) scale1->op_params + 0, sizeof(float));
                     memcpy(&b1, (const float *) scale1->op_params + 1, sizeof(float));
@@ -3650,20 +3665,21 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             }
         }
         if (matched) {
-            return 6;
+            return 6 + gr;
         }
         // one-shot diagnostic: an hc_combine ADD within reach that did not fuse prints the real op sequence
         static bool hc_dbg = getenv("GGML_HC_FUSE_DEBUG") != nullptr;
         static bool hc_dbg_printed = false;
         if (hc_dbg && !hc_dbg_printed) {
             for (int k = 0; k <= 8 && i + k < cgraph->n_nodes; ++k) {
-                if (strncmp(cgraph->nodes[i + k]->name, "hc_combine", 10) == 0) {
+                const char * nm = cgraph->nodes[i + k]->name;
+                if (strncmp(nm, "hc_combine", 10) == 0 || strncmp(nm, "mtp_hc_", 7) == 0) {
                     hc_dbg_printed = true;
-                    GGML_LOG_INFO("hc_combine NOT fused at node %d; ops from i-1:", i);
-                    for (int j = -1; j <= k; ++j) {
-                        if (i + j >= 0) GGML_LOG_INFO(" %s", ggml_op_name(cgraph->nodes[i + j]->op));
+                    std::string ops;
+                    for (int j = -1; j <= k + 2 && i + j < cgraph->n_nodes; ++j) {
+                        if (i + j >= 0) { ops += " "; ops += ggml_op_name(cgraph->nodes[i + j]->op); ops += "("; ops += cgraph->nodes[i + j]->name; ops += ")"; }
                     }
-                    GGML_LOG_INFO("\n");
+                    GGML_LOG_WARN("hc_combine NOT fused at node %d (%s): matched=%d ops from i-1:%s\n", i, nm, (int) matched, ops.c_str());
                     break;
                 }
             }
@@ -4895,6 +4911,18 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
     }
 
+    // GGML_CUDA_GRAPH_DUMP=<n_nodes>: print the nodes of the first graph with exactly that many nodes (diagnostics)
+    static const int dump_n = getenv("GGML_CUDA_GRAPH_DUMP") ? atoi(getenv("GGML_CUDA_GRAPH_DUMP")) : 0;
+    static bool dumped = false;
+    if (dump_n > 0 && !dumped && cgraph->n_nodes == dump_n) {
+        dumped = true;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            const ggml_tensor * n = cgraph->nodes[i];
+            GGML_LOG_WARN("graph dump dev%d node %4d %-12s %-28s [%lld,%lld,%lld,%lld] %s src0=%s\n", cuda_ctx->device, i, ggml_op_name(n->op),
+                n->name, (long long) n->ne[0], (long long) n->ne[1], (long long) n->ne[2], (long long) n->ne[3], ggml_type_name(n->type),
+                n->src[0] ? n->src[0]->name : "-");
+        }
+    }
     ggml_cuda_q8_cache_begin(*cuda_ctx);
     // GGML_CUDA_GRAPH_STATS=1: per-device counts of graph launches by kind (reused exec / re-captured / eager) and the
     // host time of re-captures, logged every 1000 computes. Diagnostics only.

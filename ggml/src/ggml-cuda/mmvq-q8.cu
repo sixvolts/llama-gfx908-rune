@@ -154,6 +154,7 @@ static void mmvq_q8_0_v2_ncols(int ncols, const void * vx, const void * vy, floa
     }
 }
 
+
 bool ggml_cuda_mmvq_q8_v2(
         const void * vx, const void * vy, float * dst, int ncols_x, int nrows_x, int ncols_dst,
         int stride_row_x, int stride_col_y, int stride_col_dst,

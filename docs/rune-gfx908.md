@@ -229,3 +229,17 @@ Rows per block is a free knob (a row's order is one lane sequence): 1 for one co
 Isolated: 6144x2560 at 3 cols 28.3 -> 24.0 us, at 4 cols 33.4 -> 26.6; output layer at 1 col 804 -> 717 us.
 Server: MTP step 34.26 -> 33.62 ms (2 drafts), 39.87 -> 39.13 (3 drafts); seeded outputs unchanged.
 GGML_MMVQ_Q8_V2=0 disables; GGML_MMVQ_Q8_RPB=<n> overrides rows per block.
+
+## 2026-09-23: MTP head trims (top-k, HC combine with gathered rows)
+
+- `top-k.cu`: for k <= 32 on long rows (the draft sampler's top-10 over the 248k vocabulary) a two-kernel partial
+  top-k (64 blocks keep their slice's k largest by k rounds of block argmax, one block merges) replaces the radix select's
+  11 launches: 127 -> 46 us per call on MI100, exactly the k largest values (ties: lowest index). GGML_CUDA_TOPK_SMALL=0
+  restores the radix path.
+- `ggml-cuda.cu`: the HC combine fusion also matches REPEAT, GET_ROWS, SCALE, UNARY, SCALE, RESHAPE, MUL, ADD (the row
+  gather that appears when only some rows are output: the trunk's last layer and every layer of the MTP head); the gather
+  runs as its own op, the other seven fuse as before. GGML_HC_FUSE_DEBUG=1 reports any hc_combine/mtp_hc_ ADD left
+  unfused; GGML_CUDA_GRAPH_DUMP=<n_nodes> prints the first graph with that many nodes.
+- Tolerance-class dense GEMV (lane owns whole Q8_0 blocks, LDS activations, prefetch) was tried and dropped: slower than
+  the bit-exact unrolled kernel on every model shape (e.g. 6144x2560 at 3 columns 28.7 vs 24.0 us).
+Server (seeded chats, hash-identical): draft phase 3.27 -> 3.13 ms, MTP step 33.62 -> 33.34 ms.
