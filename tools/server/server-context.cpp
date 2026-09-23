@@ -2919,7 +2919,7 @@ private:
                 for (auto & slot : slots) {
                     n_proc += slot.is_processing() ? 1 : 0;
                 }
-                if (n_proc < barrier) {
+                if (n_proc < std::min<int>(barrier, (int) slots.size())) {
                     std::this_thread::sleep_for(std::chrono::milliseconds(1));
                     return;
                 }

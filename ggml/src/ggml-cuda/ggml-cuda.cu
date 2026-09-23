@@ -2132,7 +2132,10 @@ static void ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
 }
 
 static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {
-    ggml_cuda_alloc_log_op = dst;
+    struct alloc_log_scope {   // diagnostics: the op being computed, cleared on every exit path
+        alloc_log_scope(const ggml_tensor * t) { ggml_cuda_alloc_log_op = t; }
+        ~alloc_log_scope() { ggml_cuda_alloc_log_op = nullptr; }
+    } alloc_log_scope_(dst);
 
     switch (dst->op) {
         case GGML_OP_ARGMAX:
@@ -2798,7 +2801,8 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     // data pointer of empty views (bisection aid)
     static const int props_mode = getenv("GGML_CUDA_GRAPH_PROPS_MODE") ? atoi(getenv("GGML_CUDA_GRAPH_PROPS_MODE")) : 2;
     for (int i = 0; i < cgraph->n_nodes; i++) {
-        ggml_cuda_graph::node_properties prop = {};
+        ggml_cuda_graph::node_properties prop;
+        memset(&prop, 0, sizeof(prop));   // the struct is compared with memcmp: padding bytes included
         memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
         // struct addresses do not affect the captured kernels (data pointers, shapes, strides and params do): blank
         // them so a rebuilt graph with the same layout matches its captured instance
@@ -4907,6 +4911,10 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 graph->warmup_complete = false;
                 use_cuda_graph = false;
                 graph_evaluated_or_captured = false;
+                // host-side state filled in during the capture: the q8 activation cache holds entries whose quantize
+                // kernels were only recorded, never executed - drop them so the eager re-run quantizes again
+                ggml_cuda_q8_cache_end(*cuda_ctx);
+                ggml_cuda_q8_cache_begin(*cuda_ctx);
             } else if (harden & 1) {
                 graph->pool_epoch = (harden & 4) ? cuda_ctx->pool_epoch_all() : cuda_ctx->pool().epoch;   // growth during the capture is already recorded in it
             }

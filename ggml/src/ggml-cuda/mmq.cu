@@ -137,7 +137,7 @@ void ggml_cuda_mul_mat_q(
 
     if (!ids) {
         const size_t nbytes_src1_q8_1 = ne13*ne12 * ne11*ne10_padded * y_block_size/y_values_per_block +
-            ggml_cuda_mmq_get_y_padding(src0->type, fallback, cc, ne11);
+            ggml_cuda_mmq_get_y_padding(src0->type, fallback, cc);
         ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
         ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
         if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {
@@ -188,7 +188,8 @@ void ggml_cuda_mul_mat_q(
     GGML_ASSERT(ne1 == n_expert_used);
 
     ggml_cuda_pool_alloc<int32_t> ids_src1(ctx.pool(), ne_get_rows);
-    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows);
+    // + the widest J: the tile prologue loads ids_dst[col_low + jt*J + j] for every j < J (unused past the valid count)
+    ggml_cuda_pool_alloc<int32_t> ids_dst(ctx.pool(), ne_get_rows + 128);
     ggml_cuda_pool_alloc<int32_t> expert_bounds(ctx.pool(), ne02 + 1);
 
     // gate/up activations are broadcast across experts (ne11 == 1): quantize each token once and
@@ -229,7 +230,7 @@ void ggml_cuda_mul_mat_q(
         }
     }
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
-        ggml_cuda_mmq_get_y_padding(src0->type, fallback, cc, ne11);
+        ggml_cuda_mmq_get_y_padding(src0->type, fallback, cc);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
     ggml_cuda_pool_alloc<float> src1_scale(ctx.pool());
     if (src0->type == GGML_TYPE_NVFP4 && use_native_fp4) {

@@ -267,9 +267,13 @@ log (GGML_CUDA_ALLOC_LOG=1) placed the faulting address exactly at the end of a 
   `J*MMQ_TILE_Y_K + nthreads - 1` ints from its start, past the ne11 valid columns. The buffer was padded by
   `ggml_cuda_mmq_get_J_max()*sizeof(block_q8_1_mmq)` only, and J_max is 0 for ne11 < 16 on CDNA (no J = 8 config) while
   the dispatcher still launches J = 16: no padding at all for 9..15-column batches (exactly what slots joining a running
-  decode produce). `ggml_cuda_mmq_get_y_padding()` now pads by `(max(16, J_max)*MMQ_TILE_Y_K + nthreads_max)*4` bytes at
-  both allocation sites (dense and MoE). The columns read past ne11 are never written back, so results are unchanged;
-  only the pages must exist. Present since the 5th build (chunked prefetch) and in production on both hives.
+  decode produce). `ggml_cuda_mmq_get_y_padding()` now pads by `(max(16, J_max(512))*MMQ_TILE_Y_K + nthreads_max)*4`
+  bytes (the largest configured J, ~11 KB on CDNA) at both allocation sites: the review showed the MoE path sizes J from
+  the token count (`ncols_hint`/ne12, J = 64 from 49 tokens) rather than from ne11 (1 or n_expert_used), so a padding
+  derived from ne11 still fell short there by up to 5.7 KB for the last expert's 1..40-row tile. The MoE `ids_dst`
+  buffer is padded by 128 entries for the same reason (the tile prologue loads J indices regardless of the valid count;
+  also in upstream). The columns read past the data are never written back, so results are unchanged; only the pages
+  must exist. Present since the 5th build (chunked prefetch) and in production on both hives.
 - `tools/server/server-context.cpp`: `LLAMA_SERVER_TEST_BARRIER=N` (test hook) holds the first batch until N slots are
   launched. Without it the "3 concurrent seeded streams" oracle was only deterministic by timing luck: the 3 requests
   arrive within a few ms, and whether the prompts are batched 3 or 1+2 (and which slot gets which prompt) changes the
@@ -280,7 +284,8 @@ log (GGML_CUDA_ALLOC_LOG=1) placed the faulting address exactly at the end of a 
   reproduction of the fault above.
 - `ggml-cuda.cu` / `common.cuh` graph-cache hardening from the review: the pool epoch is summed over every stream's
   pool of the device and bumped by `clear_pool()`; a free during a capture (`free_epoch`) discards that capture and runs
-  the graph eagerly once; node properties also pin each input's type/op/view flag; the key mixes op and each ne
+  the graph eagerly once (and drops the q8 activation cache first: its entries' quantize kernels were only recorded,
+  never run - a review catch); node properties also pin each input's type/op/view flag; the key mixes op and each ne
   separately; the graph map is LRU-capped at 64 entries. `GGML_CUDA_GRAPH_HARDEN=<bits>` (1 post-capture epoch,
   2 discard, 4 all pools, 8 LRU) and `GGML_CUDA_GRAPH_DIAG=<bits>` (1 no uid shortcut, 2 re-capture every call,
   4 re-instantiate) exist for bisection only.

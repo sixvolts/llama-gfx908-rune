@@ -373,15 +373,6 @@ static constexpr __device__ int ggml_cuda_mmq_get_sram_stride(ggml_type type, in
     return ggml_cuda_mmq_get_sram_stride(ggml_cuda_mmq_get_sram_layout(type, J, fallback));
 }
 
-// Bytes to allocate past the quantized activations (y). The y tile of a K block is fetched as whole chunks of
-// nthreads ints (the prefetch loop and the plain loop both index l = l0 + tid up to the LDS tile's padded size), so
-// the last K block's load reads up to J*MMQ_TILE_Y_K + nthreads - 1 ints from its start, past the ne11 valid columns.
-// The dispatcher launches J >= 16 even for ne11 < 16 (ggml_cuda_mmq_get_J_max returns 0 there: no J = 8 config on
-// CDNA), so the padding must cover J = 16 at least. The columns read past ne11 are never written back (garbage in,
-// discarded), only their pages must exist: a 12-column K = 512 y buffer at the end of a 2 MiB mapping faulted in
-// production (GPU page fault on replay of a captured graph, 2026-09-23).
-static __host__ size_t ggml_cuda_mmq_get_y_padding(const ggml_type type, const bool fallback, const int cc, const int64_t ne11);
-
 static __host__ int ggml_cuda_mmq_get_J_max(const ggml_type type, const bool fallback, const int cc, const int64_t ne11) {
     int ret = std::min(ne11, int64_t(512));
     ret -= ret % 8;
@@ -393,8 +384,16 @@ static __host__ int ggml_cuda_mmq_get_J_max(const ggml_type type, const bool fal
     return ret;
 }
 
-static __host__ size_t ggml_cuda_mmq_get_y_padding(const ggml_type type, const bool fallback, const int cc, const int64_t ne11) {
-    const int J_alloc = std::max(16, ggml_cuda_mmq_get_J_max(type, fallback, cc, ne11));
+// Bytes to allocate past the quantized activations (y). The y tile of a K block is fetched as whole chunks of
+// nthreads ints (the prefetch loop and the plain loop both index l = l0 + tid up to the LDS tile's padded size), so
+// the last K block's load reads up to J*MMQ_TILE_Y_K + nthreads - 1 ints from its start, past the valid columns.
+// J is sized from the largest configured tile: the dispatcher launches J >= 16 even for ne11 < 16
+// (ggml_cuda_mmq_get_J_max returns 0 there: no J = 8 config on CDNA) and the MoE path picks J from the token count
+// rather than ne11. The columns read past the data are never written back (garbage in, discarded), only their pages
+// must exist: a 12-column K = 512 y buffer at the end of a 2 MiB mapping faulted in production (GPU page fault on
+// replay of a captured graph, 2026-09-23). Depends only on (type, fallback, cc): ~11 KB on CDNA.
+static __host__ size_t ggml_cuda_mmq_get_y_padding(const ggml_type type, const bool fallback, const int cc) {
+    const int J_alloc = std::max(16, ggml_cuda_mmq_get_J_max(type, fallback, cc, 512));
     int nthreads_max = 0;
     for (int J = 8; J <= 128; J += 8) {
         const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
