@@ -101,3 +101,20 @@ prompt 1438 -> 1716 t/s, decode unchanged (60 t/s chat with MTP, 45 t/s without)
 mean rows per expert (routing is heavily skewed; -8%), I=64/occupancy-2 tiles (-19%), per-load branches to skip unused
 activation rows (-10%), forcing all dense GEMMs onto MMQ (-3%), prefetching inputs in the warp-per-column GDN kernel (issue-bound).
 Diagnostics: `GGML_MMQ_DUMP_IDS=1` (rows-per-expert histogram), `GGML_CUDA_DUMP_MM=1` (shapes routed to rocBLAS).
+
+## 2026-09-23: server-side fixes from the kernel review (6th production build)
+
+- `gated_delta_net.cu`: with MTP the server asks the GDN op for K>1 rollback snapshots, and the per-token snapshot check
+  inside the straight-line D-token group made the compiler drain the load ring every token (2.47x slower). Tokens that
+  never snapshot now run in a separate branch-free loop. Byte-identical output (A/B vs the previous library at n = 3..2048,
+  K = 1 and 3); K=3 at 512 tokens 3.27 -> 1.68 ms, at 2048 tokens 10.8 -> 4.5 ms.
+- Prompt cache (configuration): `--no-cache-idle-slots --cache-ram 65536`. In non-unified KV mode idle slots keep their
+  state on the GPU and a slot is always saved before it is reused, so re-saving every idle slot on every new task only
+  cost a multi-GB copy per request (and thrashed the default 8 GiB cache). Follow-up turn at 24k context: TTFT 1.56 -> 0.49 s.
+- `GLIBC_TUNABLES=glibc.malloc.hugetlb=1` (run.sh): THP is `madvise` on this host, so the server's large host
+  allocations (prompt-cache entries, 160 MB context checkpoints) paid a page fault per 4 KB; with huge pages the cache-entry
+  allocation drops 0.8-1.1 s -> 0.44 s and a 64-token turn at 24k depth 504 -> 407 ms.
+- `server-context.cpp`: `LLAMA_SERVER_BUSY_PROMPT_CAP=<tokens>` (default off) caps prompt tokens per iteration while
+  other slots generate. Measured trade-off (30k prompt arriving while a slot generates): off 17.9 s TTFT / generating slot
+  1.5 t/s, 4.9 s worst stall; 2048: 22.8 s / 2.6 t/s / 1.7 s; 1024: 26.5 s / 4.0 t/s / 1.0 s.
+Result on the production layout: 5.5k prompt 1716 -> 1988 t/s, decode unchanged (59 t/s chat).
