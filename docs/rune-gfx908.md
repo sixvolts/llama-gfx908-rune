@@ -299,3 +299,30 @@ log (GGML_CUDA_ALLOC_LOG=1) placed the faulting address exactly at the end of a 
 Validation (12th build): barrier 3-stream passes 1/2/3 = `b6c553c1 f739b818 114f17a1` / `db769488 7f5f2970 114f17a1` /
 same, no fault (the 11th backend faulted on pass 2 every time); seeded single-stream chats hash-identical to the 11th
 (37b4304d...), MTP step 33.42 ms (11th: 33.50); adaptive-shape chats hash-identical to eager (90b15b34...).
+
+## 2026-09-23: thin F32 projections (the launch-count lever after the 12th build)
+
+Per traced 3-row verify step the trunk issues ~260 `mul_mat_vec_f` launches for thin F32 projections, all
+latency-bound (one block per output row, 40 or 10 float2 loads per thread): hc_inject (K=10240, 4 rows, 18 us x96),
+ssm_alpha/ssm_beta (K=2560, 48 rows, 12 us x72), the MoE router (15 us x48), the shared-expert gate (10 us x48).
+Two levers that did NOT help: `GGML_CUDA_GRAPH_OPT=1` (ggml's multi-stream fork/join inside captured graphs) is
+bit-exact but finds nothing to overlap in this graph (33.50 vs 33.42 ms); the dense Q8_0 GEMV rows-per-block sweep
+(all 5 model shapes x nt 1/2/4 x RPB 1/2/4/8, golden/gemv_bench under rocprofv3) confirmed the current defaults, and
+the nt=4 verify costs only 1.25-1.4x the nt=1 time per shape (10240x2560: 31.7 -> 39.5 us), so dense GEMV is not a
+row-cost lever either.
+
+- `gdn-gate.cu` + `mmvf-replay.cuh`: the GDN gate chain - mul_mat(W_alpha,x), reshape, add(dt), softplus, mul(a),
+  reshape, mul_mat(W_beta,x), reshape, sigmoid (nine nodes, node order confirmed with GGML_CUDA_GRAPH_DUMP) - is one
+  launch of 96 blocks. Each block replays `mul_mat_vec_f<float, float, nt, 128>` for its row exactly (same lane
+  partition, MMVF_UNROLL=8 load and accumulation order, warp and cross-warp reduction; `ggml_cuda_mmvf_replay_row_128`)
+  and applies the unfused elementwise device math under `fp contract(off)`. Seeded chats hash-identical (single-stream,
+  adaptive shapes, barrier 3-stream), MTP step 33.42 -> 32.78 ms (target phase 28.62 -> 28.00; 32.79 / 32.82 / 32.79 on
+  repeats). GGML_GDN_GATE_FUSE=0 disables (A/B). Review hardening: the fusion is restricted to CDNA1 / wave 64 plain
+  device buffers (the replay is the gfx908 mmvf variant; RDNA/NVIDIA waves and CDNA2+'s mmf routing would differ) and
+  runs `ggml_cuda_check_fusion_memory_ranges` like the HC matchers. mmvf-replay.cuh is a copy of mmvf's F32 loop: a
+  change to MMVF_UNROLL or the reduction there must be mirrored (the seeded-hash oracle catches a divergence).
+- Dead end: folding the hc_inject GEMV (F32 [10240 -> 4], the node right before the HC low-rank pattern) into the
+  down-projection launch as four extra blocks running the same mmvf replay. Bit-exact, but slower: 33.33 / 33.01 vs
+  32.84 ms (two runs). The four latency-bound rows (40 dependent float2 loads per thread) become the critical path of a
+  launch whose 320 Q8_0 blocks finish sooner, and nothing else can hide them inside one kernel. Reverted; the inject
+  GEMV stays a separate launch. A bit-exact fold needs the row split across blocks, which changes the summation order.
