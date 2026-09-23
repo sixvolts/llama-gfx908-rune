@@ -1074,6 +1074,16 @@ static bool ggml_gallocr_needs_realloc(ggml_gallocr_t galloc, struct ggml_cgraph
                     graph->n_nodes, j, src->name, i, node->name, (long long) src->ne[0], (long long) src->ne[1], (long long) src->ne[2], (long long) src->ne[3],
                     (src->data || src->view_src || node_alloc->src[j].buffer_id < 0) ? (size_t) 0 : ggml_backend_buft_get_alloc_size(galloc->bufts[node_alloc->src[j].buffer_id], src),
                     node_alloc->src[j].size_max, node_alloc->src[j].buffer_id, src->data);
+                if (dbg) {
+                    for (int c = i; c < graph->n_nodes && c < i + 400; c++) {
+                        for (int k = 0; k < GGML_MAX_SRC; k++) {
+                            if (graph->nodes[c]->src[k] == node) {
+                                fprintf(stderr, "   consumer: node %d '%s' op=%s ne=[%lld,%lld,%lld,%lld]\n", c, graph->nodes[c]->name, ggml_op_name(graph->nodes[c]->op),
+                                    (long long) graph->nodes[c]->ne[0], (long long) graph->nodes[c]->ne[1], (long long) graph->nodes[c]->ne[2], (long long) graph->nodes[c]->ne[3]);
+                            }
+                        }
+                    }
+                }
                 return true;
             }
         }

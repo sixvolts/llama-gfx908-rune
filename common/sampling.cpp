@@ -122,6 +122,103 @@ struct common_sampler {
 
     llama_token_data_array cur_p;
 
+    // Top-K prefilter for the CPU chain (0 = off). When everything before top-k in the chain is a no-op and top_k is
+    // small, only the PREFILTER_K largest logits can survive top-k, so build cur_p from those instead of copying the
+    // whole vocabulary (248k rows) and partial-sorting it per sampled row. The result is identical whenever the
+    // top_k + 1 largest logits are distinct; on any tie there (where the full partial_sort order would decide) or any
+    // non-finite logit it falls back to the full path. prefilter_skip marks tokens the chain's logit-bias sampler
+    // suppresses (-INFINITY) so they are never among the candidates. COMMON_SAMPLER_PREFILTER=0 disables it.
+    static constexpr int PREFILTER_K = 64;
+    int32_t prefilter_topk = 0;
+    std::vector<uint8_t> prefilter_skip;
+
+    bool set_logits_prefilter(const float * logits, int n_vocab) {
+        const int K = PREFILTER_K;
+        if (n_vocab <= 4*K) {
+            return false;
+        }
+        // any NaN/inf -> full path (integer exponent test: vectorizes, unlike a float accumulation)
+        {
+            const uint32_t * bits = (const uint32_t *) logits;
+            uint32_t bad = 0;
+            for (int t = 0; t < n_vocab; ++t) {
+                bad |= (uint32_t) ((bits[t] & 0x7F800000u) == 0x7F800000u);
+            }
+            if (bad) {
+                return false;
+            }
+        }
+        cur.resize(K);
+        auto greater = [](const llama_token_data & a, const llama_token_data & b) { return a.logit > b.logit; };
+        const bool skip = !prefilter_skip.empty();
+        int n = 0;
+        int t = 0;
+        for (; t < n_vocab && n < K; ++t) {
+            if (skip && prefilter_skip[t]) {
+                continue;
+            }
+            cur[n++] = llama_token_data{t, logits[t], 0.0f};
+        }
+        if (n < K) {
+            return false;
+        }
+        // min-heap on logit: cur[0] holds the smallest of the current top-K
+        std::make_heap(cur.begin(), cur.end(), greater);
+        float thr = cur[0].logit;
+        // blocked scan: a vectorized block max decides whether a block can contain a candidate at all
+        constexpr int B = 64;
+        auto scan = [&](int t0, int t1) {
+            for (int u = t0; u < t1; ++u) {
+                const float v = logits[u];
+                if (v > thr && !(skip && prefilter_skip[u])) {
+                    std::pop_heap(cur.begin(), cur.end(), greater);
+                    cur[K - 1] = llama_token_data{u, v, 0.0f};
+                    std::push_heap(cur.begin(), cur.end(), greater);
+                    thr = cur[0].logit;
+                }
+            }
+        };
+        const int t_al = std::min(n_vocab, (t + B - 1) / B * B);
+        scan(t, t_al);
+        for (int t0 = t_al; t0 < n_vocab; t0 += B) {
+            const int t1 = std::min(n_vocab, t0 + B);
+            float bmax = -INFINITY;
+            if (t1 - t0 == B) {
+                float m[8];
+                for (int j = 0; j < 8; ++j) {
+                    m[j] = logits[t0 + j];
+                }
+                for (int i = 8; i < B; i += 8) {
+                    for (int j = 0; j < 8; ++j) {
+                        m[j] = std::max(m[j], logits[t0 + i + j]);
+                    }
+                }
+                for (int j = 0; j < 8; ++j) {
+                    bmax = std::max(bmax, m[j]);
+                }
+                if (bmax > thr) {
+                    scan(t0, t1);
+                }
+            } else {
+                scan(t0, t1);
+            }
+        }
+        std::sort(cur.begin(), cur.end(), greater);
+        // the top_k + 1 largest must be distinct (otherwise the full partial_sort's tie order could decide), and the
+        // (top_k+1)-th strictly above the K-th: every token outside the prefilter set is <= the K-th, so the true
+        // top_k + 1 are all inside and strictly ordered.
+        const int k = prefilter_topk;
+        for (int i = 0; i < k; ++i) {
+            if (!(cur[i].logit > cur[i + 1].logit)) {
+                return false;
+            }
+        }
+        if (!(cur[k].logit > cur[K - 1].logit)) {
+            return false;
+        }
+        return true;
+    }
+
     void reset() {
         prev.clear();
 
@@ -153,6 +250,10 @@ struct common_sampler {
         } else {
             const auto * logits = llama_get_logits_ith(ctx, idx);
             GGML_ASSERT(logits != nullptr);
+            if (prefilter_topk > 0 && set_logits_prefilter(logits, n_vocab)) {
+                cur_p = { cur.data(), cur.size(), -1, false };
+                return;
+            }
             cur.resize(n_vocab);
             for (llama_token token_id = 0; token_id < n_vocab; token_id++) {
                 cur[token_id] = llama_token_data{token_id, logits[token_id], 0.0f};
@@ -434,6 +535,59 @@ struct common_sampler * common_sampler_init(
         /* .cur     = */ {},
         /* .cur_p   = */ {},
     };
+
+    // top-K prefilter: only when top-k comes first among the active samplers and nothing before it changes logits
+    // (see common_sampler::set_logits_prefilter; the result is identical to the full path or it falls back)
+    {
+        static const bool pf_env = !getenv("COMMON_SAMPLER_PREFILTER") || atoi(getenv("COMMON_SAMPLER_PREFILTER")) != 0;
+        bool ok = pf_env && params.mirostat == 0 && !grmr && !rbudget &&
+                  params.top_k > 0 && params.top_k + 1 < common_sampler::PREFILTER_K;
+        for (const auto & lb : params.logit_bias) {
+            ok = ok && lb.bias == -INFINITY;   // suppression only; positive/finite biases can lift any token
+        }
+        bool seen_top_k = false;
+        for (const auto t : params.samplers) {
+            if (!ok) {
+                break;
+            }
+            if (t == COMMON_SAMPLER_TYPE_TOP_K) {
+                seen_top_k = true;
+                break;
+            }
+            switch (t) {
+                case COMMON_SAMPLER_TYPE_PENALTIES:
+                    ok = params.penalty_last_n == 0 ||
+                         (params.penalty_repeat == 1.0f && params.penalty_freq == 0.0f && params.penalty_present == 0.0f);
+                    break;
+                case COMMON_SAMPLER_TYPE_DRY:
+                    ok = params.dry_multiplier == 0.0f;
+                    break;
+                case COMMON_SAMPLER_TYPE_TOP_N_SIGMA:
+                    ok = params.top_n_sigma <= 0.0f;
+                    break;
+                default:
+                    ok = false; // anything else ahead of top-k: keep the full path
+                    break;
+            }
+        }
+        if (ok && seen_top_k) {
+            const int32_t n_vocab = llama_vocab_n_tokens(vocab);
+            std::vector<uint8_t> skip(n_vocab, 0);
+            bool any = false;
+            int32_t n_suppress = 0;
+            const llama_token * suppress = llama_vocab_get_suppress_tokens(vocab, &n_suppress);
+            for (int32_t i = 0; i < n_suppress; ++i) {
+                if (suppress[i] >= 0 && suppress[i] < n_vocab) { skip[suppress[i]] = 1; any = true; }
+            }
+            for (const auto & lb : params.logit_bias) {
+                if (lb.token >= 0 && lb.token < n_vocab) { skip[lb.token] = 1; any = true; }
+            }
+            result->prefilter_topk = params.top_k;
+            if (any) {
+                result->prefilter_skip = std::move(skip);
+            }
+        }
+    }
 
     return result;
 }
