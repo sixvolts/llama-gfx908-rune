@@ -46,6 +46,7 @@
 #include "ggml-cuda/scale.cuh"
 #include "ggml-cuda/snake.cuh"
 #include "ggml-cuda/hc-fused.cuh"
+#include "ggml-cuda/gdn-gate.cuh"
 #include "ggml-cuda/softcap.cuh"
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
@@ -3669,6 +3670,48 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // GDN gate chain (qwen4exp build_delta_net), two thin F32 GEMVs on the same activation and their elementwise tails:
+    //   [i+0] mul_mat(W_alpha, x) [i+1] reshape [i+2] add(dt) [i+3] softplus [i+4] mul(a) [i+5] reshape
+    //   [i+6] mul_mat(W_beta, x)  [i+7] reshape [i+8] sigmoid
+    // One launch (gdn-gate.cu) replaces the nine nodes for decode-size batches. GGML_GDN_GATE_FUSE=0 disables.
+    static const bool gdn_gate_fuse = !(getenv("GGML_GDN_GATE_FUSE") && std::atoi(getenv("GGML_GDN_GATE_FUSE")) == 0);
+    if (gdn_gate_fuse && node->op == GGML_OP_MUL_MAT && i + 8 < cgraph->n_nodes && node->src[0]->type == GGML_TYPE_F32) {
+        std::initializer_list<enum ggml_op> gdn_gate_ops = {
+            GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_ADD, GGML_OP_UNARY, GGML_OP_MUL, GGML_OP_RESHAPE,
+            GGML_OP_MUL_MAT, GGML_OP_RESHAPE, GGML_OP_UNARY };
+        if (ggml_can_fuse_subgraph(cgraph, i, gdn_gate_ops, { i + 4, i + 5, i + 8 }) &&
+            ggml_check_edges(cgraph, i, { {1,0,0}, {2,0,1}, {3,0,2}, {4,0,3}, {5,0,4}, {7,0,6}, {8,0,7} })) {
+            const ggml_tensor * mm_a  = cgraph->nodes[i];
+            ggml_tensor *       add   = cgraph->nodes[i + 2];
+            const ggml_tensor * sp    = cgraph->nodes[i + 3];
+            ggml_tensor *       gate  = cgraph->nodes[i + 4];
+            const ggml_tensor * mm_b  = cgraph->nodes[i + 6];
+            ggml_tensor *       sigm  = cgraph->nodes[i + 8];
+            const ggml_tensor * w_a = mm_a->src[0];
+            const ggml_tensor * w_b = mm_b->src[0];
+            const ggml_tensor * x   = mm_a->src[1];
+            const ggml_tensor * dt  = add->src[1];
+            const ggml_tensor * a   = gate->src[1];
+            const bool ok =
+                ggml_get_unary_op(sp) == GGML_UNARY_OP_SOFTPLUS && ggml_get_unary_op(sigm) == GGML_UNARY_OP_SIGMOID &&
+                mm_b->src[1] == x && w_b->type == GGML_TYPE_F32 && x->type == GGML_TYPE_F32 &&
+                dt->type == GGML_TYPE_F32 && a->type == GGML_TYPE_F32 && gate->type == GGML_TYPE_F32 && sigm->type == GGML_TYPE_F32 &&
+                w_a->ne[0] == x->ne[0] && w_b->ne[0] == x->ne[0] &&
+                dt->ne[0] == w_a->ne[1] && ggml_nelements(dt) == w_a->ne[1] && a->ne[0] == w_a->ne[1] && ggml_nelements(a) == w_a->ne[1] &&
+                ggml_nelements(gate) == w_a->ne[1]*x->ne[1] && ggml_nelements(sigm) == w_b->ne[1]*x->ne[1] &&
+                ggml_is_contiguous(w_a) && ggml_is_contiguous(w_b) && ggml_is_contiguous(x) && ggml_is_contiguous(dt) &&
+                ggml_is_contiguous(a) && ggml_is_contiguous(gate) && ggml_is_contiguous(sigm) &&
+                w_a->ne[2] == 1 && w_a->ne[3] == 1 && w_b->ne[2] == 1 && w_b->ne[3] == 1 &&
+                ggml_backend_buffer_is_cuda(w_a->buffer) && ggml_backend_buffer_is_cuda(w_b->buffer) &&   // plain device buffers (no split / host)
+                add->src[0] == cgraph->nodes[i + 1] && gate->src[0] == sp;
+            int out_nodes[] = { i + 4, i + 5, i + 8 };
+            if (ok && ggml_cuda_check_fusion_memory_ranges(cgraph, i, 9, out_nodes, 3, false, nullptr) &&
+                ggml_cuda_op_gdn_gate_fused(*cuda_ctx, w_a, w_b, x, dt, a, gate, sigm)) {
+                return 8;
+            }
+        }
+    }
 
     // HyperConnection combine (qwen4exp build_hc_combine). Node order is ggml's DFS post-order;
     // the leading reshape(block_out) is a view the caller already skipped:
