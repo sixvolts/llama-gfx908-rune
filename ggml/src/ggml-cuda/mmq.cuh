@@ -373,6 +373,15 @@ static constexpr __device__ int ggml_cuda_mmq_get_sram_stride(ggml_type type, in
     return ggml_cuda_mmq_get_sram_stride(ggml_cuda_mmq_get_sram_layout(type, J, fallback));
 }
 
+// Bytes to allocate past the quantized activations (y). The y tile of a K block is fetched as whole chunks of
+// nthreads ints (the prefetch loop and the plain loop both index l = l0 + tid up to the LDS tile's padded size), so
+// the last K block's load reads up to J*MMQ_TILE_Y_K + nthreads - 1 ints from its start, past the ne11 valid columns.
+// The dispatcher launches J >= 16 even for ne11 < 16 (ggml_cuda_mmq_get_J_max returns 0 there: no J = 8 config on
+// CDNA), so the padding must cover J = 16 at least. The columns read past ne11 are never written back (garbage in,
+// discarded), only their pages must exist: a 12-column K = 512 y buffer at the end of a 2 MiB mapping faulted in
+// production (GPU page fault on replay of a captured graph, 2026-09-23).
+static __host__ size_t ggml_cuda_mmq_get_y_padding(const ggml_type type, const bool fallback, const int cc, const int64_t ne11);
+
 static __host__ int ggml_cuda_mmq_get_J_max(const ggml_type type, const bool fallback, const int cc, const int64_t ne11) {
     int ret = std::min(ne11, int64_t(512));
     ret -= ret % 8;
@@ -382,6 +391,18 @@ static __host__ int ggml_cuda_mmq_get_J_max(const ggml_type type, const bool fal
         }
     }
     return ret;
+}
+
+static __host__ size_t ggml_cuda_mmq_get_y_padding(const ggml_type type, const bool fallback, const int cc, const int64_t ne11) {
+    const int J_alloc = std::max(16, ggml_cuda_mmq_get_J_max(type, fallback, cc, ne11));
+    int nthreads_max = 0;
+    for (int J = 8; J <= 128; J += 8) {
+        const ggml_cuda_mmq_config config = ggml_cuda_mmq_get_config(type, J, fallback, cc);
+        if (config.type != GGML_TYPE_COUNT) {
+            nthreads_max = std::max(nthreads_max, config.nthreads);
+        }
+    }
+    return (size_t(J_alloc)*MMQ_TILE_Y_K + nthreads_max) * sizeof(int);
 }
 
 static constexpr __device__ int ggml_cuda_mmq_get_rows_per_warp(ggml_type type, int J, bool fallback) {
@@ -1489,6 +1510,16 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
     const uint3 channel_ratio_fd   = init_fastdiv_values(channel_ratio);
     const uint3 sample_ratio_fd    = init_fastdiv_values(sample_ratio);
 
+    {   // GGML_CUDA_ALLOC_LOG=1 (diagnostics): every MMQ launch with its y buffer and tiling parameters
+        static const bool on = getenv("GGML_CUDA_ALLOC_LOG") && atoi(getenv("GGML_CUDA_ALLOC_LOG")) != 0;
+        if (on) {
+            GGML_LOG_WARN("[mmq] dev%d type %s J %d I %d nthreads %d y %p x %p ncols_x %lld nrows_x %lld ncols_dst %lld ncols_y %lld ncols_max %lld nch_y %lld nsm_y %lld stride_ch_y %lld ntx %d nty %d stream_k %d ids %d\n",
+                id, ggml_type_name(type), J, config.I, config.nthreads, (const void *) args.y, (const void *) args.x,
+                (long long) args.ncols_x, (long long) args.nrows_x, (long long) args.ncols_dst, (long long) args.ncols_y, (long long) args.ncols_max,
+                (long long) args.nchannels_y, (long long) args.nsamples_y, (long long) args.stride_channel_y, ntx, nty,
+                (int) ggml_cuda_mmq_get_stream_k(type, J, fallback, cc), args.ids_dst != nullptr);
+        }
+    }
     if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
         mul_mat_q<type, J, fallback><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,
