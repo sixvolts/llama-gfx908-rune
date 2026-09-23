@@ -3637,13 +3637,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
             const int64_t ne0 = scl->ne[0];
             const int64_t hc  = 4;
             const int64_t nt  = scl->ne[1];
-            bool ok = wired && nt == 1 && scl->ne[2] == 1 && scl->ne[3] == 1 &&
+            // nt 2..4 (MTP verify): same per-column math as the ncols=nt mmvq path it replaces (GCN table: nwarps=2 for 1..4)
+            static const bool hc_mega_mt_disabled = getenv("GGML_HC_MEGA_MT_DISABLE") != nullptr && std::atoi(getenv("GGML_HC_MEGA_MT_DISABLE"));
+            bool ok = wired && nt >= 1 && nt <= (hc_mega_mt_disabled ? 1 : 4) && scl->ne[2] == 1 && scl->ne[3] == 1 &&
                 ggml_get_unary_op(silu) == GGML_UNARY_OP_SILU && ggml_get_unary_op(sigm) == GGML_UNARY_OP_SIGMOID &&
                 mul->src[0] == xn &&
                 w_down->type == GGML_TYPE_Q8_0 && w_up->type == GGML_TYPE_Q8_0 &&
                 xn->type == GGML_TYPE_F32 && scl->type == GGML_TYPE_F32 && mm_down->type == GGML_TYPE_F32 && mm_up->type == GGML_TYPE_F32 &&
                 ggml_is_contiguous(w_down) && ggml_is_contiguous(w_up) && ggml_is_contiguous(xn) && ggml_is_contiguous(scl) &&
-                xn->ne[0] == hc*ne0 && xn->ne[1] == 1 && xn->ne[2] == 1 && xn->ne[3] == 1 &&
+                xn->ne[0] == hc*ne0 && xn->ne[1] == nt && xn->ne[2] == 1 && xn->ne[3] == 1 &&
                 w_down->ne[0] == hc*ne0 && w_down->ne[2] == 1 && w_down->ne[3] == 1 &&
                 w_up->ne[0] == w_down->ne[1] && w_up->ne[1] == hc*ne0 && w_up->ne[2] == 1 && w_up->ne[3] == 1 &&
                 resh->ne[0] == ne0 && resh->ne[1] == hc && resh->ne[2] == nt &&
@@ -3659,11 +3661,12 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                          (const char *) v->data == (const char *) resh->data + cidx * ne0 * sizeof(float);
                 }
             }
-            // xn is read at j + c*ne0 by the block that writes dst[j]: in-place is safe only for an exact same base
-            ok = ok && (!ggml_cuda_hc_ranges_overlap(scl, xn) || xn->data == scl->data);
+            // xn is read at j + c*ne0 (+ t*hc*ne0) by the block that writes dst[j (+ t*ne0)]: in-place is safe only for a
+            // single token with an exact same base; with several tokens other blocks would read overwritten xn
+            ok = ok && (!ggml_cuda_hc_ranges_overlap(scl, xn) || (nt == 1 && xn->data == scl->data));
             if (ok) {
                 int out_nodes[] = { i + 15 };
-                const ggml_tensor * may_alias = (xn->data == scl->data) ? xn : nullptr;
+                const ggml_tensor * may_alias = (nt == 1 && xn->data == scl->data) ? xn : nullptr;
                 if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 16, out_nodes, 1, false, may_alias)) {
                     float s_lo, b_lo, s_out, b_out;
                     memcpy(&s_lo,  (const float *) scl_lo->op_params + 0, sizeof(float));

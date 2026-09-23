@@ -3,7 +3,10 @@
 
 #include <cstdlib>
 
-template <int S_v, bool KDA, bool keep_rs_t>
+// NPRE > 0 (short batches, e.g. the 3-token MTP verify): every token's k/q/v/g/beta is loaded before the recurrence
+// starts, so the per-token global latency is not exposed on the serial state chain. Arithmetic and reduction order
+// per token are unchanged (bit-exact); requires n_tokens <= NPRE.
+template <int S_v, bool KDA, bool keep_rs_t, int NPRE = 0>
 __global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
 gated_delta_net_cuda(const float * q,
                                      const float * k,
@@ -62,7 +65,42 @@ gated_delta_net_cuda(const float * q,
         s_shard[r]  = curr_state[i];
     }
 
-    for (int t = 0; t < n_tokens; t++) {
+    // NPRE: preload all tokens (see the template comment)
+    constexpr int NP = NPRE > 0 ? NPRE : 1;
+    [[maybe_unused]] float k_pre[NP][rows_per_lane];
+    [[maybe_unused]] float q_pre[NP][rows_per_lane];
+    [[maybe_unused]] float g_pre[NP][KDA ? rows_per_lane : 1];
+    [[maybe_unused]] float v_pre[NP], beta_pre[NP];
+    if constexpr (NPRE > 0) {
+#pragma unroll
+        for (int t = 0; t < NPRE; t++) {
+            if (t < n_tokens) {
+                const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
+                const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
+                const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    const int i = r * warp_size + lane;
+                    k_pre[t][r] = k_t[i];
+                    q_pre[t][r] = q_t[i];
+                    if constexpr (KDA) {
+                        g_pre[t][r] = g[gb_offset * S_v + i];
+                    }
+                }
+                if constexpr (!KDA) {
+                    g_pre[t][0] = g[gb_offset];
+                }
+                v_pre[t]    = v[sequence * sv3 + t * sv2 + h_idx * sv1 + col];
+                beta_pre[t] = beta[gb_offset];
+            }
+        }
+    }
+
+#pragma unroll
+    for (int t = 0; t < (NPRE > 0 ? NPRE : n_tokens); t++) {
+        if (NPRE > 0 && t >= n_tokens) {
+            continue;   // not break: a single-exit constant-trip loop can be fully unrolled (preload arrays stay in VGPRs)
+        }
         const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
         const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
         const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
@@ -71,7 +109,7 @@ gated_delta_net_cuda(const float * q,
         const float * beta_t = beta + gb_offset;
         const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
 
-        const float beta_val = *beta_t;
+        const float beta_val = NPRE > 0 ? beta_pre[NPRE > 0 ? t : 0] : *beta_t;
 
         // Cache k and q in registers
         float k_reg[rows_per_lane];
@@ -79,12 +117,12 @@ gated_delta_net_cuda(const float * q,
 #pragma unroll
         for (int r = 0; r < rows_per_lane; r++) {
             const int i = r * warp_size + lane;
-            k_reg[r] = k_t[i];
-            q_reg[r] = q_t[i];
+            k_reg[r] = NPRE > 0 ? k_pre[NPRE > 0 ? t : 0][r] : k_t[i];
+            q_reg[r] = NPRE > 0 ? q_pre[NPRE > 0 ? t : 0][r] : q_t[i];
         }
 
         if constexpr (!KDA) {
-            const float g_val = expf(*g_t);
+            const float g_val = expf(NPRE > 0 ? g_pre[NPRE > 0 ? t : 0][0] : *g_t);
 
             // kv[col] = (S^T @ k)[col] = sum_i S[i][col] * k[i]
             float kv_shard = 0.0f;
@@ -95,7 +133,7 @@ gated_delta_net_cuda(const float * q,
             float kv_col = warp_reduce_sum<warp_size>(kv_shard);
 
             // delta[col] = (v[col] - g * kv[col]) * beta
-            float delta_col = (v_t[col] - g_val * kv_col) * beta_val;
+            float delta_col = ((NPRE > 0 ? v_pre[NPRE > 0 ? t : 0] : v_t[col]) - g_val * kv_col) * beta_val;
 
             // fused: S[i][col] = g * S[i][col] + k[i] * delta[col]
             // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
@@ -117,13 +155,13 @@ gated_delta_net_cuda(const float * q,
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
                 const int i = r * warp_size + lane;
-                kv_shard += expf(g_t[i]) * s_shard[r] * k_reg[r];
+                kv_shard += expf(NPRE > 0 ? g_pre[NPRE > 0 ? t : 0][KDA ? r : 0] : g_t[i]) * s_shard[r] * k_reg[r];
             }
 
             float kv_col = warp_reduce_sum<warp_size>(kv_shard);
 
             // delta[col] = (v[col] - kv[col]) * beta
-            float delta_col = (v_t[col] - kv_col) * beta_val;
+            float delta_col = ((NPRE > 0 ? v_pre[NPRE > 0 ? t : 0] : v_t[col]) - kv_col) * beta_val;
 
             // fused: S[i][col] = g[i] * S[i][col] + k[i] * delta[col]
             // attn[col] = (S^T @ q)[col] = sum_i S[i][col] * q[i]
@@ -131,7 +169,7 @@ gated_delta_net_cuda(const float * q,
 #pragma unroll
             for (int r = 0; r < rows_per_lane; r++) {
                 const int i = r * warp_size + lane;
-                s_shard[r]  = expf(g_t[i]) * s_shard[r] + k_reg[r] * delta_col;
+                s_shard[r]  = expf(NPRE > 0 ? g_pre[NPRE > 0 ? t : 0][KDA ? r : 0] : g_t[i]) * s_shard[r] + k_reg[r] * delta_col;
                 attn_partial += s_shard[r] * q_reg[r];
             }
 
@@ -427,6 +465,15 @@ static void launch_gated_delta_net(
             break;
         }
         case 128: {
+            // 2..4 tokens (MTP verify): preload variant, bit-exact with the plain loop. GGML_GDN_PRELOAD=0 disables.
+            static const bool preload = !getenv("GGML_GDN_PRELOAD") || atoi(getenv("GGML_GDN_PRELOAD")) != 0;
+            if (preload && n_tokens >= 2 && n_tokens <= 4) {
+                ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t, 4>, launch_params,
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                    n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+                break;
+            }
             ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
                 q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
                 n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
