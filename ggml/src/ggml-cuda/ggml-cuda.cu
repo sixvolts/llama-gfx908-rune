@@ -2685,14 +2685,25 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     // different shapes (e.g. the MTP head's 3-row catch-up and 1-row draft, or the trunk at different slot counts),
     // which then evict each other's instance and re-capture on every call. Mix the node count and the first/last
     // node shapes into the key. The key only selects a cache slot; node properties are still compared in full.
+    // The key is built from the DATA layout, not from tensor struct addresses: after a llama graph rebuild (a batch of a
+    // different shape in between) the scheduler re-creates the split's nodes at new addresses and picks the input copy
+    // of its current rotation, so a struct-address key would start a fresh warmup (2 eager runs + a 7 ms capture) at
+    // every shape change. Data pointers of the first/last node and of the first node's inputs, plus the shapes, identify
+    // a captured instance exactly (node properties are still compared in full before it is launched).
     const ggml_tensor * first = cgraph->nodes[0];
     const ggml_tensor * last  = cgraph->nodes[cgraph->n_nodes - 1];
-    uint64_t h = (uint64_t) (uintptr_t) first;
+    uint64_t h = (uint64_t) (uintptr_t) first->data;
     auto mix = [&h](uint64_t v) { h ^= v + 0x9e3779b97f4a7c15ull + (h << 6) + (h >> 2); };
     mix((uint64_t) cgraph->n_nodes);
-    for (int d = 0; d < GGML_MAX_DIMS; ++d) {
-        mix((uint64_t) first->ne[d]);
-        mix((uint64_t) last->ne[d]);
+    mix((uint64_t) (uintptr_t) last->data);
+    for (int j = 0; j < GGML_MAX_SRC; ++j) {
+        mix((uint64_t) (uintptr_t) (first->src[j] ? first->src[j]->data : nullptr));
+    }
+    // every node's shape: a KV view that grows with the context, or a batch of another size, is then a different
+    // cached instance instead of a property change that restarts this instance's warmup
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        const ggml_tensor * n = cgraph->nodes[i];
+        mix(((uint64_t) n->ne[0] << 40) ^ ((uint64_t) n->ne[1] << 24) ^ ((uint64_t) n->ne[2] << 8) ^ (uint64_t) n->ne[3] ^ ((uint64_t) n->op << 56));
     }
     return (const void *) (uintptr_t) h;
 }
@@ -2721,6 +2732,16 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_cuda_graph::node_properties prop = {};
         memcpy(&prop.node, cgraph->nodes[i], sizeof(ggml_tensor));
+        // struct addresses do not affect the captured kernels (data pointers, shapes, strides and params do): blank
+        // them so a rebuilt graph with the same layout matches its captured instance
+        prop.node.view_src = nullptr;
+        prop.node.buffer   = nullptr;
+        prop.node.extra    = nullptr;
+        memset(prop.node.src,  0, sizeof(prop.node.src));
+        memset(prop.node.name, 0, sizeof(prop.node.name));
+        if (ggml_nelements(cgraph->nodes[i]) == 0) {
+            prop.node.data = nullptr;   // an empty view (e.g. a rollback-slot view of a recurrent state) touches no bytes
+        }
 
         for (int j = 0; j < GGML_MAX_SRC; ++j) {
             if (cgraph->nodes[i]->src[j]) {
@@ -2731,6 +2752,23 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
         }
 
         if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+            // GGML_CUDA_GRAPH_DEBUG=1: say which node broke the match (first differing node per call)
+            static const bool dbg = getenv("GGML_CUDA_GRAPH_DEBUG") && atoi(getenv("GGML_CUDA_GRAPH_DEBUG")) != 0;
+            if (dbg && !res) {
+                const auto & o = graph->node_props[i];
+                const char * what = o.node.data != prop.node.data ? "data ptr" :
+                    memcmp(o.node.ne, prop.node.ne, sizeof(prop.node.ne)) != 0 ? "ne" :
+                    memcmp(o.node.nb, prop.node.nb, sizeof(prop.node.nb)) != 0 ? "nb" :
+                    memcmp(o.node_src_data_ptrs, prop.node_src_data_ptrs, sizeof(prop.node_src_data_ptrs)) != 0 ? "src data ptr" :
+                    memcmp(o.node_src_ne, prop.node_src_ne, sizeof(prop.node_src_ne)) != 0 ? "src ne" :
+                    memcmp(o.node.op_params, prop.node.op_params, sizeof(prop.node.op_params)) != 0 ? "op_params" :
+                    memcmp(o.node.src, prop.node.src, sizeof(prop.node.src)) != 0 ? "src tensor ptr" : "other field";
+                const ggml_tensor * vs = cgraph->nodes[i]->view_src;
+                GGML_LOG_WARN("cuda graph dev%d: props changed at node %d/%d '%s' (%s, view of '%s' %s): %s ne [%lld,%lld,%lld,%lld] -> [%lld,%lld,%lld,%lld] data %p -> %p\n",
+                    cuda_ctx->device, i, cgraph->n_nodes, prop.node.name, ggml_op_name(prop.node.op), vs ? vs->name : "-", vs ? ggml_op_name(vs->op) : "-", what,
+                    (long long) o.node.ne[0], (long long) o.node.ne[1], (long long) o.node.ne[2], (long long) o.node.ne[3],
+                    (long long) prop.node.ne[0], (long long) prop.node.ne[1], (long long) prop.node.ne[2], (long long) prop.node.ne[3], o.node.data, prop.node.data);
+            }
             graph->node_props[i] = prop;
             res = true;
         }
@@ -4821,8 +4859,11 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
 
             if (!graph->warmup_complete) {
-                // Warmup: need at least 2 calls with no property change on the 2nd call
-                if (!properties_changed) {
+                // Warmup: need at least 2 calls with no property change on the 2nd call.
+                // GGML_CUDA_GRAPH_WARMUP=0 captures on the first call instead: with shape-complete keys a new key is a
+                // new batch shape / KV length, and two eager runs of a 2300-node decode graph cost more than one capture.
+                static const int warmup_calls = getenv("GGML_CUDA_GRAPH_WARMUP") ? atoi(getenv("GGML_CUDA_GRAPH_WARMUP")) : 2;
+                if (!properties_changed || warmup_calls <= 1) {
                     graph->warmup_complete = true;
                     GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
                     use_cuda_graph = true;
@@ -4855,7 +4896,24 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 
     ggml_cuda_q8_cache_begin(*cuda_ctx);
+    // GGML_CUDA_GRAPH_STATS=1: per-device counts of graph launches by kind (reused exec / re-captured / eager) and the
+    // host time of re-captures, logged every 1000 computes. Diagnostics only.
+    static const bool graph_stats = getenv("GGML_CUDA_GRAPH_STATS") && atoi(getenv("GGML_CUDA_GRAPH_STATS")) != 0;
+    static int64_t gs_n[GGML_CUDA_MAX_DEVICES][3] = {};
+    static double  gs_t[GGML_CUDA_MAX_DEVICES][3] = {};
+    const int64_t gs_t0 = graph_stats ? ggml_time_us() : 0;
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    if (graph_stats) {
+        const int kind = !use_cuda_graph ? 2 : (cuda_graph_update_required ? 1 : 0);
+        const int d = cuda_ctx->device;
+        gs_n[d][kind]++; gs_t[d][kind] += ggml_time_us() - gs_t0;
+        const int64_t tot = gs_n[d][0] + gs_n[d][1] + gs_n[d][2];
+        if (tot % 1000 == 0) {
+            GGML_LOG_WARN("cuda graph stats dev%d: reused %lld (%.2f ms avg) | re-captured %lld (%.2f ms avg) | eager %lld (%.2f ms avg) | nodes %d | keys %zu\n", d,
+                (long long) gs_n[d][0], gs_n[d][0] ? gs_t[d][0]/gs_n[d][0]/1e3 : 0.0, (long long) gs_n[d][1], gs_n[d][1] ? gs_t[d][1]/gs_n[d][1]/1e3 : 0.0,
+                (long long) gs_n[d][2], gs_n[d][2] ? gs_t[d][2]/gs_n[d][2]/1e3 : 0.0, cgraph->n_nodes, cuda_ctx->cuda_graphs.size());
+        }
+    }
     ggml_cuda_q8_cache_end(*cuda_ctx);
 
     return GGML_STATUS_SUCCESS;

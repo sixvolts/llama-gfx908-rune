@@ -199,3 +199,20 @@ helper, shared with hc-fused.cu.
 - LLAMA_SPEC_TIMING=1 (server): median host timeline of the MTP loop. Single stream, 10th build: step 33.6 ms =
   target verify 28.7 + draft 3.45 (2 head decodes: 0.31 ms enqueue + 1.39 ms GPU incl. the 0.77 ms lm_head each) +
   catch-up 0.55 + sample/accept/rest 0.96 + build 0.09. Draft sampling already runs on the GPU (top-k 10).
+
+## 2026-09-23: HIP graph cache correctness under changing batch shapes (not yet in production)
+
+`ggml-cuda.cu`: the graph cache was keyed on the first node's struct address (+ shapes) and compared node properties
+including struct pointers. When batch shapes alternate (verify batches of 2/3/4 rows with adaptive MTP drafts; in
+production, whenever the number of busy slots changes) every shape change rebuilt the llama graph, the scheduler re-created
+the split's nodes at new addresses and picked another input copy, and the cache restarted its 2-call warmup (2 eager runs
++ a ~7 ms capture of 2341 nodes). Worse, the seeded output under alternating shapes (5649af6d...) differed from fully eager
+execution (GGML_CUDA_DISABLE_GRAPHS=1: 90b15b34...): a captured instance was being reused for a computation it did not
+match. Now the key is the data layout (first/last node data pointers, the first node's input data pointers, n_nodes and
+every node's shape/op) and the property comparison ignores struct pointers, names and the data pointer of empty views.
+Graph runs equal eager runs bit-for-bit and are deterministic across runs; under alternating shapes graph reuse went
+29% -> 75% of launches (verify 39.9 -> 35.2 ms/step; fixed shape 28.7). GGML_CUDA_GRAPH_WARMUP=0 captures on the first
+call; GGML_CUDA_GRAPH_STATS=1 / GGML_CUDA_GRAPH_DEBUG=1 report reuse counts and the first mismatching node.
+Validation rule for any graph-cache change: seeded chats (scratch chatab2.py) must hash-equal GGML_CUDA_DISABLE_GRAPHS=1.
+The remaining cost of a shape change is the llama graph rebuild path (~0.75 ms build + ~0.8 ms sched alloc + ~1.6 ms
+extra enqueue), which is why per-step adaptive draft lengths measure +1.3% today and +5.9% without it.
