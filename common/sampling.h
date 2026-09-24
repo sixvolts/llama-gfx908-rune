@@ -88,6 +88,29 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 
+// lossless speculative sampling (Leviathan et al. 2023; Chen et al. 2023) for a SAMPLED draft.
+// draft[i] was drawn from draft_q[i] (the drafter's distribution over its candidates, p fields normalised).
+// Position i accepts draft[i] with probability min(1, p(x)/q(x)), p = the target's distribution after the full
+// sampler chain; on rejection the emitted token is drawn from max(0, p - q) renormalised. Every emitted token is
+// distributed exactly as the target alone would sample it, but a draft that is merely plausible (not the argmax the
+// target happens to pick) now survives. Falls back to common_sampler_sample_and_accept_n when a grammar is active,
+// when the target sampled on the backend, or when draft_q does not cover the draft.
+std::vector<llama_token> common_sampler_sample_and_accept_n_rs(struct common_sampler * gsmpl, struct llama_context * ctx,
+        const std::vector<int> & idxs, const llama_tokens & draft, const std::vector<std::vector<llama_token_data>> & draft_q,
+        uint32_t & rng_state, bool grammar_first = false);
+
+// true when the target chain gives one fixed distribution per position that the RS verifier can test against: no
+// mirostat and no adaptive-p (both adapt their state from the token they select themselves, so accepting another
+// token breaks them) and no grammar that currently applies (its resample-on-reject is not the chain's cur_p)
+bool common_sampler_rs_compatible(struct common_sampler * gsmpl);
+
+// RS random streams: a well-mixed, non-zero xorshift32 state for stream `stream` of a request seed. A raw small seed
+// (1, 2, ...) would give near-zero first uniforms and bias the first acceptance tests toward accepting.
+uint32_t common_rs_seed(uint32_t seed, uint32_t stream);
+
+// next uniform in [0, 1) from a xorshift32 state (never 0)
+double common_rs_uniform(uint32_t & st);
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.

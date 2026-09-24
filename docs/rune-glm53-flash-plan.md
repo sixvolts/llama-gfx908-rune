@@ -204,3 +204,45 @@ fabric/hardware errors; staged pairs exactly the cross-island ones (3->4, 7->8, 
   Without the drafter prefill was ~640 t/s at 6k (the drafter adds the 5-layer hidden-state export and its own
   prompt pass). Decode falls with context because attention and the indexer scan the whole cache (dense masked
   attention): the case for true gather-based sparse attention.
+
+## 8. Reuse from llama-halo-hybrid, steps 1-3 (2026-09-24)
+
+Port order from the review of github.com/sixvolts/llama-halo-hybrid (Strix Halo GLM tuning): (1) ssm_a / TOP_K ties /
+DFlash causal fix, (2) scheduler and input-copy host paths, (3) MTP export + lossless rejection sampling, (4) sparse
+attention with a gfx908 kernel, (5) the fusion wave.
+
+- Step 1 (e4aa7799f): `ssm_a` loads from the NOSCAN tensor name, and TOP_K resolves ties in column order
+  (test-backend-ops TOP_K 525/525 on gfx908). Not ported: Halo's DFlash causal-SWA override applies only when a config
+  leaves `is_causal` unset, and the GLM DFlash2 config sets `is_causal=false`, so the bidirectional block is correct.
+- Step 2: skipped on evidence. After graph reuse, decode is GPU-bound (stage busy time 40.7 of a 42.1 ms period) with
+  about 9 copies per token, so the host paths Halo tuned have nothing left to give here.
+- Step 3: the model's own MTP (NextN) block as the drafter, with lossless rejection sampling.
+  - `glm53_export_mtp.py` writes blk.45 plus the global tensors as a self-contained 5.9 GB draft file that runs on
+    GPU 1. With a separate `-md` file the target no longer loads its own blk.45: GPU 6 holds the same VRAM as without
+    speculation.
+  - Rejection sampling (Halo 2c85bcfa6, reworked here): the MTP head samples its draft from its own top-10
+    distribution at the request's temperature, with top-p/min-p mirrored, and the target accepts a draft token with
+    probability min(1, p/q), else it resamples from max(0, p - q). Streams are seeded from the request's resolved seed
+    through splitmix (raw small seeds biased the first tests toward accepting). RS turns itself off, falling back to
+    the compare verifier, for mirostat, adaptive-p, an active grammar, backend sampling and synthetic drafts. After a
+    checkpoint restore, the replay accepts the tokens RS already emitted as they are. `LLAMA_SPEC_RS=0` disables it.
+  - Lossless check (`glm53_rs_dist.py`, 400 seeds per condition, token distribution at the first verified noun):
+    RS against compare mode gives p = 0.25 (full distribution) and p = 0.84 (top-p 0.95, min-p 0.05). Against a
+    nospec server the truncated case fails (p < 0.001), and that is not RS: the verify batch's logits differ slightly
+    from single-token decode, and two tokens at p 0.036/0.034 sit on the min-p cut (0.034). Every verify keeps them
+    and every plain decode drops them. Compare mode shows the same, so it is the reference for this test.
+
+Sampled decode (T = 1.0, top-p 0.95, 4 prompts x 2 seeds, 2.5k tokens, `glm53_sampled.py`):
+
+| drafter | verifier | decode t/s | draft acceptance |
+|---|---|---|---|
+| none | - | 26.1 | - |
+| DFlash2, depth 2 | compare | 35.9 | 0.62 |
+| DFlash2, depth 3 | compare | 34.2 | 0.50 |
+| MTP, depth 2 | compare | 37.0 | 0.66 |
+| MTP, depth 2 | RS | 38.9 | 0.71 |
+| MTP, depth 3 | RS | 37.1 | 0.59 |
+
+Greedy (3 prompts, t/s per prompt): MTP depth 2 36.6/41.8/38.4 against DFlash2 depth 2 34.2/42.1/35.8, with identical
+output hashes (both verify the same batch shape). MTP depth 2 with RS is the best drafter configuration: +49% over no
+speculation on sampled chat, +8% over DFlash2, and its drafter needs no second model. `GLM_SPEC=mtp` selects it.

@@ -22,18 +22,27 @@ export LLAMA_PIPELINE_PARALLEL=1
 export GLIBC_TUNABLES=glibc.malloc.hugetlb=1
 export LD_LIBRARY_PATH=$GLM_BIN
 
-GLM_ARGS=(
+GLM_LAYOUT=(
   -ngl 99 -dev ROCm0,ROCm1,ROCm2,ROCm3,ROCm4,ROCm5,ROCm6,ROCm7,ROCm8 -ts 7,4,4,5,5,5,5,5,7
   -fa off                                   # PR #27754: FA's F32->F16 cast breaks MLA precision
   --load-mode none -lzm off -t 16
+)
+GLM_ARGS=(
+  "${GLM_LAYOUT[@]}"
   -c "${GLM_CTX:-32768}" -np "${GLM_NP:-1}" -ub "${GLM_UB:-512}" -b 2048
   --no-cache-idle-slots --cache-ram 65536
   --temp 1.0 --top-p 0.95
   --host 127.0.0.1 --port "$GLM_PORT" --alias glm-5.3-flash --metrics
 )
-GLM_SPEC_ARGS=(
-  -md "$GLM_DRAFT" --spec-type draft-dflash --spec-draft-n-max "$GLM_DRAFT_N" -ngld 99 -devd ROCm9
-)
+# GLM_SPEC=dflash (DFlash2 block drafter) | mtp (the model's own NextN block, exported self-contained by
+# glm53_export_mtp.py; with lossless rejection sampling at temperature > 0). Both drafters run on GPU 1 (ROCm9).
+GLM_SPEC=${GLM_SPEC:-dflash}
+GLM_MTP=${GLM_MTP:-/home/sixvolts/models/GLM-5.3-Flash-GGUF/MTP/GLM-5.3-Flash-MTP-UD-Q4_K_XL-sc.gguf}
+if [ "$GLM_SPEC" = mtp ]; then
+  GLM_SPEC_ARGS=(-md "$GLM_MTP" --spec-type draft-mtp --spec-draft-n-max "$GLM_DRAFT_N" -ngld 99 -devd ROCm9)
+else
+  GLM_SPEC_ARGS=(-md "$GLM_DRAFT" --spec-type draft-dflash --spec-draft-n-max "$GLM_DRAFT_N" -ngld 99 -devd ROCm9)
+fi
 
 glm53_require_hives_free() {
   local busy=""

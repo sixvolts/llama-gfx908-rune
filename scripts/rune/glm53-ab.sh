@@ -2,6 +2,8 @@
 # A/B runs of the GLM test server: for each "tag:ENV=VAL,ENV=VAL[:extra server args]" argument start the server
 # (nospec unless GLM_MODE=spec), run the greedy hash/speed client, stop the server (by its PID, args verified).
 #   glm53-ab.sh <outdir> "base:LLAMA_GRAPH_REUSE_DISABLE=1" "reuse:" "d3::--spec-draft-n-max 3" ...
+# GLM_CLIENT picks the client script (default glm53_client.py), GLM_CLIENT_ARGS adds arguments after the port (@TAG@
+# becomes the run's tag), GLM_VRAM=1 records rocm-smi VRAM use once the server is healthy.
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/glm53-env.sh"
@@ -25,7 +27,10 @@ for arg in "$@"; do
     sleep 2
   done
   if [ $ok = 1 ]; then
-    python3 "$HERE/${GLM_CLIENT:-glm53_client.py}" "$GLM_PORT" 2>&1 | tee "$OUT/client_$tag.txt"
+    [ "${GLM_VRAM:-0}" = 1 ] && rocm-smi --showmeminfo vram --csv > "$OUT/vram_$tag.csv" 2>&1
+    read -ra CARGS <<< "${GLM_CLIENT_ARGS:-}"
+    CARGS=("${CARGS[@]//@TAG@/$tag}")
+    python3 "$HERE/${GLM_CLIENT:-glm53_client.py}" "$GLM_PORT" "${CARGS[@]}" 2>&1 | tee "$OUT/client_$tag.txt"
   else
     echo "server failed"; tail -5 "$OUT/server_$tag.log"
   fi

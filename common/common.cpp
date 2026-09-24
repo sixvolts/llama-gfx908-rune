@@ -1292,6 +1292,13 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
     auto mparams = common_model_params_to_llama(params);
     auto cparams = common_context_params_to_llama(params);
 
+    // an MTP draft given as its own file (-md, e.g. an exported NextN block) carries the block itself: the target then
+    // does not need its copy (GLM-5.3 on rune: ~4.6 GB on the last trunk GPU). The draft is loaded from the
+    // speculative params, which keep load_mtp.
+    if (params.speculative.has_dft()) {
+        mparams.load_mtp = false;
+    }
+
     if (params.fit_params) {
         COM_TRC("%s", "fitting params to device memory ...\n");
         COM_TRC("%s", "(for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)\n");
