@@ -1081,6 +1081,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SOLVE_TRI",
     "GATED_DELTA_NET",
     "LIGHTNING_INDEXER",
+    "SPARSE_ATTN",
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
@@ -1101,7 +1102,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1196,6 +1197,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
     "lightning_indexer(q, k, weights, mask)",
+    "sparse_attn(q, k, idx, mask)",
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
@@ -1216,7 +1218,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -6449,6 +6451,44 @@ struct ggml_tensor * ggml_lightning_indexer(
     result->src[0] = q;
     result->src[1] = k;
     result->src[2] = weights;
+    result->src[3] = mask;
+
+    return result;
+}
+
+// ggml_sparse_attn
+
+struct ggml_tensor * ggml_sparse_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * idx,
+        struct ggml_tensor  * mask,
+        int64_t               D_v,
+        float                 scale) {
+    GGML_ASSERT(   q->type == GGML_TYPE_F32);
+    GGML_ASSERT(   k->type == GGML_TYPE_F16 || k->type == GGML_TYPE_F32);
+    GGML_ASSERT( idx->type == GGML_TYPE_I32);
+    GGML_ASSERT(mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(q->ne[0] == k->ne[0]);
+    GGML_ASSERT(k->ne[1] == 1 && "sparse_attn: one KV head");
+    GGML_ASSERT(D_v > 0 && D_v <= k->ne[0]);
+    GGML_ASSERT(k->nb[0] == ggml_type_size(k->type));
+    GGML_ASSERT(ggml_are_same_shape(idx, mask));
+    GGML_ASSERT(idx->ne[1] == q->ne[2] && idx->ne[2] == q->ne[3] && idx->ne[3] == 1);
+    GGML_ASSERT(k->ne[3] == q->ne[3]);
+    GGML_ASSERT(ggml_is_contiguous(q) && ggml_is_contiguous(idx) && ggml_is_contiguous(mask));
+
+    const int64_t ne[4] = { D_v, q->ne[1], q->ne[2], q->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    ggml_set_op_params_f32(result, 0, scale);
+    ggml_set_op_params_i32(result, 1, (int32_t) D_v);
+
+    result->op     = GGML_OP_SPARSE_ATTN;
+    result->src[0] = q;
+    result->src[1] = k;
+    result->src[2] = idx;
     result->src[3] = mask;
 
     return result;

@@ -71,6 +71,7 @@
 #include "ggml-cuda/cumsum.cuh"
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
+#include "ggml-cuda/sparse-attn.cuh"
 #include "ggml.h"
 
 #include <algorithm>
@@ -2548,6 +2549,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
+            break;
+        case GGML_OP_SPARSE_ATTN:
+            ggml_cuda_sparse_attn(ctx, dst);
             break;
         default:
             return false;
@@ -6183,6 +6187,8 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return true;
         case GGML_OP_LIGHTNING_INDEXER:
             return ggml_cuda_lightning_indexer_supported(dev_ctx->device, op);
+        case GGML_OP_SPARSE_ATTN:
+            return ggml_cuda_sparse_attn_supported(dev_ctx->device, op);
 
         default:
             return false;

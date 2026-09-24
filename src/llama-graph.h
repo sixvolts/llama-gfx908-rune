@@ -1385,6 +1385,25 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
+    // build_attn_sparse without the n_kv-wide masks (LLAMA_DSA_SPARSE): each query attends only the cells listed
+    // for it, the top-k pools' members plus its tail, gathered from the cache. MQA over one KV head (absorbed MLA),
+    // v_cur's rows are the first n_embd_head_v values of the K rows.
+    ggml_tensor * build_attn_sparse_gather(
+            llm_graph_input_attn_k * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur,      // [n_embd_head_k, n_head_q, n_tokens]
+            ggml_tensor * k_cur,      // [n_embd_head_k, 1, n_tokens]
+            ggml_tensor * v_cur,      // [n_embd_head_v, 1, n_tokens]
+            ggml_tensor * v_mla,      // [n_embd_head_v, n_embd_head_v_mla, n_head_q]
+            ggml_tensor * top_k,      // I32 [kpool*select_k, n_tps, n_stream] cells of the selected pools
+            ggml_tensor * top_k_mask, // F32 [kpool*select_k, n_tps, n_stream] 0, or -INFINITY for an unusable pool
+            ggml_tensor * tail_cells, // I32 [kpool - 1, n_tps, n_stream]
+            ggml_tensor * tail_mask,  // F32 [kpool - 1, n_tps, n_stream]
+                  float   kq_scale,
+                    int   il) const;
+
     //
     // pooling
     //

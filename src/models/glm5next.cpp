@@ -320,7 +320,8 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
         ggml_tensor * cur,
         ggml_tensor * qr,
         bool scoring,
-        int il) const {
+        int il,
+        ggml_tensor ** top_k_mask) const {
     const int64_t d_idx   = hparams.indexer_head_size;
     const int64_t n_ihead = hparams.indexer_n_head;
     const int64_t r       = hparams.indexer_kpool;
@@ -459,6 +460,18 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     top_k = ggml_reshape_3d(ctx0, top_k, r*select_k, n_tps, n_stream);
     cb(top_k, "indexer_top_k", il);
 
+    if (top_k_mask != nullptr && inp_kp->tail_cells != nullptr) {
+        // a selected pool is usable iff its bias is 0 (complete and visible); top-k picks an unusable one only while
+        // fewer than select_k usable pools exist. The bias is per pool, so gather it at the picks and spread it over
+        // the pool's r members (the layout of top_k)
+        ggml_tensor * pb = ggml_view_4d(ctx0, inp_kp->pool_bias, 1, n_pools, n_tps, n_stream,
+                ggml_element_size(inp_kp->pool_bias), inp_kp->pool_bias->nb[1], inp_kp->pool_bias->nb[2], 0);
+        ggml_tensor * pv = ggml_get_rows(ctx0, pb, sel); // F32 [1, select_k, n_tps, n_stream]
+        pv = ggml_repeat_4d(ctx0, pv, r, select_k, n_tps, n_stream);
+        *top_k_mask = ggml_reshape_3d(ctx0, pv, r*select_k, n_tps, n_stream);
+        cb(*top_k_mask, "indexer_top_k_mask", il);
+    }
+
     return top_k;
 }
 
@@ -482,7 +495,8 @@ ggml_tensor * llama_model_glm5next::graph::build_dsa_layer(
     qr = build_norm(qr, layer.attn_q_a_norm, nullptr, LLM_NORM_RMS, il);
     cb(qr, "dsa_q_a_norm", il);
 
-    ggml_tensor * top_k = inp_kp ? build_indexer(layer, inp_kp, cur, qr, scoring, il) : nullptr;
+    ggml_tensor * top_k_mask = nullptr;
+    ggml_tensor * top_k = inp_kp ? build_indexer(layer, inp_kp, cur, qr, scoring, il, &top_k_mask) : nullptr;
 
     ggml_tensor * q = ggml_mul_mat(ctx0, layer.wq_b, qr);
     q = ggml_reshape_3d(ctx0, q, qk_head_dim, n_head, n_tokens);
@@ -503,7 +517,12 @@ ggml_tensor * llama_model_glm5next::graph::build_dsa_layer(
     ggml_tensor * k = ggml_reshape_3d(ctx0, kv, kv_lora_rank, 1, n_tokens);
     cb(k, "dsa_kv_latent", il);
 
-    if (top_k) {
+    if (top_k && top_k_mask) {
+        cur = build_attn_sparse_gather(inp_attn,
+                layer.wo, nullptr, nullptr,
+                q, k, k, layer.wv_b,
+                top_k, top_k_mask, inp_kp->tail_cells, inp_kp->tail_mask, kq_scale, il);
+    } else if (top_k) {
         cur = build_attn_sparse(inp_attn,
                 layer.wo, nullptr, nullptr,
                 q, k, k, nullptr, nullptr, layer.wv_b,

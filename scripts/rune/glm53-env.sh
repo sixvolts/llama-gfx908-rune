@@ -7,9 +7,10 @@
 #   (GGML_CUDA_PEER_POLICY, default xgmi) never issues peer copies outside an XGMI island.
 #   -ts counts layers the way llama.cpp assigns them: layer il (0..45) and the output layer (46) go to device
 #   upper_bound(cumsum(ts)/sum(ts), il/47), so the last device's share includes the (skipped) MTP layer and the output.
-# Compute buffer with -fa off: the "sparse" DSA attention is mask-based dense attention, so it materializes
-#   [n_kv x n_ubatch x 64 heads] scores: ~288 B x ctx_per_slot x ubatch per GPU (128k x 512 -> 19.7 GB, 32k x 512 ->
-#   5.1 GB, 128k x 128 -> 4.9 GB). Bring-up default: 1 slot x 32k, ubatch 512 (fit: <= 27.2 GiB on every GPU).
+# DSA attention: LLAMA_DSA_SPARSE=1 (default here) attends only each query's selected cells (<= 2051) with the fused
+#   GGML_OP_SPARSE_ATTN kernel, so neither its cost nor its compute buffer grows with the context (1 x 128k fits, the
+#   fullest GPU at 27.1 of 34.3 GB). LLAMA_DSA_SPARSE=0 restores the PR's mask-based dense attention, which
+#   materializes [n_kv x n_ubatch x 64] scores (~288 B x ctx_per_slot x ubatch per GPU: 32k x 512 -> 5.1 GB).
 GLM_BIN=${GLM_BIN:-/home/sixvolts/llama.cpp-glm53/build/bin}
 GLM_MODEL=${GLM_MODEL:-/home/sixvolts/models/GLM-5.3-Flash-GGUF/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf}
 GLM_MODEL_Q6MIX=/home/sixvolts/models/GLM-5.3-Flash-GGUF/UD-Q4_K_XL-Q6mix/GLM-5.3-Flash-UD-Q4_K_XL-Q6mix-00001-of-00006.gguf
@@ -18,6 +19,7 @@ GLM_PORT=${GLM_PORT:-18099}
 GLM_DRAFT_N=${GLM_DRAFT_N:-2}          # measured: 2 > 3 > 4 > 5 > 6 (each verify row adds ~8 of 288 experts' weights)
 
 export HIP_VISIBLE_DEVICES=0,2,3,4,5,7,8,9,6,1   # ROCm0..8 = trunk stages, ROCm9 = drafter
+export LLAMA_DSA_SPARSE=${LLAMA_DSA_SPARSE:-1}
 export LLAMA_PIPELINE_PARALLEL=1
 export GLIBC_TUNABLES=glibc.malloc.hugetlb=1
 export LD_LIBRARY_PATH=$GLM_BIN

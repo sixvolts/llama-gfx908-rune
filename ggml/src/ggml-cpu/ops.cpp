@@ -12079,6 +12079,102 @@ void ggml_compute_forward_fwht(const ggml_compute_params * params, ggml_tensor *
     }
 }
 
+// ggml_compute_forward_sparse_attn
+
+void ggml_compute_forward_sparse_attn(
+        const ggml_compute_params * params,
+        ggml_tensor * dst) {
+
+    const ggml_tensor * q    = dst->src[0];
+    const ggml_tensor * k    = dst->src[1];
+    const ggml_tensor * idx  = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
+
+    GGML_ASSERT(dst->type  == GGML_TYPE_F32);
+    GGML_ASSERT(q->type    == GGML_TYPE_F32);
+    GGML_ASSERT(idx->type  == GGML_TYPE_I32);
+    GGML_ASSERT(mask->type == GGML_TYPE_F32);
+    GGML_ASSERT(k->type    == GGML_TYPE_F16 || k->type == GGML_TYPE_F32);
+
+    const float   scale = ggml_get_op_params_f32(dst, 0);
+    const int64_t D_v   = ggml_get_op_params_i32(dst, 1);
+
+    const int64_t D      = q->ne[0];
+    const int64_t n_head = q->ne[1];
+    const int64_t n_q    = q->ne[2];
+    const int64_t n_ns   = q->ne[3];
+    const int64_t n_kv   = k->ne[2];
+    const int64_t n_sel  = idx->ne[0];
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    // per thread: one K row in f32 and the output accumulator
+    float * k_row = (float *) params->wdata + ith*(D + D_v + CACHE_LINE_SIZE_F32);
+    float * acc   = k_row + D;
+
+    const int64_t nr  = n_head*n_q*n_ns;
+    const int64_t dr  = (nr + nth - 1)/nth;
+    const int64_t ir0 = dr*ith;
+    const int64_t ir1 = MIN(ir0 + dr, nr);
+
+    for (int64_t ir = ir0; ir < ir1; ++ir) {
+        const int64_t h = ir % n_head;
+        const int64_t t = (ir / n_head) % n_q;
+        const int64_t s = ir / (n_head*n_q);
+
+        const float   * q_row = (const float   *) ((const char *) q->data    + h*q->nb[1] + t*q->nb[2] + s*q->nb[3]);
+        const int32_t * i_row = (const int32_t *) ((const char *) idx->data  + t*idx->nb[1]  + s*idx->nb[2]);
+        const float   * m_row = (const float   *) ((const char *) mask->data + t*mask->nb[1] + s*mask->nb[2]);
+        float         * d_row = (float         *) ((char *) dst->data + h*dst->nb[1] + t*dst->nb[2] + s*dst->nb[3]);
+
+        // online softmax over the listed cells
+        float m = -INFINITY;
+        float l = 0.0f;
+        for (int64_t d = 0; d < D_v; ++d) {
+            acc[d] = 0.0f;
+        }
+
+        for (int64_t j = 0; j < n_sel; ++j) {
+            if (m_row[j] == -INFINITY) {
+                continue;
+            }
+            const int64_t cell = i_row[j];
+            GGML_ASSERT(cell >= 0 && cell < n_kv);
+
+            const char * kr = (const char *) k->data + cell*k->nb[2] + s*k->nb[3];
+            if (k->type == GGML_TYPE_F16) {
+                ggml_cpu_fp16_to_fp32((const ggml_fp16_t *) kr, k_row, D);
+            } else {
+                memcpy(k_row, kr, D*sizeof(float));
+            }
+
+            float qk = 0.0f;
+            ggml_vec_dot_f32(D, &qk, 0, q_row, 0, k_row, 0, 1);
+
+            const float v = qk*scale + m_row[j];
+            if (v > m) {
+                const float a = m == -INFINITY ? 0.0f : expf(m - v);
+                for (int64_t d = 0; d < D_v; ++d) {
+                    acc[d] *= a;
+                }
+                l *= a;
+                m  = v;
+            }
+            const float p = expf(v - m);
+            l += p;
+            for (int64_t d = 0; d < D_v; ++d) {
+                acc[d] += p*k_row[d];
+            }
+        }
+
+        const float inv = l > 0.0f ? 1.0f/l : 0.0f;
+        for (int64_t d = 0; d < D_v; ++d) {
+            d_row[d] = acc[d]*inv;
+        }
+    }
+}
+
 // ggml_compute_forward_lightning_indexer
 
 void ggml_compute_forward_lightning_indexer(

@@ -19,20 +19,33 @@ uint32_t llama_kpool_n_pools(uint32_t n_kv, uint32_t kpool, uint32_t n_seqs = 1)
 // select_k of Glm5NextTextIndexer.forward: must run over POOLS, a cell cut takes partial pools
 uint32_t llama_kpool_select_k(uint32_t n_pools, uint32_t indexer_top_k, uint32_t kpool);
 
+// LLAMA_DSA_SPARSE: DSA attention over the selected cells only (top-k pools plus the query's tail, at most
+// indexer_top_k + kpool - 1 per query) instead of masking all n_kv cells, so its cost and compute buffer stop growing
+// with the context. 1 = the fused GGML_OP_SPARSE_ATTN, 2 = the reference built from get_rows/mul_mat/soft_max.
+// Read once; 0 when unset.
+int llama_kpool_sparse_attn_mode();
+bool llama_kpool_sparse_attn();
+
 // `kv` must be the ATTENTION (MLA) cache; the indexer cache shares its slot layout.
 //   pool_cells  pool member -> cell, 0 if not resident
 //   pool_bias   computed, NOT gathered at the last member, which an incomplete pool lacks
 //   cand_mask   bounds top-k spills a partial seq_rm would let escape
 // pool_reps / new_pool_cells / new_pool_reps are nullptr when the cache is off, and an entry
 // is emitted only for filled == kpool: cell 0 is real, so writing its 0 slot would clobber
+// sparse attention (LLAMA_DSA_SPARSE) replaces sel_mask/cand_mask (both nullptr then) with
+//   tail_cells  I32 [kpool - 1, n_tps, n_stream]: the cells of the query's partial pool at or before it (0 if unused)
+//   tail_mask   F32 [kpool - 1, n_tps, n_stream]: 0 for a used slot, -INFINITY otherwise
 void llama_kv_cache_set_input_kpool(
         const llama_kv_cache * kv,
+              int64_t          n_kv,
               ggml_tensor    * cell_pool,
               ggml_tensor    * pool_cells,
               ggml_tensor    * bias,
               ggml_tensor    * pool_bias,
               ggml_tensor    * sel_mask,
               ggml_tensor    * cand_mask,
+              ggml_tensor    * tail_cells,
+              ggml_tensor    * tail_mask,
               ggml_tensor    * pool_reps,
               ggml_tensor    * new_pool_cells,
               ggml_tensor    * new_pool_reps,
@@ -82,6 +95,10 @@ public:
 
     ggml_tensor * sel_mask   = nullptr;   // F16 [n_kv, n_batch, 1, n_stream]
     ggml_tensor * cand_mask  = nullptr;   // F16 [n_kv, n_batch, 1, n_stream]
+
+    // sparse attention: gather the selected cells instead of masking all n_kv (sel_mask/cand_mask are nullptr then)
+    ggml_tensor * tail_cells = nullptr;   // I32 [kpool - 1, n_tps, n_stream]
+    ggml_tensor * tail_mask  = nullptr;   // F32 [kpool - 1, n_tps, n_stream]
 
     const llama_kv_cache_context * mctx_attn;
     const llama_kv_cache_context * mctx_idx;

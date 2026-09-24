@@ -1395,14 +1395,16 @@ struct llama_model_glm5next : public llama_model_base {
                 ggml_tensor * cur,
                 int il) const;
 
-        // always stores the key and gate; when `scoring`, returns the selected CELL indices
+        // always stores the key and gate; when `scoring`, returns the selected CELL indices. With the sparse gather
+        // (inp_kp->tail_cells set) *top_k_mask gets each selected cell's usability: 0, or -INFINITY for an unusable pool
         ggml_tensor * build_indexer(
                 const llama_layer & layer,
                 llm_graph_input_kpool * inp_kp,
                 ggml_tensor * cur,
                 ggml_tensor * qr,
                 bool scoring,
-                int il) const;
+                int il,
+                ggml_tensor ** top_k_mask = nullptr) const;
 
         ggml_tensor * build_layer_ffn(
                 const llama_model & model,

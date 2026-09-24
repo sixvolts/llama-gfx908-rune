@@ -246,3 +246,67 @@ Sampled decode (T = 1.0, top-p 0.95, 4 prompts x 2 seeds, 2.5k tokens, `glm53_sa
 Greedy (3 prompts, t/s per prompt): MTP depth 2 36.6/41.8/38.4 against DFlash2 depth 2 34.2/42.1/35.8, with identical
 output hashes (both verify the same batch shape). MTP depth 2 with RS is the best drafter configuration: +49% over no
 speculation on sampled chat, +8% over DFlash2, and its drafter needs no second model. `GLM_SPEC=mtp` selects it.
+
+## 9. Step 4: sparse DSA attention on gfx908 (2026-09-24)
+
+The PR computes DSA attention as dense attention under a mask. Every query scores all n_kv cells, and the host fills
+two n_kv-wide masks per ubatch. With `-fa off` that materializes [n_kv x ubatch x 64] scores, so the compute buffer
+limited us to 1 x 32k, and decode fell from 24 to 11.5 t/s between 1.6k and 22.7k of context. A query only ever
+attends the cells of its top-k pools plus its own partial pool, at most top_k + kpool - 1 = 2051 cells. The sparse
+path now computes exactly that set.
+
+- Inputs (`LLAMA_DSA_SPARSE` set): the pooled-indexer input gives each query its tail, the visible cells of its own
+  partial pool (at most kpool - 1), as a cell list and a 0/-inf mask. They replace the n_kv-wide `sel_mask` and
+  `cand_mask`. A selected pool is usable iff its `pool_bias` is 0, so its members' mask is that bias gathered at the
+  top-k picks. The KQ mask is also gathered at every listed cell, as in the dense path.
+- `GGML_OP_SPARSE_ATTN` (`ggml_sparse_attn`): attention of each query over its own cell list, one KV head, V = a prefix
+  of the K row. CPU reference in ggml-cpu. The gfx908 kernel (`ggml-cuda/sparse-attn.cu`) handles one query x 16 heads
+  x 64-cell tiles per block. It gathers the K rows straight from the cache into registers and runs QK on
+  `v_mfma_f32_16x16x16f16`, with Q held in registers as f16. The online softmax runs across the 4 waves, and PV runs on
+  the same MFMA with V^T staged through LDS in 128-wide chunks. Precision matches the dense `-fa off` path: f16 K, Q
+  and P with f32 accumulation. For few queries (decode, verify), the cell range is split across blocks and a combine
+  kernel merges the partial results.
+- `LLAMA_DSA_SPARSE=1` selects the fused op, `=2` a reference built from get_rows/mul_mat/soft_max, and unset or 0
+  keeps the dense path.
+
+Validation:
+- test-backend-ops SPARSE_ATTN: 18/18 against the CPU reference (decode, verify and 64-query batches, 1 and 2 streams,
+  partial tiles, a fully masked query).
+- The dense path is unchanged: greedy hashes are identical to before (7f3bc855 3ea253ae 3667a96e).
+- KL gate (`glm53-kl.sh`, wikitext-2, 6 chunks of 8k, so the top-k is active). The model's numerics floor is not 0:
+  changing only the dense path's ubatch moves the logits as much as the sparse paths do, because a tiny difference flips
+  near-tied top-k pool picks in later DSA layers.
+
+| against dense, ubatch 512 | mean KLD | same top token | PPL |
+|---|---|---|---|
+| dense again | 0.000000 | 99.996% | 2.6852 |
+| dense, ubatch 256 (numerics only) | 0.00976 | 96.46% | 2.6851 |
+| sparse, reference ops | 0.00945 | 96.73% | 2.6832 |
+| sparse, fused kernel | 0.00965 | 96.70% | 2.6814 |
+
+Both sparse paths sit at the numerics floor, so later tolerance-class GLM changes should be gated against the ubatch-256
+figure, not against 0.
+
+Speed without speculation, one slot (prefill / decode t/s):
+
+| prompt tokens | dense, 32k ctx | fused, 32k ctx | fused, 128k ctx |
+|---|---|---|---|
+| 1,641 | 280 / 24.1 | 309 / 25.6 | |
+| 6,471 | 462 / 19.4 | 518 / 25.0 | |
+| 13,001 | 423 / 15.2 | 561 / 24.6 | |
+| 22,726 | 342 / 11.5 | 574 / 24.2 | 435 / 24.3 |
+| 54,054 | | | 497 / 23.7 |
+| 108,043 | | | 449 / 22.2 |
+
+Decode no longer falls with the cache (22.2 t/s at 108k), and long prefill is up to 1.7x faster. VRAM at 32k drops by
+about 4.5 GB per GPU. At 128k the fullest GPU holds 27.1 of 34.3 GB. The dense path cannot run 128k with ubatch 512.
+
+With the MTP drafter (depth 2, lossless RS) the sparse path applies to the drafter's DSA layer too:
+- Sampled chat (T = 1.0, top-p 0.95): 40.9 t/s, acceptance 0.74, against 38.9 with dense attention.
+- Greedy, 3 prompts: 37.6/41.7/41.5 t/s.
+- 128k context, prefill / decode t/s: 1.6k prompt 289 / 36.8, 22.7k 682 / 37.9, 108k 352 / 30.9.
+
+Two prefill effects are open. The first prompt that reaches a new cache width prefills slower than a repeat of the
+same length (22.7k: 422 against 682 t/s in one server run), a one-time warm-up of per-shape state, not steady state.
+And the drafter's own prompt pass costs about a fifth of prefill at 108k (352 against 449 t/s without it).
+`LLAMA_DSA_SPARSE=1` is now the default in `glm53-env.sh`.

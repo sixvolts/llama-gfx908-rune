@@ -582,6 +582,7 @@ extern "C" {
         GGML_OP_SOLVE_TRI,
         GGML_OP_GATED_DELTA_NET,
         GGML_OP_LIGHTNING_INDEXER,
+        GGML_OP_SPARSE_ATTN,
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
@@ -2676,6 +2677,26 @@ extern "C" {
         struct ggml_tensor  * k,
         struct ggml_tensor  * weights,
         struct ggml_tensor  * mask);
+
+    // sparse attention over a per-query list of cells, for one KV head whose V is a prefix of its K row (DSA over
+    // absorbed MLA: the attended cells are the indexer's top-k pools plus a short tail, a few thousand at most)
+    //
+    // q:    [D,     n_head, n_q, ne3] f32
+    // k:    [D,     1,      n_kv, ne3] f16 or f32 (a KV-cache view; rows and streams may be strided)
+    // idx:  [n_sel, n_q,    ne3]      i32, cell of k per slot (0 <= idx < n_kv)
+    // mask: [n_sel, n_q,    ne3]      f32, added to the scaled score (0 or -INFINITY)
+    // res:  [D_v,   n_head, n_q, ne3] f32 (the layout of ggml_flash_attn_ext's result)
+    //
+    // res[:, h, t] = sum_j softmax_j(scale*q[:, h, t].k[:, idx[j, t]] + mask[j, t]) k[0:D_v, idx[j, t]]
+    // a query with no finite mask entry gets 0
+    GGML_API struct ggml_tensor * ggml_sparse_attn(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * q,
+        struct ggml_tensor  * k,
+        struct ggml_tensor  * idx,
+        struct ggml_tensor  * mask,
+        int64_t               D_v,
+        float                 scale);
 
     // DeepSeek V4 hyper-connections (ref. https://arxiv.org/pdf/2512.24880)
     // In short these operations are replacements for the original residual connection (x = transformer(x) + x)

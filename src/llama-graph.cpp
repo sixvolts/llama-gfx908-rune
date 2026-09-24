@@ -3663,14 +3663,26 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
             ggml_set_name(inp->pool_bias_f16, "kpool_pool_bias_f16");
         }
 
-        // lossless in f16 (only 0.0f and -INFINITY), and f16 + f32 -> f16 adds the KQ mask uncast
-        inp->sel_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream);
-        ggml_set_input(inp->sel_mask);
-        ggml_set_name(inp->sel_mask, "kpool_sel_mask");
+        if (llama_kpool_sparse_attn()) {
+            GGML_ASSERT(kpool > 1 && "the sparse gather's tail list needs kpool > 1");
+            // sparse attention gathers the selected cells: only the tail needs a host-side list
+            inp->tail_cells = ggml_new_tensor_3d(ctx0, GGML_TYPE_I32, kpool - 1, n_tps, n_stream);
+            ggml_set_input(inp->tail_cells);
+            ggml_set_name(inp->tail_cells, "kpool_tail_cells");
 
-        inp->cand_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream);
-        ggml_set_input(inp->cand_mask);
-        ggml_set_name(inp->cand_mask, "kpool_cand_mask");
+            inp->tail_mask = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, kpool - 1, n_tps, n_stream);
+            ggml_set_input(inp->tail_mask);
+            ggml_set_name(inp->tail_mask, "kpool_tail_mask");
+        } else {
+            // lossless in f16 (only 0.0f and -INFINITY), and f16 + f32 -> f16 adds the KQ mask uncast
+            inp->sel_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream);
+            ggml_set_input(inp->sel_mask);
+            ggml_set_name(inp->sel_mask, "kpool_sel_mask");
+
+            inp->cand_mask = ggml_new_tensor_4d(ctx0, GGML_TYPE_F16, n_kv, n_tps, 1, n_stream);
+            ggml_set_input(inp->cand_mask);
+            ggml_set_name(inp->cand_mask, "kpool_cand_mask");
+        }
 
         // n_new_max is an exact bound (a contiguous run of L tokens closes at most L/kpool + 1
         // pools), FIXED for the decode phase so the graph shape does not track pools-closed-this-
@@ -3777,6 +3789,126 @@ ggml_tensor * llm_graph_context::build_attn_sparse(
     if (wo_b) {
         cur = ggml_add(ctx0, cur, wo_b);
     }
+
+    return cur;
+}
+
+ggml_tensor * llm_graph_context::build_attn_sparse_gather(
+        llm_graph_input_attn_k * inp,
+        ggml_tensor * wo,
+        ggml_tensor * wo_b,
+        ggml_tensor * wo_s,
+        ggml_tensor * q_cur,
+        ggml_tensor * k_cur,
+        ggml_tensor * v_cur,
+        ggml_tensor * v_mla,
+        ggml_tensor * top_k,
+        ggml_tensor * top_k_mask,
+        ggml_tensor * tail_cells,
+        ggml_tensor * tail_mask,
+              float   kq_scale,
+                int   il) const {
+    ggml_build_forward_expand(gf, q_cur);
+    ggml_build_forward_expand(gf, v_cur);
+    ggml_build_forward_expand(gf, k_cur);
+
+    const auto * mctx_cur = inp->mctx;
+
+    // the ubatch's own keys are stored first: the gather reads them back (same ordering as build_attn_sparse)
+    ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il));
+
+    const auto & kq_mask = inp->get_kq_mask();
+
+    ggml_tensor * k = mctx_cur->get_k(ctx0, il); // [D, 1, n_kv, n_stream]
+
+    GGML_ASSERT(k->ne[1] == 1 && "sparse gather attention is MQA (one KV head)");
+
+    const int64_t D        = k->ne[0];
+    const int64_t D_v      = v_cur->ne[0];
+    const int64_t n_kv     = k->ne[2];
+    const int64_t n_stream = k->ne[3];
+    const int64_t n_head   = q_cur->ne[1];
+    const int64_t n_toks   = q_cur->ne[2];
+    const int64_t n_tps    = n_toks/n_stream;
+
+    GGML_ASSERT(q_cur->ne[0] == D && D_v <= D);
+    GGML_ASSERT(n_tps*n_stream == n_toks);
+    GGML_ASSERT(top_k->ne[1] == n_tps && top_k->ne[2] == n_stream);
+    GGML_ASSERT(ggml_are_same_shape(top_k, top_k_mask));
+    GGML_ASSERT(ggml_are_same_shape(tail_cells, tail_mask));
+    GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream);
+
+    // the per-query cell list and its additive mask
+    ggml_tensor * idx  = ggml_concat(ctx0, top_k,      tail_cells, 0); // I32 [n_sel, n_tps, n_stream]
+    ggml_tensor * mask = ggml_concat(ctx0, top_k_mask, tail_mask,  0); // F32 [n_sel, n_tps, n_stream]
+
+    const int64_t n_sel = idx->ne[0];
+
+    // load bearing as in build_attn_sparse: the KQ mask at every listed cell keeps an empty, future or
+    // foreign-sequence cell masked whatever the lists say
+    {
+        ggml_tensor * kqm = ggml_view_4d(ctx0, kq_mask, 1, n_kv, n_tps, n_stream,
+                ggml_element_size(kq_mask), kq_mask->nb[1], kq_mask->nb[3], 0);
+        kqm = ggml_get_rows(ctx0, kqm, idx); // F32 [1, n_sel, n_tps, n_stream]
+        mask = ggml_add(ctx0, mask, ggml_reshape_3d(ctx0, kqm, n_sel, n_tps, n_stream));
+    }
+    cb(mask, "sparse_mask", il);
+
+    ggml_tensor * cur = nullptr;
+
+    if (llama_kpool_sparse_attn_mode() != 2) {
+        // fused: one kernel reads the listed rows straight from the cache
+        ggml_tensor * q4 = ggml_reshape_4d(ctx0, q_cur, D, n_head, n_tps, n_stream);
+        cur = ggml_sparse_attn(ctx0, q4, k, idx, mask, D_v, kq_scale); // [D_v, n_head, n_tps, n_stream]
+        cb(cur, "sparse_kqv", il);
+    } else {
+        // reference: gather the listed K rows per query; f16 again so the products run like the dense -fa off path
+        // (K f16 from the cache, Q and P converted to f16, f32 accumulation)
+        ggml_tensor * k3 = ggml_view_3d(ctx0, k, D, n_kv, n_stream, k->nb[2], k->nb[3], 0);
+        ggml_tensor * ks = ggml_get_rows(ctx0, k3, ggml_reshape_2d(ctx0, idx, n_sel*n_tps, n_stream));
+        if (k->type == GGML_TYPE_F16) {
+            ks = ggml_cast(ctx0, ks, GGML_TYPE_F16);
+        }
+        ks = ggml_reshape_3d(ctx0, ks, D, n_sel, n_toks);
+        cb(ks, "sparse_k", il);
+
+        ggml_tensor * kq = ggml_mul_mat(ctx0, ks, q_cur); // [n_sel, n_head, n_toks]
+        ggml_prec_set_acc(kq, GGML_PREC_F32);
+        cb(kq, "sparse_kq", il);
+
+        // mask values are 0 or -INFINITY, so adding before the scale equals soft_max_ext's scale-then-mask
+        kq = ggml_add(ctx0, kq, ggml_reshape_3d(ctx0, mask, n_sel, 1, n_toks));
+        kq = ggml_soft_max_ext(ctx0, kq, nullptr, kq_scale, 0.0f);
+        cb(kq, "sparse_kq_soft_max", il);
+
+        ggml_tensor * vs = D_v == D ? ks : ggml_view_3d(ctx0, ks, D_v, n_sel, n_toks, ks->nb[1], ks->nb[2], 0);
+        ggml_tensor * vt = ggml_cont(ctx0, ggml_transpose(ctx0, vs)); // [n_sel, D_v, n_toks]
+        cb(vt, "sparse_vt", il);
+
+        cur = ggml_mul_mat(ctx0, vt, kq); // [D_v, n_head, n_toks], the flash_attn_ext layout
+        cb(cur, "sparse_kqv", il);
+    }
+
+    if (v_mla) {
+        cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+        cur = ggml_mul_mat(ctx0, v_mla, cur);
+        cb(cur, "sparse_mla", il);
+        cur = ggml_permute(ctx0, cur, 0, 2, 1, 3);
+        cur = ggml_cont(ctx0, cur);
+    }
+
+    cur = ggml_reshape_2d(ctx0, cur, cur->ne[0]*cur->ne[1], cur->ne[2]*cur->ne[3]);
+    cb(cur, "kqv_out", il);
+
+    if (wo) {
+        cur = build_lora_mm(wo, cur, wo_s);
+    }
+
+    if (wo_b) {
+        cur = ggml_add(ctx0, cur, wo_b);
+    }
+
+    ggml_build_forward_expand(gf, cur);
 
     return cur;
 }

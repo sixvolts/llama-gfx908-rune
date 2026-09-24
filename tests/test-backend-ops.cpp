@@ -8242,6 +8242,83 @@ struct test_lightning_indexer : public test_case {
     }
 };
 
+// GGML_OP_SPARSE_ATTN
+struct test_sparse_attn : public test_case {
+    const int64_t d;     // K row size (V is its first d_v values)
+    const int64_t d_v;
+    const int64_t nh;    // query heads
+    const int64_t kv;    // cells
+    const int64_t n_sel; // listed cells per query
+    const int64_t nq;    // queries per stream
+    const int64_t ns;    // streams
+
+    std::string vars() override {
+        return VARS_TO_STR7(d, d_v, nh, kv, n_sel, nq, ns);
+    }
+
+    double max_nmse_err() override {
+        return 5e-4; // f16 Q, K and P with f32 accumulation on the GPU, all-f32 on the CPU
+    }
+
+    uint64_t op_flops(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return 2 * (d + d_v) * nh * n_sel * nq * ns;
+    }
+
+    test_sparse_attn(int64_t d = 512, int64_t d_v = 512, int64_t nh = 64, int64_t kv = 4096, int64_t n_sel = 2051,
+            int64_t nq = 1, int64_t ns = 1)
+        : d(d), d_v(d_v), nh(nh), kv(kv), n_sel(n_sel), nq(nq), ns(ns) {}
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * q = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, d, nh, nq, ns);
+        ggml_set_name(q, "q");
+
+        // a KV-cache-like view: the stream stride covers more cells than the view
+        ggml_tensor * k_all = ggml_new_tensor_4d(ctx, GGML_TYPE_F16, d, 1, kv + 16, ns);
+        ggml_set_name(k_all, "k_all");
+        ggml_tensor * k = ggml_view_4d(ctx, k_all, d, 1, kv, ns, k_all->nb[1], k_all->nb[2], k_all->nb[3], 0);
+        ggml_set_name(k, "k");
+
+        ggml_tensor * idx = ggml_new_tensor_3d(ctx, GGML_TYPE_I32, n_sel, nq, ns);
+        ggml_set_name(idx, "idx");
+
+        ggml_tensor * mask = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_sel, nq, ns);
+        ggml_set_name(mask, "mask");
+
+        ggml_tensor * out = ggml_sparse_attn(ctx, q, k, idx, mask, d_v, 1.0f/sqrtf((float) d));
+        ggml_set_name(out, "out");
+
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        std::mt19937 rng(1234);
+        for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != NULL; t = ggml_get_next_tensor(ctx, t)) {
+            if (strcmp(t->name, "idx") == 0) {
+                std::uniform_int_distribution<int32_t> cell(0, (int32_t) kv - 1);
+                std::vector<int32_t> v(ggml_nelements(t));
+                for (auto & x : v) {
+                    x = cell(rng);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(int32_t));
+            } else if (strcmp(t->name, "mask") == 0) {
+                // mostly visible, some -inf, and the last query of the last stream fully masked (must give 0)
+                std::uniform_real_distribution<float> u(0.0f, 1.0f);
+                std::vector<float> v(ggml_nelements(t));
+                for (auto & x : v) {
+                    x = u(rng) < 0.9f ? 0.0f : -INFINITY;
+                }
+                if (nq > 1) {
+                    std::fill(v.end() - n_sel, v.end(), -INFINITY);
+                }
+                ggml_backend_tensor_set(t, v.data(), 0, v.size()*sizeof(float));
+            } else if (t->view_src == nullptr) {
+                init_tensor_uniform(t);
+            }
+        }
+    }
+};
+
 // Deserializable generic test case
 struct input_tensor {
     ggml_type type;
@@ -10979,6 +11056,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     for (int kv : { 1, 7, 8, 63, 64, 65 }) {
         for (ggml_type type_K : {GGML_TYPE_F32, GGML_TYPE_F16, GGML_TYPE_BF16, GGML_TYPE_Q8_0, GGML_TYPE_Q5_1, GGML_TYPE_Q5_0, GGML_TYPE_Q4_1, GGML_TYPE_Q4_0}) {
             test_cases.emplace_back(new test_lightning_indexer(128, 64, kv, 32, 4, 1, type_K));
+        }
+    }
+
+    // sparse attention (GLM-5.3 DSA shape): decode, speculative verify, prefill-sized batches, two streams, a partial tile
+    for (int64_t n_sel : { 64, 100, 2051 }) {
+        for (int64_t nq : { 1, 3, 64 }) {
+            for (int64_t ns : { 1, 2 }) {
+                test_cases.emplace_back(new test_sparse_attn(512, 512, 64, 4096, n_sel, nq, ns));
+            }
         }
     }
 
