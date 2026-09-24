@@ -15,7 +15,7 @@ GLM_MODEL=${GLM_MODEL:-/home/sixvolts/models/GLM-5.3-Flash-GGUF/UD-Q4_K_XL/GLM-5
 GLM_MODEL_Q6MIX=/home/sixvolts/models/GLM-5.3-Flash-GGUF/UD-Q4_K_XL-Q6mix/GLM-5.3-Flash-UD-Q4_K_XL-Q6mix-00001-of-00006.gguf
 GLM_DRAFT=${GLM_DRAFT:-/home/sixvolts/models/GLM-5.3-Flash-DFlash2/GLM-5.3-Flash-DFlash2-Q8_0-sc.gguf}
 GLM_PORT=${GLM_PORT:-18099}
-GLM_DRAFT_N=${GLM_DRAFT_N:-4}          # physics: block 4-5 beats 8 on MI100 (expert-union cost of each verify row)
+GLM_DRAFT_N=${GLM_DRAFT_N:-2}          # measured: 2 > 3 > 4 > 5 > 6 (each verify row adds ~8 of 288 experts' weights)
 
 export HIP_VISIBLE_DEVICES=0,2,3,4,5,7,8,9,6,1   # ROCm0..8 = trunk stages, ROCm9 = drafter
 export LLAMA_PIPELINE_PARALLEL=1

@@ -178,3 +178,29 @@ fabric error), `glm53_plan.py bytes|layout|typemap`, `gguf_add_tensors.py`. Both
 Bring-up order once both hives can be released: soak (20 min) -> nospec bring-up (load, VRAM per GPU, PPL/KL vs the
 reference, tokens/s, HIP-graph and fused-op checks) -> DFlash2 depth sweep 3/4/5/6 -> Q6mix gate -> kernel work from
 the profile.
+
+## 7. First measurements on the two hives (2026-09-24, Qwen services paused)
+
+Layout: 9 stages (A 0,2,3,4 -> B 5,7,8,9 -> GPU 6), DFlash2 Q8_0 drafter on GPU 1, `-fa off`, 1 slot x 32k, ubatch 512.
+Safety: 3-min and 20-min cross-island soaks (the 20-min one with the drafter: 75 requests, 236k tokens) passed with no
+fabric/hardware errors; staged pairs exactly the cross-island ones (3->4, 7->8, 0->4..8); hops cost 20-40 us.
+
+- Compute buffers are the memory constraint, not weights: the DSA "sparse" attention is mask-based dense attention,
+  so with `-fa off` every stage materializes [n_kv x ubatch x 64 heads] scores (~288 B per pair: 128k x 512 ->
+  19.7 GB per GPU). With FA the buffers drop to 2.4 GB, but on gfx908 the 512-wide MLA runs the tile kernel with
+  packed-fp16 Q.K (the precision problem the PR avoids). Hence 32k x 1 for now.
+- `-ts` must count layers the way llama.cpp assigns them (il/47 against the cumulative split, the last share holding
+  the skipped MTP layer and the output): `-ts 7,4,4,5,5,5,5,5,7` reproduces the planner's split.
+- Graph reuse was never happening (`llm_graph_input_kpool` lacked `can_reuse`): a fixed 10.9 ms host rebuild per
+  token. Fixed (b29ce33bc, outputs identical): raw decode 19.7 -> 26.0 t/s.
+- Decode anatomy (trace, 1 token): 9 stages strictly sequential, ~3,700 kernels/token. Dense Q8_0 GEMVs are already at
+  0.76-0.88 TB/s on GLM's shapes (upstream mmvq; our tuned kernel adds nothing here), MoE experts ~72% of bandwidth;
+  the remainder is launch-bound small kernels (quantize, mHC pre/comb/post, norms, elementwise, 4.5 us each) plus
+  the mHC Sinkhorn kernel (19 us x 90), a 46 us recurrent-state get_rows x 34 and the indexer (87 us x 11).
+- DFlash2 depth sweep (greedy, 3 prompts): raw 26.0 | d2 34.2/42.1/35.8 | d3 33.3/40.8/33.3 | d4 31.4/38.2/28.7 |
+  d5 29.8/36.2/27.2 | d6 27.8/32.4/25.5. Depth 2 wins (+44%), as the expert-union model predicts. Acceptance ~40-60%
+  per draft at d4.
+- With the drafter (d2): prompt 1.6k/6.5k/13k/22.7k -> prefill 227/389/388/318 t/s, decode 32.5/24.7/20.7/13.9 t/s.
+  Without the drafter prefill was ~640 t/s at 6k (the drafter adds the 5-layer hidden-state export and its own
+  prompt pass). Decode falls with context because attention and the indexer scan the whole cache (dense masked
+  attention): the case for true gather-based sparse attention.

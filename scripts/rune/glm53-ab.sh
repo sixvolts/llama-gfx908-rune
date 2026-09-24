@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
-# A/B runs of the GLM test server: for each "tag:ENV=VAL,ENV=VAL" argument start the server (nospec unless
-# GLM_MODE=spec), run the greedy hash/speed client, stop the server (by its PID, args verified).
-#   glm53-ab.sh <outdir> "base:LLAMA_GRAPH_REUSE_DISABLE=1" "reuse:" ...
+# A/B runs of the GLM test server: for each "tag:ENV=VAL,ENV=VAL[:extra server args]" argument start the server
+# (nospec unless GLM_MODE=spec), run the greedy hash/speed client, stop the server (by its PID, args verified).
+#   glm53-ab.sh <outdir> "base:LLAMA_GRAPH_REUSE_DISABLE=1" "reuse:" "d3::--spec-draft-n-max 3" ...
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)
 . "$HERE/glm53-env.sh"
@@ -11,10 +11,12 @@ glm53_require_hives_free || exit 1
 SPEC=()
 [ "${GLM_MODE:-nospec}" = spec ] && SPEC=("${GLM_SPEC_ARGS[@]}")
 for arg in "$@"; do
-  tag=${arg%%:*}; envs=${arg#*:}
+  tag=${arg%%:*}; rest=${arg#*:}; envs=${rest%%:*}; extra=""
+  [[ "$rest" == *:* ]] && extra=${rest#*:}
+  read -ra EXTRA <<< "$extra"
   ENVV=(); IFS=',' read -ra kv <<< "$envs"; for e in "${kv[@]}"; do [ -n "$e" ] && ENVV+=("$e"); done
-  echo "== $tag ${ENVV[*]}"
-  env "${ENVV[@]}" "$GLM_BIN/llama-server" -m "$GLM_MODEL" "${GLM_ARGS[@]}" "${SPEC[@]}" -lv 3 > "$OUT/server_$tag.log" 2>&1 &
+  echo "== $tag ${ENVV[*]} ${EXTRA[*]}"
+  env "${ENVV[@]}" "$GLM_BIN/llama-server" -m "$GLM_MODEL" "${GLM_ARGS[@]}" "${SPEC[@]}" "${EXTRA[@]}" -lv 3 > "$OUT/server_$tag.log" 2>&1 &
   SRV=$!
   ok=0
   for i in $(seq 1 300); do
@@ -23,7 +25,7 @@ for arg in "$@"; do
     sleep 2
   done
   if [ $ok = 1 ]; then
-    python3 "$HERE/glm53_client.py" "$GLM_PORT" 2>&1 | tee "$OUT/client_$tag.txt"
+    python3 "$HERE/${GLM_CLIENT:-glm53_client.py}" "$GLM_PORT" 2>&1 | tee "$OUT/client_$tag.txt"
   else
     echo "server failed"; tail -5 "$OUT/server_$tag.log"
   fi
