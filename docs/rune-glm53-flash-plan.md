@@ -163,7 +163,8 @@ replayed + the peer policy. Build `/home/sixvolts/llama.cpp-glm53/build` (same C
 - **Q6_K mix**: `llama-quantize` re-derives the type of every tensor an override does not match, so the requant uses
   an explicit map of all 1412 tensors (`glm53_plan.py typemap --q6k`): 294 Q8_0 projections -> Q6_K, the other 1118
   copied byte-for-byte (unsloth's Q4_K/Q5_K/Q6_K experts untouched), unsloth imatrix, -1.87 GB.
-  Output: `UD-Q4_K_XL-Q6mix/`. Gate before use: KL vs UD-Q4_K_XL, and the Q6_K GEMV must reach Q8_0's bandwidth
+  Output: `UD-Q4_K_XL-Q6mix/` (5.6 min on CPU; verified: 1118 tensors byte-identical to the source, exactly the 294
+  planned ones retyped; decode bytes 14.12 -> 12.25 GB/token). Gate before use: KL vs UD-Q4_K_XL, and the Q6_K GEMV must reach Q8_0's bandwidth
   efficiency on MI100 (mmvq Q6_K is upstream code we have not tuned) or the byte saving does not turn into speed.
 - HIP coverage (static): lightning indexer runs its vec kernel for the 32-head config (F32/F16/Q8_0 keys), fused mHC
   ops take F32, KDA runs on our GDN kernels (their preload and lane-per-column variants already carry the KDA template
