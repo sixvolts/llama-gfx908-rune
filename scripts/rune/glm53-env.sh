@@ -5,7 +5,11 @@
 #   Hive A 0,2,3,4 (XGMI) -> Hive B 5,7,8,9 (XGMI) -> GPU 6 (PCIe), DFlash2 drafter on GPU 1 (PCIe).
 #   Island crossings (A->B, B->6) and the drafter's inputs go through the host-staged copy path: the peer policy
 #   (GGML_CUDA_PEER_POLICY, default xgmi) never issues peer copies outside an XGMI island.
-#   Planner: tightest stage 2.9 GB free with a 3 GB compute reserve; ~0.3 GB/GPU more for KDA rollback snapshots.
+#   -ts counts layers the way llama.cpp assigns them: layer il (0..45) and the output layer (46) go to device
+#   upper_bound(cumsum(ts)/sum(ts), il/47), so the last device's share includes the (skipped) MTP layer and the output.
+# Compute buffer with -fa off: the "sparse" DSA attention is mask-based dense attention, so it materializes
+#   [n_kv x n_ubatch x 64 heads] scores: ~288 B x ctx_per_slot x ubatch per GPU (128k x 512 -> 19.7 GB, 32k x 512 ->
+#   5.1 GB, 128k x 128 -> 4.9 GB). Bring-up default: 1 slot x 32k, ubatch 512 (fit: <= 27.2 GiB on every GPU).
 GLM_BIN=${GLM_BIN:-/home/sixvolts/llama.cpp-glm53/build/bin}
 GLM_MODEL=${GLM_MODEL:-/home/sixvolts/models/GLM-5.3-Flash-GGUF/UD-Q4_K_XL/GLM-5.3-Flash-UD-Q4_K_XL-00001-of-00006.gguf}
 GLM_MODEL_Q6MIX=/home/sixvolts/models/GLM-5.3-Flash-GGUF/UD-Q4_K_XL-Q6mix/GLM-5.3-Flash-UD-Q4_K_XL-Q6mix-00001-of-00006.gguf
@@ -19,10 +23,10 @@ export GLIBC_TUNABLES=glibc.malloc.hugetlb=1
 export LD_LIBRARY_PATH=$GLM_BIN
 
 GLM_ARGS=(
-  -ngl 99 -dev ROCm0,ROCm1,ROCm2,ROCm3,ROCm4,ROCm5,ROCm6,ROCm7,ROCm8 -ts 7,4,4,5,5,5,5,5,5
+  -ngl 99 -dev ROCm0,ROCm1,ROCm2,ROCm3,ROCm4,ROCm5,ROCm6,ROCm7,ROCm8 -ts 7,4,4,5,5,5,5,5,7
   -fa off                                   # PR #27754: FA's F32->F16 cast breaks MLA precision
   --load-mode none -lzm off -t 16
-  -c 524288 -np 4 -ub 512 -b 2048
+  -c "${GLM_CTX:-32768}" -np "${GLM_NP:-1}" -ub "${GLM_UB:-512}" -b 2048
   --no-cache-idle-slots --cache-ram 65536
   --temp 1.0 --top-p 0.95
   --host 127.0.0.1 --port "$GLM_PORT" --alias glm-5.3-flash --metrics

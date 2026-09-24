@@ -299,7 +299,7 @@ static bool ggml_cuda_can_access_peer(const int dev, const int dev_other) {
         }
 #endif // defined(GGML_USE_HIP)
         if (!can) {
-            GGML_LOG_INFO("%s: devices %d -> %d: no peer copies (policy %s), staged through host memory\n", __func__, dev, dev_other,
+            GGML_LOG_WARN("%s: devices %d -> %d: no peer copies (policy %s), staged through host memory\n", __func__, dev, dev_other,
                 policy == PEER_NONE ? "none" : policy == PEER_XGMI ? "xgmi" : "query");
         }
         c = can ? 1 : 2;
