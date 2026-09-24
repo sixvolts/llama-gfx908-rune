@@ -131,3 +131,49 @@ bandwidth machines and this model reads 2.2x the bytes per token.
 6. DFlash2 on orphan GPU 1 or 6; block sweep 4/5/6/8 with the confidence cut; compare with the built-in MTP layer.
 7. Decide the production layout (8 vs 10 stages, Q4 vs Q5, slots x context) from the measured VRAM and the agents'
    real traffic; Hive B's Flash-Next service cannot coexist with it (both hives are needed).
+
+## 6. Prep status (2026-09-24, no GPU used - both hives stayed in production)
+
+Branches: `flash-next/13th-build` = the exact production commit (7baa212de), `glm53/snapshot-base` = the tuning tip
+before this work, `glm53/bringup` = worktree `/home/sixvolts/llama.cpp-glm53`: PR #27754 (86ebfef2c) + our 30 commits
+replayed + the peer policy. Build `/home/sixvolts/llama.cpp-glm53/build` (same CMake options as production).
+
+- **Rebase.** Conflicts were all where upstream had moved first: qwen4exp tensor shapes (hc norms now `[n_embd, hc]`
+  with `TENSOR_ALLOW_RESHAPE`; kept upstream's shapes with our MTP skip/trunk flags) and MMQ, where upstream added the
+  same per-expert J hint as ours under the name `ncols_opt` (kept upstream's, our `GGML_MMQ_MOE_J_MULT` override on
+  top). Everything compiles. Upstream also changed qwen4exp numerics since our fork point (GDN norm `max` -> `rsqrt`
+  #28068, rms_norm+mul fusion #28896, fp32 accumulation in the HIP MFMA flash attention #28576), so Flash-Next on
+  this branch is NOT expected to hash-match the 13th build: the regression gate there is KL/PPL + speed, and our HC
+  fusion matchers must be re-checked against the new node order (a miss costs speed, not correctness).
+- **Peer policy** (`f28ce566e`): on HIP a device pair uses peer copies only with a direct XGMI link (sysfs confirms
+  the islands {0,2,3,4} and {5,7,8,9}; GPUs 1 and 6 are PCIe-only). All cross-island traffic takes the pinned
+  host-staged path. `GGML_CUDA_PEER_POLICY=query|xgmi|none`. Untested on hardware - the soak script is the gate.
+- **Layout correction.** On 8 GPUs the UD-Q4_K_XL weights (194.4 GB without the MTP layer) do not fit with a 3 GB
+  compute reserve: MoE layers are ~4.6 GB, and the best contiguous split leaves the fullest GPUs 0.2-1.4 GB short.
+  9 stages (Hive A, Hive B, then GPU 6) fit with >= 2.9 GB free per GPU at 4 x 128k (`-ts 7,4,4,5,5,5,5,5,5`), leaving
+  GPU 1 for the drafter. 8 GPUs are possible only with per-tensor `-ot` balancing (~2 GB free) - not worth it.
+- **DFlash2 drafter**: converted with `--target-model-dir` (tokenizer from the target, metadata verified: target
+  layers [6,15,25,34,43], block 8, conv 2/16, selector 256/16, SWA 2048). The checkpoint has no embeddings and no
+  lm_head - it borrows the target's at runtime, which from GPU 1 would mean reading the target's 674 MB lm_head across
+  devices every draft step - so the target's Q8_0 `token_embd`/`output` were appended
+  (`scripts/rune/gguf_add_tensors.py`) and the whole draft quantized to Q8_0: `GLM-5.3-Flash-DFlash2-Q8_0-sc.gguf`,
+  2.5 GB, self-contained. SGLang's reference captures the mean of the 4 mHC streams at the input of layer k+1, which
+  is exactly what the PR's graph exports for `target_layers` - acceptance should match SGLang's.
+  License: CC BY-NC-ND 4.0 (private evaluation use only; do not redistribute the converted files).
+- **Q6_K mix**: `llama-quantize` re-derives the type of every tensor an override does not match, so the requant uses
+  an explicit map of all 1412 tensors (`glm53_plan.py typemap --q6k`): 294 Q8_0 projections -> Q6_K, the other 1118
+  copied byte-for-byte (unsloth's Q4_K/Q5_K/Q6_K experts untouched), unsloth imatrix, -1.87 GB.
+  Output: `UD-Q4_K_XL-Q6mix/`. Gate before use: KL vs UD-Q4_K_XL, and the Q6_K GEMV must reach Q8_0's bandwidth
+  efficiency on MI100 (mmvq Q6_K is upstream code we have not tuned) or the byte saving does not turn into speed.
+- HIP coverage (static): lightning indexer runs its vec kernel for the 32-head config (F32/F16/Q8_0 keys), fused mHC
+  ops take F32, KDA runs on our GDN kernels (their preload and lane-per-column variants already carry the KDA template
+  branch), glm5next supports recurrent rollback for speculative decoding (`n_rs_seq` = draft depth).
+
+Scripts (`scripts/rune/`): `glm53-env.sh` (layout + flags), `glm53-serve.sh [spec|nospec] [q4xl|q6mix]`,
+`glm53-peer-soak.sh [minutes]` (sustained cross-island load with the kernel log watched; stops the server on any
+fabric error), `glm53_plan.py bytes|layout|typemap`, `gguf_add_tensors.py`. Both serve scripts refuse to start while
+`flash-next` or `flash-next-b` is active.
+
+Bring-up order once both hives can be released: soak (20 min) -> nospec bring-up (load, VRAM per GPU, PPL/KL vs the
+reference, tokens/s, HIP-graph and fused-op checks) -> DFlash2 depth sweep 3/4/5/6 -> Q6mix gate -> kernel work from
+the profile.
