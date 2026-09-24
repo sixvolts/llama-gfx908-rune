@@ -4255,6 +4255,42 @@ struct test_dsv4_hc_comb : public test_dsv4_hc {
     }
 };
 
+// halo-hybrid: fused prologue
+struct test_dsv4_hc_mix : public test_dsv4_hc {
+    const ggml_type type;
+    const int64_t n_embd;
+    const int64_t n_tokens;
+    const int32_t n_iter;
+
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "DSV4_HC_MIX";
+    }
+
+    std::string vars() override {
+        return VARS_TO_STR4(type, n_embd, n_tokens, n_iter);
+    }
+
+    test_dsv4_hc_mix(ggml_type type = GGML_TYPE_Q8_0, int64_t n_embd = 256, int64_t n_tokens = 3, int32_t n_iter = 4)
+        : type(type), n_embd(n_embd), n_tokens(n_tokens), n_iter(n_iter) {}
+
+    double max_nmse_err() override { return 1e-5; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * x = ggml_new_tensor_3d(ctx, GGML_TYPE_F32, n_embd, hc, n_tokens);
+        ggml_set_name(x, "x");
+        ggml_tensor * w = ggml_new_tensor_2d(ctx, type, hc*n_embd, (2 + hc)*hc);
+        ggml_set_name(w, "hc_fn");
+        ggml_tensor * scale = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, 3);
+        ggml_set_name(scale, "scale");
+        ggml_tensor * base = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, (2 + hc)*hc);
+        ggml_set_name(base, "base");
+        out = ggml_dsv4_hc_mix(ctx, x, w, scale, base, 1e-6f, 1e-6f, n_iter);
+        ggml_set_name(out, "out");
+        return out;
+    }
+};
+
 struct test_dsv4_hc_pre : public test_dsv4_hc {
     const int64_t n_embd;
     const int64_t n_tokens;
@@ -9057,6 +9093,12 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_snake_fuse(type, {  64,  32, 2, 3}));   // ne[2] > 1 and ne[3] > 1
     }
 
+    for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_F32}) {
+        for (int64_t nt : {1, 3, 8}) {
+            test_cases.emplace_back(new test_dsv4_hc_mix(t, 256, nt, 4));
+        }
+        test_cases.emplace_back(new test_dsv4_hc_mix(t, 4096, 3, 4));
+    }
     test_cases.emplace_back(new test_dsv4_hc_comb(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_comb(17, 4));
     test_cases.emplace_back(new test_dsv4_hc_comb(257, 8));
