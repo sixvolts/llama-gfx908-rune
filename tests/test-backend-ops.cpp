@@ -9186,6 +9186,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t nt : {1, 3, 8}) {
             test_cases.emplace_back(new test_dsv4_hc_mix(t, 4096, nt, 4));
         }
+        // the model's 20 sinkhorn iterations at every decode width and a prefill width (split kernel gated off)
+        for (int64_t nt : {1, 2, 3, 4, 8, 64}) {
+            test_cases.emplace_back(new test_dsv4_hc_mix(t, 4096, nt, 20));
+        }
     }
     // the fused hyper-connection boundary (hc_post + hc_mix + rms_norm*w + q8_1 copy), decode widths, a prefill width
     // (no q8 copy above 8 tokens) and a chained block
@@ -11223,6 +11227,9 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // halo-hybrid: the fused hyper-connection prologue at decode widths
     for (int64_t nt : {1, 3}) {
         test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_Q8_0, 4096, nt, 4));
+    }
+    for (int64_t nt : {1, 2, 3, 4, 8}) {
+        test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_Q8_0, 4096, nt, 20));   // GLM-5.3: 20 sinkhorn iterations
     }
     // halo-hybrid: 8 chained hyper-connection boundaries in one graph (us/run is the whole graph); compare
     //     GGML_CUDA_NO_HC_NORM_FUSE=1 / GGML_CUDA_NO_HC_POST_FUSE=1 against the default
