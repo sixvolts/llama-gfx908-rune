@@ -292,14 +292,16 @@ static bool ggml_cuda_can_access_peer(const int dev, const int dev_other) {
                 (void) hipGetLastError();
                 link_type = 0;
             }
-            const bool xgmi = link_type == 4 /* HSA_AMD_LINK_INFO_TYPE_XGMI */ && hops == 1;
+            const bool xgmi = link_type == 4 /* HSA_AMD_LINK_INFO_TYPE_XGMI (hsa_ext_amd.h) */ && hops == 1;
             if (!xgmi) {
-                GGML_LOG_INFO("%s: devices %d and %d report peer access but share no direct XGMI link (type %u, hops %u): "
-                    "copies between them are staged through host memory\n", __func__, dev, dev_other, link_type, hops);
-                can = 0;
+                can = 0;   // the runtime says yes, but there is no direct XGMI link (logged below)
             }
         }
 #endif // defined(GGML_USE_HIP)
+        if (!can) {
+            GGML_LOG_INFO("%s: devices %d -> %d: no peer copies (policy %s), staged through host memory\n", __func__, dev, dev_other,
+                policy == PEER_NONE ? "none" : policy == PEER_XGMI ? "xgmi" : "query");
+        }
         c = can ? 1 : 2;
     }
     return c == 1;
@@ -918,6 +920,7 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
         // in which case a same-device copy (not a peer copy) is required
         const int src_physical = ggml_cuda_get_physical_device(src_ctx->device);
         const int dst_physical = ggml_cuda_get_physical_device(dst_ctx->device);
+        ggml_cuda_set_device(src_ctx->device);   // the copy runs on the owning device's stream, not the current one
         if (src_physical == dst_physical) {
             CUDA_CHECK(cudaMemcpyAsync(dst->data, src->data, ggml_nbytes(src), cudaMemcpyDeviceToDevice, cudaStreamPerThread));
         } else {
