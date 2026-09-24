@@ -56,6 +56,10 @@ public:
 
     void set_input(const llama_ubatch * ubatch) override;
 
+    // set_input rewrites every tensor from the ubatch and the cache state, so the graph can be reused whenever the
+    // shapes it was built with still hold (params.mctx must be the llama_memory_hybrid_context build_inp_kpool took)
+    bool can_reuse(const llm_graph_params & params) override;
+
     ggml_tensor * k_idxs     = nullptr;   // I32 [n_tokens]
     ggml_tensor * pool_cells = nullptr;   // I32 [kpool*n_pools, n_stream]
     ggml_tensor * pool_bias  = nullptr;   // F32 [n_pools, n_tps, n_stream]

@@ -3,6 +3,7 @@
 #include "llama-batch.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cells.h"
+#include "llama-memory-hybrid.h"
 
 #include <algorithm>
 #include <cmath>
@@ -455,6 +456,42 @@ void llama_kv_cache_set_input_kpool(
             }
         }
     }
+}
+
+bool llm_graph_input_kpool::can_reuse(const llm_graph_params & params) {
+    const auto * mctx_hyb = static_cast<const llama_memory_hybrid_context *>(params.mctx);
+    if (mctx_hyb == nullptr || mctx_hyb->get_idx() == nullptr) {
+        return false;
+    }
+    mctx_attn = mctx_hyb->get_attn();
+    mctx_idx  = mctx_hyb->get_idx();
+
+    const llama_ubatch & ub = params.ubatch;
+
+    bool res = k_idxs->ne[0] == (int64_t) ub.n_tokens;
+
+    if (pool_cells == nullptr) {
+        return res;   // dense path: only the key/gate store
+    }
+
+    // same derivation as build_inp_kpool
+    const int64_t n_kv     = mctx_attn->get_n_kv();
+    const int64_t n_stream = params.cparams.kv_unified ? 1 : ub.n_seqs_unq;
+    const int64_t n_tps    = ub.n_tokens/n_stream;
+    const int64_t n_ps     = (int64_t) ub.n_seqs_unq/n_stream;
+    const int64_t n_pools  = llama_kpool_n_pools(n_kv, kpool, n_ps);
+
+    // a step that must re-emit every pool uses a different n_new_max: rebuild the graph for it (rare)
+    const bool rebuild_now = mctx_attn->get_kv()->get_kpool_dirty();
+
+    res &= !rebuild && !rebuild_now;
+    res &= n_new_max == (uint32_t) (n_tps/kpool + n_ps);
+    res &= pool_cells->ne[0] == (int64_t) kpool*n_pools && pool_cells->ne[1] == n_stream;
+    res &= pool_bias->ne[0]  == n_pools && pool_bias->ne[1] == n_tps && pool_bias->ne[2] == n_stream;
+    res &= sel_mask->ne[0]   == n_kv    && sel_mask->ne[1]  == n_tps && sel_mask->ne[3]  == n_stream;
+    res &= pool_reps->ne[0]  == n_pools && pool_reps->ne[1] == n_stream;
+
+    return res;
 }
 
 void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
