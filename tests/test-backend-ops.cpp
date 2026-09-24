@@ -9095,9 +9095,8 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 
     for (ggml_type t : {GGML_TYPE_Q8_0, GGML_TYPE_F32}) {
         for (int64_t nt : {1, 3, 8}) {
-            test_cases.emplace_back(new test_dsv4_hc_mix(t, 256, nt, 4));
+            test_cases.emplace_back(new test_dsv4_hc_mix(t, 4096, nt, 4));
         }
-        test_cases.emplace_back(new test_dsv4_hc_mix(t, 4096, 3, 4));
     }
     test_cases.emplace_back(new test_dsv4_hc_comb(1, 1));
     test_cases.emplace_back(new test_dsv4_hc_comb(17, 4));
@@ -11120,6 +11119,10 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // halo-hybrid: the fused hyper-connection prologue at decode widths
+    for (int64_t nt : {1, 3}) {
+        test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_Q8_0, 4096, nt, 4));
+    }
     // SWIGLU at a 27B-class FFN width, fused [gate|up] vs split operands
     // note: same bytes either way, so a backend that indexes them differently shows it here
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {
