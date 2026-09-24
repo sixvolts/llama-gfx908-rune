@@ -243,6 +243,68 @@ static int ggml_cuda_parse_id(char devName[]) {
 }
 #endif // defined(GGML_USE_HIP)
 
+// Which device pairs may use direct peer access / hipMemcpyPeerAsync. On rune the MI100s form two XGMI islands
+// (0,2,3,4 and 5,7,8,9) plus two PCIe-only GPUs (1, 6): sustained peer traffic between the islands (PCIe, through the
+// PLX switches) once collapsed an island's fabric (uncorrectable ATHUB/XGMI errors, GPU reset), and between a PCIe-only
+// GPU and anything else hipMemcpyPeerAsync faults; the runtime's peer query is not a guard to rely on. So on HIP a pair
+// is a peer only when the runtime agrees AND the GPUs share a direct XGMI link; every other cross-device copy goes
+// through the pinned host-staged path (ggml_cuda_cpy_host_staged) or ggml's host fallback.
+// GGML_CUDA_PEER_POLICY: xgmi (HIP default), query (trust cudaDeviceCanAccessPeer alone; CUDA default), none (never).
+static bool ggml_cuda_can_access_peer(const int dev, const int dev_other) {
+    enum { PEER_QUERY, PEER_XGMI, PEER_NONE };
+    static const int policy = [] {
+        const char * e = getenv("GGML_CUDA_PEER_POLICY");
+#if defined(GGML_USE_HIP)
+        int p = PEER_XGMI;
+#else
+        int p = PEER_QUERY;
+#endif // defined(GGML_USE_HIP)
+        if (e) {
+            if (strcmp(e, "query") == 0) {
+                p = PEER_QUERY;
+            } else if (strcmp(e, "none") == 0) {
+                p = PEER_NONE;
+            } else if (strcmp(e, "xgmi") == 0) {
+                p = PEER_XGMI;
+            } else {
+                GGML_LOG_WARN("%s: unknown GGML_CUDA_PEER_POLICY=%s, keeping the default\n", __func__, e);
+            }
+        }
+        return p;
+    }();
+    static std::mutex mtx;
+    static int cache[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES] = {};   // 0 unknown, 1 yes, 2 no
+    if (dev == dev_other) {
+        return true;
+    }
+    std::lock_guard<std::mutex> lock(mtx);
+    int & c = cache[dev][dev_other];
+    if (c == 0) {
+        int can = 0;
+        if (policy != PEER_NONE) {
+            CUDA_CHECK(cudaDeviceCanAccessPeer(&can, dev, dev_other));
+        }
+#if defined(GGML_USE_HIP)
+        if (can && policy == PEER_XGMI) {
+            uint32_t link_type = 0;
+            uint32_t hops      = 0;
+            if (hipExtGetLinkTypeAndHopCount(dev, dev_other, &link_type, &hops) != hipSuccess) {
+                (void) hipGetLastError();
+                link_type = 0;
+            }
+            const bool xgmi = link_type == 4 /* HSA_AMD_LINK_INFO_TYPE_XGMI */ && hops == 1;
+            if (!xgmi) {
+                GGML_LOG_INFO("%s: devices %d and %d report peer access but share no direct XGMI link (type %u, hops %u): "
+                    "copies between them are staged through host memory\n", __func__, dev, dev_other, link_type, hops);
+                can = 0;
+            }
+        }
+#endif // defined(GGML_USE_HIP)
+        c = can ? 1 : 2;
+    }
+    return c == 1;
+}
+
 static ggml_cuda_device_info ggml_cuda_init() {
     ggml_cuda_device_info info = {};
 
@@ -421,9 +483,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
                 if (id == id_other) {
                     continue;
                 }
-                int can_access_peer;
-                CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_peer, id, id_other));
-                if (can_access_peer) {
+                if (ggml_cuda_can_access_peer(id, id_other)) {
                     CUDA_CHECK(cudaDeviceEnablePeerAccess(id_other, 0));
                 }
             }
@@ -655,9 +715,7 @@ struct ggml_cuda_pool_vmm : public ggml_cuda_pool {
                 for (int id = 0; id < device_count; ++id) {
                     const int id_physical = ggml_cuda_get_physical_device(id);
                     if (id_physical != physical_device) {
-                        int can_access_peer = 0;
-                        CUDA_CHECK(cudaDeviceCanAccessPeer(&can_access_peer, id_physical, physical_device));
-                        if (!can_access_peer) {
+                        if (!ggml_cuda_can_access_peer(id_physical, physical_device)) {
                             continue;
                         }
                     }
@@ -866,6 +924,9 @@ static bool ggml_backend_cuda_buffer_cpy_tensor(ggml_backend_buffer_t buffer, co
 #ifdef GGML_CUDA_NO_PEER_COPY
             return false;
 #else
+            if (!ggml_cuda_can_access_peer(src_physical, dst_physical)) {
+                return false;   // ggml_backend_tensor_copy falls back to a copy through host memory
+            }
             CUDA_CHECK(cudaMemcpyPeerAsync(dst->data, dst_physical, src->data, src_physical, ggml_nbytes(src), cudaStreamPerThread));
 #endif
         }
@@ -2559,17 +2620,6 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 // through a small ring of pinned host buffers per (src, dst) pair: D2H on the src stream, H2D on the dst stream after an
 // event, slot reuse gated by an event recorded after its H2D. Both streams stay asynchronous (pipeline parallelism keeps
 // overlapping); the host only waits if a slot is still in flight N copies later.
-static bool ggml_cuda_can_access_peer(const int dev, const int dev_other) {
-    static int cache[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES] = {};   // 0 unknown, 1 yes, 2 no
-    int & c = cache[dev][dev_other];
-    if (c == 0) {
-        int can = 0;
-        CUDA_CHECK(cudaDeviceCanAccessPeer(&can, dev, dev_other));
-        c = can ? 1 : 2;
-    }
-    return c == 1;
-}
-
 struct ggml_cuda_stage_ring {
     static constexpr int N = 4;
     void *      buf[N]      = {};
