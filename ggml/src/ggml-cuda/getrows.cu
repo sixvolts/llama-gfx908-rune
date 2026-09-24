@@ -266,7 +266,12 @@ static void get_rows_cuda_float(
             (((uintptr_t) src0_d) % 16 == 0) && (((uintptr_t) dst_d) % 16 == 0);
 
         if (can_vec) {
-            const int block_num_y = vec_block_num_y;
+            // the kernel strides over the row, so cap its blocks at 4 per CU for all rows together: on gfx908 exactly
+            // 1024 fully busy 256-thread blocks (a 4 MB row, the KDA/GDN state gather) run in 51 us against 8.9 us with
+            // 480 blocks, a launch-geometry cliff that neighbouring grid sizes do not show (rune, 2026-09-24)
+            const int64_t n_rows_launch = ne10*std::min<int64_t>(ne11*ne12, UINT16_MAX);
+            const int64_t cap_y = std::max<int64_t>(1, (4*ggml_cuda_info().devices[ggml_cuda_get_device()].nsm)/n_rows_launch);
+            const int block_num_y = (int) std::min<int64_t>(vec_block_num_y, cap_y);
             const dim3 block_nums(ne10, MIN(block_num_y, UINT16_MAX), MIN(ne11*ne12, UINT16_MAX));
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
             ggml_cuda_kernel_launch(k_get_rows_float_vec<dst_t>, launch_params,
