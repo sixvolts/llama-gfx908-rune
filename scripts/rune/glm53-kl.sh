@@ -1,8 +1,11 @@
 #!/usr/bin/env bash
 # KL gate for tolerance-class changes: llama-perplexity on wikitext-2 with the server's layout, storing the base run's
 # logits and scoring a candidate's KL divergence against them.
-#   glm53-kl.sh base <base.kld> <log> [ENV=VAL ...]     reference logits (e.g. the dense DSA path)
-#   glm53-kl.sh cmp  <base.kld> <log> [ENV=VAL ...]     candidate vs the reference (e.g. LLAMA_DSA_SPARSE=1)
+#   glm53-kl.sh base <base.kld> <log> [ENV=VAL ...]     reference logits
+#   glm53-kl.sh cmp  <base.kld> <log> [ENV=VAL ...]     candidate vs the reference
+# Both runs take glm53-env.sh's defaults (LLAMA_DSA_SPARSE=1) unless an ENV=VAL overrides them, e.g. a dense-path
+# reference: glm53-kl.sh base dense.kld base.log LLAMA_DSA_SPARSE=0. A numerics-only change moves this model's logits
+# by ~0.0098 mean KLD (dense ubatch 256 against 512), so that, not 0, is the floor to compare against.
 # GLM_KL_CTX (8192: past the 2048-cell top-k, so the DSA selection is active), GLM_KL_CHUNKS (6), GLM_UB (512).
 set -u
 HERE=$(cd "$(dirname "$0")" && pwd)

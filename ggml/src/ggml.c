@@ -1081,7 +1081,6 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "SOLVE_TRI",
     "GATED_DELTA_NET",
     "LIGHTNING_INDEXER",
-    "SPARSE_ATTN",
     "DSV4_HC_COMB",
     "DSV4_HC_PRE",
     "DSV4_HC_POST",
@@ -1100,6 +1099,8 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+
+    "SPARSE_ATTN",
 };
 
 static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
@@ -1197,7 +1198,6 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "A X = B, A triangular, solve X",
     "gated_delta_net(q, k, v, g, beta, s)",
     "lightning_indexer(q, k, weights, mask)",
-    "sparse_attn(q, k, idx, mask)",
     "dsv4_hc_comb(mixes, scale, base)",
     "dsv4_hc_pre(x, weights)",
     "dsv4_hc_post(x, residual, post, comb)",
@@ -1216,6 +1216,8 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+
+    "sparse_attn(q, k, idx, mask)",
 };
 
 static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");

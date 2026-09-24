@@ -329,6 +329,8 @@ void ggml_cuda_sparse_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * mask = dst->src[3];
 
     GGML_ASSERT(ggml_cuda_sparse_attn_supported(ctx.device, dst));
+    // the kernel reads K rows and Q with 16-byte loads: a cache view at a row offset and a compute buffer both are
+    GGML_ASSERT(((uintptr_t) k->data) % 16 == 0 && ((uintptr_t) q->data) % 16 == 0);
 
     constexpr int D  = 512;
     constexpr int DV = 512;

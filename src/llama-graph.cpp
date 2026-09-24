@@ -3856,7 +3856,8 @@ ggml_tensor * llm_graph_context::build_attn_sparse_gather(
 
     ggml_tensor * cur = nullptr;
 
-    if (llama_kpool_sparse_attn_mode() != 2) {
+    // the fused kernel reads an f16 cache; a quantized or f32 K cache takes the reference (get_rows dequantizes)
+    if (llama_kpool_sparse_attn_mode() != 2 && k->type == GGML_TYPE_F16) {
         // fused: one kernel reads the listed rows straight from the cache
         ggml_tensor * q4 = ggml_reshape_4d(ctx0, q_cur, D, n_head, n_tps, n_stream);
         cur = ggml_sparse_attn(ctx0, q4, k, idx, mask, D_v, kq_scale); // [D_v, n_head, n_tps, n_stream]
