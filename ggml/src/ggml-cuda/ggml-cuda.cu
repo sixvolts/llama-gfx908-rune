@@ -3929,6 +3929,8 @@ static int ggml_cuda_try_fuse_kda_conv_l2(ggml_backend_cuda_context * cuda_ctx, 
 
     ggml_cuda_op_ssm_conv_kda_l2(*cuda_ctx, conv_in, w_q, w_k, w_v, silu, l2[0], l2[1], eps);
     return j - i;
+}
+
 // halo-hybrid: KDA conv-input assembly (build_conv_state of glm5next/kimi-linear at decode) as one launch:
 //     c1 = CONCAT(q, k, 0), [one MUL_MAT producing v when the GEMV hoist did not run], c2 = CONCAT(c1, v, 0),
 //     c3 = CONCAT(states, TRANSPOSE(RESHAPE(c2)), 0), then up to KDA_CONV_ROWS_MAX_DST CPY(VIEW(c3), slot view).
@@ -3979,14 +3981,14 @@ static bool ggml_cuda_kda_conv_rows_find(const ggml_cgraph * g, int i, ggml_cuda
     if (nt < 1 || nt > 8 || !kda_f32_cols(q, nt) || !kda_f32_cols(k, nt) || kda_use_count(g, c1) != 1) {
         return false;
     }
-    int j = hc_next(g, i + 1);
+    int j = dsv4_hc_next(g, i + 1);
     m.mid = nullptr;
     if (j < n && g->nodes[j]->op == GGML_OP_MUL_MAT) {
         m.mid = g->nodes[j];
         if (m.mid->src[0] == c1 || m.mid->src[1] == c1) {
             return false;
         }
-        j = hc_next(g, j + 1);
+        j = dsv4_hc_next(g, j + 1);
     }
     if (j >= n || !concat0(g->nodes[j])) {
         return false;
@@ -4000,7 +4002,7 @@ static bool ggml_cuda_kda_conv_rows_find(const ggml_cgraph * g, int i, ggml_cuda
     if (C > INT_MAX / 2) {
         return false;
     }
-    const int k3 = hc_next(g, j + 1);
+    const int k3 = dsv4_hc_next(g, j + 1);
     if (k3 >= n || g->nodes[k3]->op != GGML_OP_CONCAT || ggml_get_op_params_i32(g->nodes[k3], 0) != 0 ||
             g->nodes[k3]->type != GGML_TYPE_F32) {
         return false;
@@ -4015,7 +4017,7 @@ static bool ggml_cuda_kda_conv_rows_find(const ggml_cgraph * g, int i, ggml_cuda
         return false;
     }
     for (const ggml_tensor * t = xt; t != c2; t = t->src[0]) {
-        if (!hc_is_view_op(t) || !t->src[0] || kda_use_count(g, t) != 1) {
+        if (!dsv4_hc_is_view_op(t) || !t->src[0] || kda_use_count(g, t) != 1) {
             return false;
         }
     }
@@ -4026,7 +4028,7 @@ static bool ggml_cuda_kda_conv_rows_find(const ggml_cgraph * g, int i, ggml_cuda
     m.c1 = c1; m.c2 = c2; m.c3 = c3;
     m.n_cpy = 0;
     m.last  = k3;
-    for (int p = hc_next(g, k3 + 1); p < n && m.n_cpy < KDA_CONV_ROWS_MAX_DST; p = hc_next(g, p + 1)) {
+    for (int p = dsv4_hc_next(g, k3 + 1); p < n && m.n_cpy < KDA_CONV_ROWS_MAX_DST; p = dsv4_hc_next(g, p + 1)) {
         ggml_tensor * cp = g->nodes[p];
         if (cp->op != GGML_OP_CPY) {
             break;
