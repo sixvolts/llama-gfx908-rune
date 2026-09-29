@@ -1431,11 +1431,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
         // that the previous compute is still reading.
         if (cparams.pipeline_parallel) {
-            // Only device-resident inputs can race with the previous compute: host-resident inputs are copied into the
-            // scheduler's rotating per-split device copies at enqueue time, so overwriting them here is safe and the
-            // synchronize would serialize the ubatches (rune: 0% cross-GPU overlap, no prefill gain from pipelining).
+            // Only device-resident inputs can race with the previous compute: the scheduler copies host-resident
+            // inputs into its rotating per-split device copies SYNCHRONOUSLY at enqueue time, so overwriting them here
+            // is safe and the synchronize would serialize the ubatches (rune: 0% cross-GPU overlap, no prefill gain
+            // from pipelining). That premise fails if the scheduler copies them asynchronously (GGML_SCHED_ASYNC_INPUTS=1:
+            // from pinned memory the H2D reads the buffer later), so that mode synchronizes here too.
             // LLAMA_PP_INPUT_SYNC=1 restores the unconditional synchronize.
-            static const bool force_sync = getenv("LLAMA_PP_INPUT_SYNC") && atoi(getenv("LLAMA_PP_INPUT_SYNC")) == 1;
+            static const bool force_sync = (getenv("LLAMA_PP_INPUT_SYNC") && atoi(getenv("LLAMA_PP_INPUT_SYNC")) == 1) ||
+                                           (getenv("GGML_SCHED_ASYNC_INPUTS") && atoi(getenv("GGML_SCHED_ASYNC_INPUTS")) != 0);
             bool need_sync = force_sync;
             for (ggml_tensor * t = ggml_get_first_tensor(res->get_ctx()); t && !need_sync; t = ggml_get_next_tensor(res->get_ctx(), t)) {
                 if ((t->flags & GGML_TENSOR_FLAG_INPUT) && t->buffer && !ggml_backend_buffer_is_host(t->buffer)) {

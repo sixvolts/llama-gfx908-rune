@@ -1670,12 +1670,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         //
         // User inputs: the split backend must be done with its previous use of the input copies before they are
         // overwritten. That is a per-backend condition, so wait once per split rather than once per input: with
-        // ~65 user inputs per token on a 4-GPU layer split, a sync + synchronous copy per input cost ~1.4 ms/token
-        // of host time while the split's GPU sat idle waiting to launch. Host-resident contiguous inputs then use
-        // the backend's stream-ordered set_tensor_async instead of the fully synchronous ggml_backend_tensor_copy;
-        // for pageable host memory the runtime has finished reading `input` when the call returns, so the user may
-        // still overwrite it afterwards. GGML_SCHED_SYNC_INPUTS=1 restores the original per-input path (A/B).
-        static const bool sync_inputs = getenv("GGML_SCHED_SYNC_INPUTS") != NULL && atoi(getenv("GGML_SCHED_SYNC_INPUTS")) != 0;
+        // ~65 user inputs per token on a 4-GPU layer split, a sync per input cost ~1.4 ms/token of host time while
+        // the split's GPU sat idle waiting to launch. The copy itself stays synchronous (ggml_backend_tensor_copy):
+        // the caller may overwrite `input` as soon as this returns (llama reuses a graph and runs set_inputs for the
+        // next ubatch while this one is still in flight). An async set_tensor_async from host memory is only safe
+        // for pageable memory; llama's CPU-side buffers are pinned (the CUDA host buffer type), so the H2D still
+        // reads `input` later and the next ubatch's tokens/positions/masks raced into this one (rune GLM-5.3:
+        // perplexity +5-16% and nondeterministic at small ubatches). GGML_SCHED_ASYNC_INPUTS=1 opts into the async
+        // copy (only for pageable inputs); GGML_SCHED_SYNC_INPUTS=1 restores the original per-input wait (A/B).
+        static const bool sync_inputs  = getenv("GGML_SCHED_SYNC_INPUTS")  != NULL && atoi(getenv("GGML_SCHED_SYNC_INPUTS"))  != 0;
+        static const bool async_inputs = getenv("GGML_SCHED_ASYNC_INPUTS") != NULL && atoi(getenv("GGML_SCHED_ASYNC_INPUTS")) != 0;
         bool waited_for_split = false;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
@@ -1692,7 +1696,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                     waited_for_split = true;
                 }
-                if (!sync_inputs && ggml_backend_buffer_is_host(input->buffer) && split_backend->iface.set_tensor_async != NULL &&
+                if (async_inputs && !sync_inputs && ggml_backend_buffer_is_host(input->buffer) && split_backend->iface.set_tensor_async != NULL &&
                     ggml_is_contiguous(input) && ggml_is_contiguous(input_cpy)) {
                     ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
                 } else {
