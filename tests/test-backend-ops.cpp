@@ -11433,6 +11433,20 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             true, 16, 8, b, false, true, false));
     }
 
+    // few-token expert-dedup MoE kernels (mmvq-moe.cu) at their shapes (Qwen3.8 K=2560, GLM-5.3 K=4096 gate/up and
+    // K=2048 Q5_K down), 1..8 tokens; 32 experts so tokens share experts; 72 rows for a partial row tile
+    for (int n_tok : {1, 3, 5, 6, 8}) {
+        for (bool b : {false, true}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32, 8, b, 72, n_tok, 4096));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32, 8, b, 72, n_tok, 2560));
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 32, 8, b, 72, n_tok, 2048));
+        }
+        for (ggml_glu_op op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_SWIGLU_CLAMP}) {
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, op, n_tok, 72, 4096,
+                true, 32, 8, true, false, true, false, {1, 1}));
+        }
+    }
+
     // Fused row-pair coverage: minimum rows, an even pair, and an odd tail.
     // TODO: the max_nmse_err() for these cases is not estimated correctly causing sporadic false failures.
     //for (ggml_glu_op glu_op : { GGML_GLU_OP_SWIGLU, GGML_GLU_OP_GEGLU }) {
@@ -11779,7 +11793,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     // GLM-5.3-Flash dense Q8_0 mat-vec: decode (1 column) and MTP verify (3 columns) at the model's K
     for (int64_t k : {1536, 2048, 4096, 8192, 12288, 16384}) {
         for (int64_t m : {2048, 4096, 16384}) {
-            for (int bs : {1, 3}) {
+            for (int bs : {1, 2, 3, 4}) {
                 test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, bs, k, {1, 1}, {1, 1}));
             }
         }

@@ -476,7 +476,9 @@ bool ggml_cuda_mmvq_moe_dedup(
     static const bool enabled = !getenv("GGML_MOE_V2") || atoi(getenv("GGML_MOE_V2")) != 0;
     const int device = ggml_cuda_get_device();
     const int cc     = ggml_cuda_info().devices[device].cc;
-    if (!enabled || ncols_dst < 1 || ncols_dst > 8 || n_used*ncols_dst > 64 || !GGML_CUDA_CC_IS_CDNA(cc)) {
+    // n_used < 64: moe_route builds (1 << n_used) - 1 masks. A token must not list the same expert twice (top-k never
+    // does): only its first slot of an expert would be written.
+    if (!enabled || ncols_dst < 1 || ncols_dst > 8 || n_used < 1 || n_used >= 64 || n_used*ncols_dst > 64 || !GGML_CUDA_CC_IS_CDNA(cc)) {
         return false;
     }
     static const bool dbg = getenv("GGML_MOE_V2_DEBUG") && atoi(getenv("GGML_MOE_V2_DEBUG")) != 0;
@@ -540,6 +542,14 @@ bool ggml_cuda_mmvq_moe_dedup(
                     go_nt(std::integral_constant<int, 10>{});
                 }
             };
+            // 5..8 tokens stage ~41 KB of activations per block (K = 4096): one block per CU, so more waves per block
+            // is the only way to add waves: 8 waves (default; GGML_MOE_V2_NT8_NW=4 for 4). Rows map to waves differently,
+            // each row is still reduced by the same 8 lanes in the same order (bit-identical). rune GLM, 6 streams: 75.6 -> 79.9 t/s
+            static const int nt8_nw = getenv("GGML_MOE_V2_NT8_NW") ? atoi(getenv("GGML_MOE_V2_NT8_NW")) : 8;
+            if (ncols_dst > 4 && nt8_nw == 8) {
+                launch(std::integral_constant<int, 8>{}, std::integral_constant<int, 1>{});
+                return true;
+            }
             switch (cfg_q4k) {
                 case 11: launch(std::integral_constant<int, 1>{}, std::integral_constant<int, 1>{}); break;
                 case 12: launch(std::integral_constant<int, 1>{}, std::integral_constant<int, 2>{}); break;
@@ -555,6 +565,16 @@ bool ggml_cuda_mmvq_moe_dedup(
             static const bool q5k_on = !getenv("GGML_MOE_V2_Q5K") || atoi(getenv("GGML_MOE_V2_Q5K")) != 0;
             if (!q5k_on || ncols_x != 8*QK_K || glu) {
                 return false;
+            }
+            static const int nt8_nw5 = getenv("GGML_MOE_V2_NT8_NW") ? atoi(getenv("GGML_MOE_V2_NT8_NW")) : 8;
+            if (ncols_dst > 4 && nt8_nw5 == 8) {
+                constexpr int NW = 8, RG = 1;
+                const dim3 block_dims(moe_warp_size, NW, 1);
+                const dim3 block_nums((nrows_x + 8*RG*NW - 1) / (8*RG*NW), n_used*ncols_dst, 1);
+                mmvq_moe_q4K<8, NW, RG, 8, false, block_q5_K, moe_q5K_pair><<<block_nums, block_dims, 0, stream>>>(vx, vx, vy, ids, dst,
+                    nrows_x, stride_row_x, stride_channel_x, stride_col_y, stride_channel_y, nchannels_y,
+                    stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats, false, 0.0f);
+                return true;
             }
             constexpr int NW = 4, RG = 1;
             const dim3 block_dims(moe_warp_size, NW, 1);
