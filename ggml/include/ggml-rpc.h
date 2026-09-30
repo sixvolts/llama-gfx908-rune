@@ -7,11 +7,15 @@ extern "C" {
 #endif
 
 #define RPC_PROTO_MAJOR_VERSION    7
-#define RPC_PROTO_MINOR_VERSION    0
-#define RPC_PROTO_PATCH_VERSION    1
+// 7.1: GGML_OP_SPARSE_ATTN and GGML_OP_DSV4_HC_MIX appended to the op enum (ids before them unchanged), and the
+//      HELLO reply carries GGML_OP_COUNT, which the client compares (from llama-halo-hybrid's 7.4): a peer built
+//      with a different op table is refused at the handshake instead of executing shifted op ids
+#define RPC_PROTO_MINOR_VERSION    1
+#define RPC_PROTO_PATCH_VERSION    0
 
 #ifdef  __cplusplus
-static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT has changed - update RPC_PROTO_PATCH_VERSION");
+static_assert(GGML_OP_COUNT == 103, "GGML_OP_COUNT has changed - bump RPC_PROTO_MINOR_VERSION (the handshake compares major/minor only)");
+static_assert(GGML_OP_COUNT <= 255, "GGML_OP_COUNT no longer fits the HELLO op_count byte - widen it");
 #endif
 
 #define GGML_RPC_MAX_SERVERS       16

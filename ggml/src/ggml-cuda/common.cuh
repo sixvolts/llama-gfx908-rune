@@ -1479,6 +1479,10 @@ struct ggml_backend_cuda_context {
     // when the computation is split across CPU/GPU (e.g., with --n-cpu-moe)
     std::unordered_map<const void *, std::unique_ptr<ggml_cuda_graph>> cuda_graphs;
 
+    // halo-hybrid: persistent zeroed scratch of the split DSV4_HC_MIX kernel (dsv4-hc.cu): per-token arrival counters
+    // (reset by the last block of every launch, so graph replays find them at zero) and the per-block partial dots
+    void * hc_mix_scratch = nullptr;
+
     int64_t last_graph_eviction_sweep = 0;
 
     // every pool of this device (graph optimization puts branch temporaries in the other streams' pools)

@@ -800,6 +800,10 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (hc_mix_scratch != nullptr) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaFree(hc_mix_scratch));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -2529,6 +2533,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_DSV4_HC_POST:
             ggml_cuda_op_dsv4_hc_post(ctx, dst);
             break;
+        case GGML_OP_DSV4_HC_MIX:
+            ggml_cuda_op_dsv4_hc_mix(ctx, dst);
+            break;
         case GGML_OP_RWKV_WKV7:
             ggml_cuda_op_rwkv_wkv7(ctx, dst);
             break;
@@ -3719,6 +3726,109 @@ static bool ggml_cuda_hc_ranges_overlap(const ggml_tensor * a, const ggml_tensor
     return (b0 <= a0 && a0 < b1) || (a0 <= b0 && b0 < a1);
 }
 
+// ---- DSV4 hyper-connection boundary (llama-halo-hybrid dad429ac7) ----------------------------------------------
+static bool dsv4_hc_is_view_op(const ggml_tensor * t) {
+    return t->op == GGML_OP_VIEW || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_TRANSPOSE || t->op == GGML_OP_NONE;
+}
+static int dsv4_hc_next(const ggml_cgraph * g, int j) {
+    while (j < g->n_nodes && dsv4_hc_is_view_op(g->nodes[j])) { j++; }
+    return j;
+}
+static bool dsv4_hc_uses1(const ggml_cgraph * g, int j) {
+    return ggml_node_get_use_count(g, j) == 1;
+}
+// the fused kernel reads `in` at indices other than the one it writes in `out`: an `out` that ggml-alloc placed over
+// memory `in` occupied (legal unfused, where `in` is dead by then) would race with itself, so the fusion declines
+static bool dsv4_hc_disjoint(const ggml_tensor * out, const ggml_tensor * in) {
+    const char * a0 = (const char *) out->data; const char * a1 = a0 + ggml_nbytes(out);
+    const char * b0 = (const char *) in->data;  const char * b1 = b0 + ggml_nbytes(in);
+    return a1 <= b0 || b1 <= a0;
+}
+static bool dsv4_hc_f32_rows16(const ggml_tensor * t) {   // f32, contiguous dim 0, 16-byte aligned rows (float4 loads)
+    return t->type == GGML_TYPE_F32 && t->nb[0] == sizeof(float) && ((uintptr_t) t->data) % 16 == 0 &&
+           t->nb[1] % 16 == 0 && t->nb[2] % 16 == 0 && t->nb[3] % 16 == 0;
+}
+
+// the hyper-connection boundary in one launch (dsv4-hc.cu, dsv4_hc_mix_fused): an optional DSV4_HC_POST whose dst is
+// the next DSV4_HC_MIX's input, the HC_MIX, and the RMS_NORM -> MUL(w) of its pre-mix row (the view at offset 0). The
+// hc_post dst and the post/comb part of the mix are still written (other consumers read them); the un-normed row is
+// skipped when the norm is its only reader. GGML_CUDA_NO_HC_NORM_FUSE=1 disables; GGML_CUDA_NO_HC_POST_FUSE=1 keeps the
+// norm tail but leaves hc_post as its own launch.
+static int ggml_cuda_try_fuse_hc_norm(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
+    static const bool disabled = getenv("GGML_CUDA_NO_HC_NORM_FUSE") != nullptr && std::atoi(getenv("GGML_CUDA_NO_HC_NORM_FUSE"));
+    if (disabled) {
+        return 0;
+    }
+    const int n = cgraph->n_nodes;
+    ggml_tensor * node = cgraph->nodes[i];
+    ggml_tensor * post = nullptr;
+    int im = i;
+    static const bool no_post = getenv("GGML_CUDA_NO_HC_POST_FUSE") != nullptr && std::atoi(getenv("GGML_CUDA_NO_HC_POST_FUSE"));
+    if (node->op == GGML_OP_DSV4_HC_POST) {
+        if (no_post) {
+            return 0;
+        }
+        im = dsv4_hc_next(cgraph, i + 1);
+        if (im >= n || cgraph->nodes[im]->op != GGML_OP_DSV4_HC_MIX || cgraph->nodes[im]->src[0] != node) {
+            return 0;
+        }
+        post = node;
+    } else if (node->op != GGML_OP_DSV4_HC_MIX) {
+        return 0;
+    }
+    ggml_tensor * mix = cgraph->nodes[im];
+    const ggml_tensor * x = mix->src[0];
+    const int64_t n_embd = x->ne[0];
+    const int64_t nt     = x->ne[2];
+    if (x->type != GGML_TYPE_F32 || x->ne[1] != 4 || 4*n_embd != 16384 || x->ne[3] != 1 || mix->type != GGML_TYPE_F32 ||
+            (mix->src[1]->type != GGML_TYPE_Q8_0 && mix->src[1]->type != GGML_TYPE_F32) || !dsv4_hc_f32_rows16(x)) {
+        return 0;
+    }
+    if (post) {
+        const ggml_tensor * px = post->src[0], * pr = post->src[1], * pp = post->src[2], * pc = post->src[3];
+        const bool ok = post->type == GGML_TYPE_F32 && ggml_are_same_shape(post, x) &&
+            px->ne[0] == n_embd && px->ne[1] == nt && px->ne[2] == 1 && px->ne[3] == 1 && dsv4_hc_f32_rows16(px) &&
+            pr->ne[0] == n_embd && pr->ne[1] == 4 && pr->ne[2] == nt && pr->ne[3] == 1 && dsv4_hc_f32_rows16(pr) &&
+            pp->type == GGML_TYPE_F32 && pp->ne[0] == 4 && pp->ne[1] == nt && pp->ne[2] == 1 && pp->ne[3] == 1 &&
+            pc->type == GGML_TYPE_F32 && pc->ne[0] == 4 && pc->ne[1] == 4 && pc->ne[2] == nt && pc->ne[3] == 1 &&
+            dsv4_hc_disjoint(post, px) && dsv4_hc_disjoint(post, pr) && dsv4_hc_disjoint(post, pp) && dsv4_hc_disjoint(post, pc) &&
+            dsv4_hc_disjoint(mix, px) && dsv4_hc_disjoint(mix, pr) && dsv4_hc_disjoint(mix, pp) && dsv4_hc_disjoint(mix, pc);
+        if (!ok) {
+            return 0;
+        }
+    }
+    // the norm tail: VIEW(mix, offset 0, n_embd x nt) -> RMS_NORM -> MUL(w [n_embd])
+    ggml_tensor * rn  = nullptr;
+    ggml_tensor * mul = nullptr;
+    bool write_out = true;
+    const int ir = dsv4_hc_next(cgraph, im + 1);
+    if (ir + 1 < n && cgraph->nodes[ir]->op == GGML_OP_RMS_NORM && cgraph->nodes[ir + 1]->op == GGML_OP_MUL) {
+        ggml_tensor * r = cgraph->nodes[ir];
+        ggml_tensor * m = cgraph->nodes[ir + 1];
+        const ggml_tensor * v  = r->src[0];
+        const ggml_tensor * wv = m->src[0] == r ? m->src[1] : (m->src[1] == r ? m->src[0] : nullptr);
+        const bool ok = v->view_src == mix && v->view_offs == 0 && v->ne[0] == n_embd && v->ne[1] == nt &&
+            v->ne[2] == 1 && v->ne[3] == 1 && v->nb[0] == sizeof(float) && v->nb[1] == mix->nb[1] &&
+            r->type == GGML_TYPE_F32 && dsv4_hc_uses1(cgraph, ir) &&
+            wv && wv->type == GGML_TYPE_F32 && ggml_is_contiguous(wv) && wv->ne[0] == n_embd && ggml_nrows(wv) == 1 &&
+            m->type == GGML_TYPE_F32 && ggml_are_same_shape(m, r) && m->nb[0] == sizeof(float) &&
+            dsv4_hc_disjoint(m, x) && dsv4_hc_disjoint(m, mix) && dsv4_hc_disjoint(m, wv) &&
+            (!post || (dsv4_hc_disjoint(m, post->src[0]) && dsv4_hc_disjoint(m, post->src[1]) &&
+                       dsv4_hc_disjoint(m, post->src[2]) && dsv4_hc_disjoint(m, post->src[3])));
+        if (ok) {
+            rn = r; mul = m;
+            for (int q = im + 1; q < ir; ++q) {
+                if (cgraph->nodes[q] == v) { write_out = !dsv4_hc_uses1(cgraph, q); }
+            }
+        }
+    }
+    if (!post && !mul) {
+        return 0;
+    }
+    ggml_cuda_op_dsv4_hc_mix_fused(*cuda_ctx, mix, post, rn, mul, write_out);
+    return (mul ? ir + 1 : im) - i;
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -3727,6 +3837,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    if (node->op == GGML_OP_DSV4_HC_POST || node->op == GGML_OP_DSV4_HC_MIX) {
+        const int skip = ggml_cuda_try_fuse_hc_norm(cuda_ctx, cgraph, i);
+        if (skip > 0) {
+            return skip;
+        }
+    }
 
     // GDN gate chain (qwen4exp build_delta_net), two thin F32 GEMVs on the same activation and their elementwise tails:
     //   [i+0] mul_mat(W_alpha, x) [i+1] reshape [i+2] add(dt) [i+3] softplus [i+4] mul(a) [i+5] reshape
@@ -5061,6 +5178,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
+    ggml_cuda_dsv4_hc_mix_scratch_init(*cuda_ctx);   // once per context, before any capture
 
     bool use_cuda_graph             = false;
     bool cuda_graph_update_required = false;
@@ -6173,6 +6291,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             return op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32 &&
                 op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 &&
                 op->type == GGML_TYPE_F32;
+        case GGML_OP_DSV4_HC_MIX:
+            return op->src[0]->type == GGML_TYPE_F32 && (op->src[1]->type == GGML_TYPE_Q8_0 || op->src[1]->type == GGML_TYPE_F32) &&
+                op->src[2]->type == GGML_TYPE_F32 && op->src[3]->type == GGML_TYPE_F32 && op->type == GGML_TYPE_F32 &&
+                4*op->src[0]->ne[0] == 16*1024 && op->src[0]->nb[1] % 16 == 0 && op->src[0]->nb[2] % 16 == 0;
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
         case GGML_OP_CROSS_ENTROPY_LOSS:
