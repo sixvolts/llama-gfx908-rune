@@ -544,7 +544,8 @@ bool ggml_cuda_mmvq_moe_dedup(
             };
             // 5..8 tokens stage ~41 KB of activations per block (K = 4096): one block per CU, so more waves per block
             // is the only way to add waves: 8 waves (default; GGML_MOE_V2_NT8_NW=4 for 4). Rows map to waves differently,
-            // each row is still reduced by the same 8 lanes in the same order (bit-identical). rune GLM, 6 streams: 75.6 -> 79.9 t/s
+            // each row is still reduced by the same 8 lanes in the same order (bit-identical). rune GLM, 6 streams: 75.6 -> 79.9 t/s.
+            // GGML_MOE_V2_Q4K applies to 5..8 tokens only with GGML_MOE_V2_NT8_NW=4.
             static const int nt8_nw = getenv("GGML_MOE_V2_NT8_NW") ? atoi(getenv("GGML_MOE_V2_NT8_NW")) : 8;
             if (ncols_dst > 4 && nt8_nw == 8) {
                 launch(std::integral_constant<int, 8>{}, std::integral_constant<int, 1>{});

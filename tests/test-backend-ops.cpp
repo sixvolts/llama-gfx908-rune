@@ -11434,12 +11434,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // few-token expert-dedup MoE kernels (mmvq-moe.cu) at their shapes (Qwen3.8 K=2560, GLM-5.3 K=4096 gate/up and
-    // K=2048 Q5_K down), 1..8 tokens; 32 experts so tokens share experts; 72 rows for a partial row tile
-    for (int n_tok : {1, 3, 5, 6, 8}) {
+    // K=2048 Q5_K down), 1..8 tokens; 32 experts so tokens share experts; 72 rows for a partial row tile, 76 for a
+    // partial 8-row group
+    for (int n_tok : {1, 2, 3, 4, 5, 6, 7, 8}) {
         for (bool b : {false, true}) {
-            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32, 8, b, 72, n_tok, 4096));
-            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32, 8, b, 72, n_tok, 2560));
-            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 32, 8, b, 72, n_tok, 2048));
+            for (int rows : {72, 76}) {
+                test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32, 8, b, rows, n_tok, 4096));
+                test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32, 8, b, rows, n_tok, 2560));
+                test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 32, 8, b, rows, n_tok, 2048));
+            }
         }
         for (ggml_glu_op op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_SWIGLU_CLAMP}) {
             test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, op, n_tok, 72, 4096,
