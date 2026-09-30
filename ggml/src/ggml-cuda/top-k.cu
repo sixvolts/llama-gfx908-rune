@@ -62,14 +62,12 @@ struct top_k_radix_state {
     uint32_t prefix;
     uint32_t prefix_mask;
     int rank;
-    int greater_count;
-    int equal_count;
 };
 
 static __global__ void top_k_radix_init(top_k_radix_state * states, int nrows, int k) {
     const int row = blockIdx.x * blockDim.x + threadIdx.x;
     if (row < nrows) {
-        states[row] = {0, 0, k, 0, 0};
+        states[row] = {0, 0, k};
     }
 }
 
@@ -140,11 +138,39 @@ static __global__ void top_k_radix_select(
     }
 }
 
-static __global__ void top_k_radix_reset_counters(top_k_radix_state * states, int nrows) {
-    const int row = blockIdx.x * blockDim.x + threadIdx.x;
-    if (row < nrows) {
-        states[row].greater_count = 0;
-        states[row].equal_count = 0;
+// The entries above the k-th key, placed deterministically: an atomic slot counter wrote them in arrival order, so
+// the selected SET was reproducible but its ORDER was not, and every consumer that accumulates over the list (the
+// DSA sparse attention / indexer on GLM-5.3-Flash) rounded differently on every run (KL 0.0094 between identical
+// perplexity runs). Pass 1 counts each block's entries; pass 2 gives each block the sum of the earlier blocks'
+// counts as its base and writes its entries in its own column order (warp ballots, as top_k_gather_equal).
+template<int BLOCK_SIZE>
+static __global__ void top_k_radix_count_greater(
+        const float * __restrict__ src,
+        const top_k_radix_state * __restrict__ states,
+        int * __restrict__ block_counts,
+        int ncols,
+        int blocks_per_row) {
+    const int row = blockIdx.x / blocks_per_row;
+    const int row_block = blockIdx.x % blocks_per_row;
+    const int tid = threadIdx.x;
+    const float * row_src = src + (size_t) row * ncols;
+    const uint32_t prefix = states[row].prefix;
+    __shared__ int total;
+
+    if (tid == 0) {
+        total = 0;
+    }
+    __syncthreads();
+
+    int count = 0;
+    for (int col = row_block * BLOCK_SIZE + tid; col < ncols; col += blocks_per_row * BLOCK_SIZE) {
+        count += top_k_float_to_ordered(row_src[col]) > prefix;
+    }
+    atomicAdd(&total, count);   // integer: order-independent
+    __syncthreads();
+
+    if (tid == 0) {
+        block_counts[blockIdx.x] = total;
     }
 }
 
@@ -152,26 +178,47 @@ template<int BLOCK_SIZE>
 static __global__ void top_k_radix_gather(
         const float * __restrict__ src,
         int * __restrict__ dst,
-        top_k_radix_state * __restrict__ states,
+        const top_k_radix_state * __restrict__ states,
+        const int * __restrict__ block_counts,
         int ncols,
         int k,
         int blocks_per_row) {
     const int row = blockIdx.x / blocks_per_row;
     const int row_block = blockIdx.x % blocks_per_row;
     const int tid = threadIdx.x;
+    const int lane = tid % warpSize;
+    const int warp = tid / warpSize;
+    const int nwarps = BLOCK_SIZE / warpSize;
     const float * row_src = src + (size_t) row * ncols;
     int * row_dst = dst + (size_t) row * k;
-    top_k_radix_state * state = &states[row];
+    const uint32_t prefix = states[row].prefix;
+    __shared__ int warp_counts[32];
 
-    // the entries above the k-th key; the ties at the k-th key are gathered separately, in column order
-    for (int col = row_block * BLOCK_SIZE + tid;
-         col < ncols;
-         col += blocks_per_row * BLOCK_SIZE) {
-        const uint32_t key = top_k_float_to_ordered(row_src[col]);
-        if (key > state->prefix) {
-            const int pos = atomicAdd(&state->greater_count, 1);
-            row_dst[pos] = col;
+    int count = 0;
+    for (int b = 0; b < row_block; ++b) {
+        count += block_counts[row * blocks_per_row + b];
+    }
+
+    for (int base = row_block * BLOCK_SIZE; base < ncols; base += blocks_per_row * BLOCK_SIZE) {
+        const int col = base + tid;
+        const bool greater = col < ncols && top_k_float_to_ordered(row_src[col]) > prefix;
+        const unsigned long long mask = __ballot(greater);
+        if (lane == 0) {
+            warp_counts[warp] = __popcll(mask);
         }
+        __syncthreads();
+        int before = count;
+        for (int w = 0; w < nwarps; ++w) {
+            if (w < warp) {
+                before += warp_counts[w];
+            }
+            count += warp_counts[w];
+        }
+        const unsigned long long lane_mask = (1ULL << lane) - 1;
+        if (greater) {
+            row_dst[before + __popcll(mask & lane_mask)] = col;
+        }
+        __syncthreads();
     }
 }
 
@@ -250,11 +297,12 @@ static void top_k_radix_cuda(
             <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift);
     }
 
-    top_k_radix_reset_counters
-        <<<(nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, nrows);
+    ggml_cuda_pool_alloc<int> counts_alloc(pool, (size_t) nrows * blocks_per_row);
+    top_k_radix_count_greater<BLOCK_SIZE>
+        <<<row_grid, BLOCK_SIZE, 0, stream>>>(src, states, counts_alloc.get(), ncols, blocks_per_row);
     top_k_radix_gather<BLOCK_SIZE>
         <<<row_grid, BLOCK_SIZE, 0, stream>>>(
-            src, dst, states, ncols, k, blocks_per_row);
+            src, dst, states, counts_alloc.get(), ncols, k, blocks_per_row);
     top_k_radix_gather_equal<BLOCK_SIZE>
         <<<nrows, BLOCK_SIZE, 0, stream>>>(src, dst, states, ncols, k);
 }
