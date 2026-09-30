@@ -24,6 +24,9 @@ export LLAMA_DSA_SPARSE=${LLAMA_DSA_SPARSE:-1}
 # 1 stream 31.7 / 44.2, 2: 50.4 / 51.9, 3: 60.6 / 36.6, 4: 66.0 / 41.5, 6: 70.8 / 43.7; MTP held back at 6: 68.9)
 export LLAMA_SPEC_MAX_GEN=${LLAMA_SPEC_MAX_GEN:-2}
 export LLAMA_PIPELINE_PARALLEL=1
+# prompt ubatches pad n_kv to 32k-cell steps: a shape change per ubatch re-reserved the graph and drained all 9 stages
+# (22.7k prompt 390 -> 633 t/s with MTP; KL 0.0103 < the ubatch-256 numerics reference 0.0120)
+export LLAMA_KV_PAD_PREFILL=${LLAMA_KV_PAD_PREFILL:-32768}
 export GLIBC_TUNABLES=glibc.malloc.hugetlb=1
 export LD_LIBRARY_PATH=$GLM_BIN
 

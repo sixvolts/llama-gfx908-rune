@@ -333,3 +333,37 @@ decode, short prompts:
 |---|---|---|---|---|---|
 | t/s per stream | 43.9 | 25.7 | 19.4 | 15.9 | 11.5 |
 | aggregate t/s | 43.9 | 51.5 | 58.2 | 63.6 | 69.0 |
+
+## 11. Prefill: the stages never overlapped (2026-09-30)
+
+Production prefill was flat at ~390 t/s from 1.6k to 22.7k tokens and fell to 313 at 108k, with `-b 512`, `-b 2048`
+and `-b 8192` all identical. A rocprofv3 trace of one warm 3k-token prompt showed exactly one GPU busy 94.7% of the
+time: stage 0 started ubatch u+1 only after stage 8 finished ubatch u. Stack samples put the host in
+`ggml_backend_sched_alloc_graph -> ggml_backend_cuda_synchronize` in 9 of 10 samples: every ubatch re-reserved the
+graph, and a re-reserve drains every backend first (the split inputs may move).
+
+Cause: `n_kv` is the used cells padded to 256, so it grows by one ubatch on every prompt ubatch, and the pooled DSA
+indexer's inputs and intermediates (`kpool_pool_reps`, `pool_bias`, scores) are all sized by it. Each ubatch outgrew
+the previous reservation (`GGML_GALLOC_DEBUG=1`: kpool_pool_reps 322 -> 450 -> 578 ...). A decode step resets the
+reservation, so repeating a prompt does not help; the old "first prompt at a new width is slower" note was this.
+
+Fix: `LLAMA_KV_PAD_PREFILL=n` pads prompt-sized ubatches (> 32 tokens per stream) to a multiple of n cells, so a
+prompt changes shape once per n cells. Decode keeps the 256 padding. Empty cells cannot leak in: every pool starts at
+-inf bias and only occupied cells of the right sequence are unmasked.
+
+| prompt tokens (MTP on, 6 x 128k) | before | n = 32768 |
+|---|---|---|
+| 1,639 (warm) | 372 | 415 |
+| 6,471 | 395 | 580 |
+| 22,722 | 390 | 633 |
+| 54,054 | 358 | 582 |
+| 108,044 | 313 | 517 |
+
+Without the drafter 22.7k reaches 720 t/s (415 before). n = 16384 is better at 1.6k (449) and worse at 22.7k (604);
+geometric buckets (pad next_pow2/4, /8) reach only 560 / 449 at 22.7k because each re-reserve costs a full drain.
+KL gate (4k ctx, 2 chunks, against an unpadded base): padded 0.0103, the ubatch-256 numerics-only reference 0.0120,
+unpadded again 0.0015; PPL 2.0388 unpadded / 2.0390 padded. The shift is rocBLAS tiling for a different pool count
+flipping near-tied top-k picks, the same class as a ubatch change.
+
+The same drain probably explains the failed decode micro-batching in section 10 (every micro-batch shape change
+re-reserves); worth re-testing with stable shapes.
