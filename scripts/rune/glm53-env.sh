@@ -20,6 +20,9 @@ GLM_DRAFT_N=${GLM_DRAFT_N:-2}          # measured: 2 > 3 > 4 > 5 > 6 (each verif
 
 export HIP_VISIBLE_DEVICES=0,2,3,4,5,7,8,9,6,1   # ROCm0..8 = trunk stages, ROCm9 = drafter
 export LLAMA_DSA_SPARSE=${LLAMA_DSA_SPARSE:-1}
+# adaptive speculation: draft only while <= 2 slots generate (6 slots, aggregate t/s, no drafter / MTP d2 always:
+# 1 stream 31.7 / 44.2, 2: 50.4 / 51.9, 3: 60.6 / 36.6, 4: 66.0 / 41.5, 6: 70.8 / 43.7; MTP held back at 6: 68.9)
+export LLAMA_SPEC_MAX_GEN=${LLAMA_SPEC_MAX_GEN:-2}
 export LLAMA_PIPELINE_PARALLEL=1
 export GLIBC_TUNABLES=glibc.malloc.hugetlb=1
 export LD_LIBRARY_PATH=$GLM_BIN

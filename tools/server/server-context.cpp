@@ -3132,6 +3132,23 @@ private:
         std::vector<server_slot *> generating;
         std::vector<server_slot *> drafting;
 
+        // Adaptive speculation (LLAMA_SPEC_MAX_GEN=N, 0 = no limit): draft only while at most N slots are generating.
+        // Every draft token widens the verify batch, and in a MoE each extra row pulls in more experts, so with many
+        // concurrent streams the verify cost outgrows what acceptance saves (rune GLM-5.3, 6 streams: 71 t/s aggregate
+        // without drafting, 43 with MTP depth 2). The drafter still ingests every target batch (spec_run), so a slot
+        // can resume drafting on any later step.
+        bool spec_allowed = true;
+        if (spec) {
+            static const int spec_max_gen = getenv("LLAMA_SPEC_MAX_GEN") ? atoi(getenv("LLAMA_SPEC_MAX_GEN")) : 0;
+            if (spec_max_gen > 0) {
+                int n_gen = 0;
+                for (const auto & s : slots) {
+                    n_gen += s.state == SLOT_STATE_GENERATING;
+                }
+                spec_allowed = n_gen <= spec_max_gen;
+            }
+        }
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
@@ -3153,7 +3170,7 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = slot.get_n_draft_max();
+                const int n_draft_max = spec_allowed ? slot.get_n_draft_max() : 0;
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
