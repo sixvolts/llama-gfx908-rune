@@ -1269,19 +1269,22 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     // LLAMA_KV_PAD_PREFILL=n: prompt-sized ubatches (> 32 tokens per stream) pad n_kv to a multiple of n instead, so a
     // long prompt changes the graph shape once per n cells rather than on every ubatch. With pipeline parallelism each
     // shape change re-reserves the graph and the scheduler drains every stage first (rune GLM-5.3, 9 stages: n_kv grew
-    // by one ubatch per ubatch, so the stages never overlapped; 22.7k prompt 415 -> 720 t/s with n = 32768). Decode
+    // by one ubatch per ubatch, so the stages never overlapped; 22.7k prompt 390 -> 633 t/s with n = 32768 and the MTP
+    // drafter, 415 -> 720 without). Any n works (rounded up to a multiple of the base padding). Decode
     // keeps the fine padding: its graphs differ from the prompt's anyway, and the extra cells would cost every step.
     static const uint32_t pad_prefill = getenv("LLAMA_KV_PAD_PREFILL") ? (uint32_t) atoi(getenv("LLAMA_KV_PAD_PREFILL")) : 0;
 
     uint32_t pad = n_pad_cur;
     if (pad_prefill > 0 && !sinfo.empty() && sinfo.size() > 32) {
-        pad = std::max(pad, GGML_PAD(pad_prefill, n_pad_cur));
+        pad = std::max(pad, (pad_prefill + n_pad_cur - 1)/n_pad_cur*n_pad_cur);
     }
 
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const auto & cells = v_cells[sinfo.strm[s]];
 
-        result = std::max(std::min(cells.size(), std::max(pad, GGML_PAD(cells.used_max_p1(), pad))), result);
+        // not GGML_PAD: pad need not be a power of two
+        const uint32_t used = cells.used_max_p1();
+        result = std::max(std::min(cells.size(), std::max(pad, (used + pad - 1)/pad*pad)), result);
     }
 
     return result;

@@ -20,10 +20,10 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
-#include <typeinfo>
 #include <numeric>
 #include <sstream>
 #include <string>
+#include <typeinfo>
 #include <unordered_set>
 
 // dedup helpers
@@ -1414,7 +1414,7 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     static const bool reuse_dbg = getenv("LLAMA_REUSE_DEBUG") && atoi(getenv("LLAMA_REUSE_DEBUG")) != 0;
     if (!this->params.allow_reuse(params)) {
         if (reuse_dbg) {
-            fprintf(stderr, "reuse: params differ (n_tokens %u -> %u, n_seqs_unq %u -> %u, n_outputs %d -> %d)\n",
+            LLAMA_LOG_WARN("reuse: params differ (n_tokens %u -> %u, n_seqs_unq %u -> %u, n_outputs %d -> %d)\n",
                 this->params.ubatch.n_tokens, params.ubatch.n_tokens, this->params.ubatch.n_seqs_unq, params.ubatch.n_seqs_unq,
                 (int) this->params.n_outputs, (int) params.n_outputs);
         }
@@ -1434,7 +1434,7 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
     for (auto & input : inputs) {
         const bool cur = input->can_reuse(params);
         if (reuse_dbg && !cur) {
-            fprintf(stderr, "reuse: input %s refuses (n_tokens %u)\n", typeid(*input).name(), params.ubatch.n_tokens);
+            LLAMA_LOG_WARN("reuse: input %s refuses (n_tokens %u)\n", typeid(*input).name(), params.ubatch.n_tokens);
         }
 
         if (debug > 1) {

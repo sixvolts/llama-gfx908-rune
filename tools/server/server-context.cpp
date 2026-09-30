@@ -1682,7 +1682,8 @@ private:
         // aggregate). New tasks go to the idle slot that leaves the fewest contiguous runs of busy slots (oldest first on
         // ties), and an LCP match that would fragment them is moved: its prefix is parked in the host prompt cache and
         // restored into a slot that keeps them contiguous (a state copy through host RAM instead of an extra ubatch on
-        // every decode step). LLAMA_SLOT_COMPACT=0 restores plain LRU and in-place LCP reuse.
+        // every decode step; verified after the load, else the source slot is used). Gaps left when a middle slot
+        // finishes are not repaired. LLAMA_SLOT_COMPACT=0 restores plain LRU and in-place LCP reuse.
         static const bool compact = !(getenv("LLAMA_SLOT_COMPACT") && atoi(getenv("LLAMA_SLOT_COMPACT")) == 0);
 
         auto n_runs_with = [&](const server_slot & cand) {
@@ -1711,13 +1712,37 @@ private:
                 }
             }
             if (best && best != ret && best_runs < n_runs_with(*ret)) {
-                const int64_t t0 = ggml_time_us();
-                // prompt_save skips a prompt the cache already holds; either way the entry is there to load
-                if (ret->prompt_save(*prompt_cache) || prompt_cache->contains(ret->prompt.tokens)) {
-                    SLT_INF(*best, "moving the LCP match (%zu tokens) from slot %d here to keep busy slots contiguous (save %.1f ms)\n",
-                            ret->prompt.tokens.size(), ret->id, (ggml_time_us() - t0)/1e3);
-                    ret = best;
-                    update_cache = true;
+                // server_prompt_cache::load() skips an entry it would keep < 25% of (and still reports success), so such a
+                // match cannot be moved without losing the prefix; and a move blocks every stream for the state copy, so
+                // it is bounded (LLAMA_SLOT_MOVE_MAX prompt tokens)
+                static const size_t move_max = getenv("LLAMA_SLOT_MOVE_MAX") ? (size_t) atoll(getenv("LLAMA_SLOT_MOVE_MAX")) : 65536;
+
+                const size_t n_src   = ret->prompt.tokens.size();
+                const size_t lcp_src = ret->prompt.tokens.get_common_prefix(task.tokens);
+
+                if (n_src > 0 && 4*lcp_src >= n_src && n_src <= move_max) {
+                    const int64_t t0 = ggml_time_us();
+                    // prompt_save skips a prompt the cache already holds; either way the entry is there to load
+                    if (ret->prompt_save(*prompt_cache) || prompt_cache->contains(ret->prompt.tokens)) {
+                        best->prompt_save(*prompt_cache);   // what the LRU path does with the idle slot's own content
+                        const bool loaded = best->prompt_load(*prompt_cache, task.tokens);
+                        if (!loaded) {
+                            best->prompt_clear();
+                        }
+                        prompt_cache->update();
+
+                        const size_t lcp_dst = loaded ? (size_t) best->prompt.tokens.get_common_prefix(task.tokens) : 0;
+                        if (lcp_dst >= lcp_src) {
+                            SLT_INF(*best, "moved the LCP match (%zu of %zu tokens) from slot %d here to keep busy slots contiguous (%.1f ms)\n",
+                                    lcp_dst, n_src, ret->id, (ggml_time_us() - t0)/1e3);
+                            ret = best;
+                            update_cache = false;
+                        } else {
+                            // e.g. the parked entry was evicted making room: the source slot's state is untouched, use it
+                            SLT_WRN(*best, "move from slot %d restored %zu of %zu prefix tokens, keeping slot %d\n",
+                                    ret->id, lcp_dst, lcp_src, ret->id);
+                        }
+                    }
                 }
             }
         }
@@ -1769,7 +1794,12 @@ private:
 
                 prompt_cache->update();
 
-                SRV_INF("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+                const double t_ms = (ggml_time_us() - t_start) / 1000.0;
+                if (t_ms > 50.0) {
+                    SRV_INF("prompt cache update took %.2f ms\n", t_ms);
+                } else {
+                    SRV_TRC("prompt cache update took %.2f ms\n", t_ms);
+                }
             }
         }
 
