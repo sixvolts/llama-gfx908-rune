@@ -367,3 +367,17 @@ flipping near-tied top-k picks, the same class as a ubatch change.
 
 The same drain probably explains the failed decode micro-batching in section 10 (every micro-batch shape change
 re-reserves); worth re-testing with stable shapes.
+
+### Busy slots must be contiguous (9ab7ea56d)
+
+Checking concurrency after the prefill fix exposed an older problem: after a few requests, 3 streams decoded at
+33 t/s aggregate instead of 58.5 (4 streams 39 vs 64), with no graph reuse. Without a unified KV cache,
+`split_equal(sequential)` only puts consecutive sequence ids in one ubatch (the K/V views span one contiguous stream
+range), so busy slots {0,4,5} made every decode step two ubatches, two passes over the weights. LRU and LCP-similarity
+slot choice produce such gaps routinely. The server now gives a new task the idle slot that leaves the fewest runs of
+busy slots, and moves a fragmenting LCP match into such a slot through the host prompt cache (~0.3 s for 650 tokens).
+`LLAMA_SLOT_COMPACT=0` reverts. After the same long-prompt history: 1/2/3/4/6 streams 41.6/50.6/58.2/63.0/69.0 t/s.
+
+Open: full prefills of the same >2k-token prompt are not deterministic run to run (greedy text differs from the first
+sentence on a word-salad prompt; first-token top-20 logprobs differ by up to 0.85 fresh vs fresh; perplexity KL between
+identical runs 0.0015). Present before these changes. A prefix restored from the prompt cache sits inside that spread.
