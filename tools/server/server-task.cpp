@@ -1708,6 +1708,15 @@ size_t server_prompt_cache::n_tokens() const {
     return res;
 }
 
+bool server_prompt_cache::contains(const server_tokens & tokens) const {
+    for (const auto & st : states) {
+        if (st.prompt.tokens.get_common_prefix(tokens) == (int) tokens.size()) {
+            return true;
+        }
+    }
+    return false;
+}
+
 server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & prompt, size_t state_size_tgt, size_t state_size_dft) {
     // first check if the current state is contained fully in the cache
     for (auto it = states.begin(); it != states.end(); ++it) {

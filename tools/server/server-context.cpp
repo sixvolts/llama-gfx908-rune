@@ -1676,9 +1676,56 @@ private:
             }
         }
 
-        // find the slot that has been least recently used
+        // Without a unified KV cache, a ubatch can only hold sequences with CONSECUTIVE ids (split_equal(sequential):
+        // the per-layer K/V views span one contiguous stream range), so every gap between busy slots adds a ubatch -
+        // a full pass over the weights - to each decode step (rune GLM-5.3, 3 streams on slots {0,4,5}: 58.5 -> 33 t/s
+        // aggregate). New tasks go to the idle slot that leaves the fewest contiguous runs of busy slots (oldest first on
+        // ties), and an LCP match that would fragment them is moved: its prefix is parked in the host prompt cache and
+        // restored into a slot that keeps them contiguous (a state copy through host RAM instead of an extra ubatch on
+        // every decode step). LLAMA_SLOT_COMPACT=0 restores plain LRU and in-place LCP reuse.
+        static const bool compact = !(getenv("LLAMA_SLOT_COMPACT") && atoi(getenv("LLAMA_SLOT_COMPACT")) == 0);
+
+        auto n_runs_with = [&](const server_slot & cand) {
+            int  n_runs = 0;
+            bool in_run = false;
+            for (const server_slot & s : slots) {
+                const bool busy = s.is_processing() || &s == &cand;
+                n_runs += busy && !in_run;
+                in_run  = busy;
+            }
+            return n_runs;
+        };
+
+        if (ret != nullptr && task.id_slot == -1 && compact && !params_base.kv_unified && prompt_cache &&
+            task.type == SERVER_TASK_TYPE_COMPLETION) {
+            server_slot * best = nullptr;
+            int best_runs = INT_MAX;
+            for (server_slot & slot : slots) {
+                if (slot.is_processing()) {
+                    continue;
+                }
+                const int runs = n_runs_with(slot);
+                if (!best || runs < best_runs || (runs == best_runs && slot.t_last_used <= best->t_last_used)) {
+                    best      = &slot;
+                    best_runs = runs;
+                }
+            }
+            if (best && best != ret && best_runs < n_runs_with(*ret)) {
+                const int64_t t0 = ggml_time_us();
+                // prompt_save skips a prompt the cache already holds; either way the entry is there to load
+                if (ret->prompt_save(*prompt_cache) || prompt_cache->contains(ret->prompt.tokens)) {
+                    SLT_INF(*best, "moving the LCP match (%zu tokens) from slot %d here to keep busy slots contiguous (save %.1f ms)\n",
+                            ret->prompt.tokens.size(), ret->id, (ggml_time_us() - t0)/1e3);
+                    ret = best;
+                    update_cache = true;
+                }
+            }
+        }
+
+        // find the slot that has been least recently used (see above)
         if (ret == nullptr) {
             int64_t t_last = -1;
+            int     best_runs = INT_MAX;
 
             for (server_slot & slot : slots) {
                 // skip the slot if it is not available
@@ -1686,9 +1733,12 @@ private:
                     continue;
                 }
 
+                const int runs = compact && !params_base.kv_unified ? n_runs_with(slot) : 0;
+
                 // select the current slot if the criteria match
-                if (!ret || slot.t_last_used <= t_last) {
-                    t_last = slot.t_last_used;
+                if (!ret || runs < best_runs || (runs == best_runs && slot.t_last_used <= t_last)) {
+                    t_last    = slot.t_last_used;
+                    best_runs = runs;
                     ret = &slot;
                 }
             }
@@ -1719,7 +1769,7 @@ private:
 
                 prompt_cache->update();
 
-                SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
+                SRV_INF("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
         }
 

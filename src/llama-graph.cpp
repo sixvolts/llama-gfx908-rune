@@ -20,6 +20,7 @@
 #include <cassert>
 #include <cmath>
 #include <cstring>
+#include <typeinfo>
 #include <numeric>
 #include <sstream>
 #include <string>
@@ -1410,7 +1411,13 @@ void llm_graph_result::set_outputs(const llm_graph_params & params) {
 }
 
 bool llm_graph_result::can_reuse(const llm_graph_params & params) {
+    static const bool reuse_dbg = getenv("LLAMA_REUSE_DEBUG") && atoi(getenv("LLAMA_REUSE_DEBUG")) != 0;
     if (!this->params.allow_reuse(params)) {
+        if (reuse_dbg) {
+            fprintf(stderr, "reuse: params differ (n_tokens %u -> %u, n_seqs_unq %u -> %u, n_outputs %d -> %d)\n",
+                this->params.ubatch.n_tokens, params.ubatch.n_tokens, this->params.ubatch.n_seqs_unq, params.ubatch.n_seqs_unq,
+                (int) this->params.n_outputs, (int) params.n_outputs);
+        }
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: cannot reuse graph due to incompatible graph parameters\n", __func__);
         }
@@ -1426,6 +1433,9 @@ bool llm_graph_result::can_reuse(const llm_graph_params & params) {
 
     for (auto & input : inputs) {
         const bool cur = input->can_reuse(params);
+        if (reuse_dbg && !cur) {
+            fprintf(stderr, "reuse: input %s refuses (n_tokens %u)\n", typeid(*input).name(), params.ubatch.n_tokens);
+        }
 
         if (debug > 1) {
             LLAMA_LOG_DEBUG("%s: can_reuse = %d\n", "placeholder", cur);
