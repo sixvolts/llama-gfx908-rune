@@ -11776,6 +11776,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
         }
     }
 
+    // GLM-5.3-Flash dense Q8_0 mat-vec: decode (1 column) and MTP verify (3 columns) at the model's K
+    for (int64_t k : {1536, 2048, 4096, 8192, 12288, 16384}) {
+        for (int64_t m : {2048, 4096, 16384}) {
+            for (int bs : {1, 3}) {
+                test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, m, bs, k, {1, 1}, {1, 1}));
+            }
+        }
+    }
+
     // Q4_K multi-column mat-vec
     for (int64_t m : {4096, 6144, 6272, 14336}) {
         for (int bs : {1, 2, 3, 4, 8}) {

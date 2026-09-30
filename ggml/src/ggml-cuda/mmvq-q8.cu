@@ -169,6 +169,17 @@ bool ggml_cuda_mmvq_q8_v2(
     }
     switch (ncols_x) {
         case  640: mmvq_q8_0_v2_ncols< 20>(ncols_dst, vx, vy, dst, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); return true;
+        // GLM-5.3-Flash (hidden 4096: 6.2 of its 9.4 GB of dense Q8_0 weights have K = 4096)
+        case 1536: mmvq_q8_0_v2_ncols< 48>(ncols_dst, vx, vy, dst, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); return true;
+        case 2048: mmvq_q8_0_v2_ncols< 64>(ncols_dst, vx, vy, dst, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); return true;
+        case 4096: mmvq_q8_0_v2_ncols<128>(ncols_dst, vx, vy, dst, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); return true;
+        case 8192: mmvq_q8_0_v2_ncols<256>(ncols_dst, vx, vy, dst, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); return true;
+        // the loads are all issued up front, so very long rows run out of registers at several columns (MI100, 3 columns:
+        // K=12288 +0%, K=16384 +50..76% slower than mul_mat_vec_q); one column is still 11..20% faster
+        case 12288: if (ncols_dst > 1) { return false; }
+                    mmvq_q8_0_v2_ncols<384>(ncols_dst, vx, vy, dst, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); return true;
+        case 16384: if (ncols_dst > 1) { return false; }
+                    mmvq_q8_0_v2_ncols<512>(ncols_dst, vx, vy, dst, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); return true;
         case 2560: mmvq_q8_0_v2_ncols< 80>(ncols_dst, vx, vy, dst, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); return true;
         case 6144: mmvq_q8_0_v2_ncols<192>(ncols_dst, vx, vy, dst, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); return true;
         default: return false;
