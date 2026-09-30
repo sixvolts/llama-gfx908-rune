@@ -393,3 +393,26 @@ A count pass plus per-block ballot compaction makes the order deterministic: ide
 100% same top token (padded, unpadded, HC mix on). rocBLAS atomics (`ROCBLAS_DEFAULT_ATOMICS_MODE=0`) made no
 difference. Most of the earlier "padding KL 0.0103" was this noise; measured deterministically it is still 0.0103
 against the unpadded path (PPL 2.0359 vs 2.0351), below the ubatch-256 reference 0.0124 (PPL 2.0414).
+
+## 12. MTP verify kernels: 45.9 -> 50.5 t/s single stream (2026-09-30)
+
+Step anatomy (LLAMA_SPEC_TIMING, sampled 8 x 320 tok): 52.7 ms = draft 4.2 + target verify 46.6 + ~2 host, 2.46 tokens
+per step. Stage handoffs inside a verify are only 1.2 ms; the verify is ~47 ms of kernels: MoE 18.6, dense Q8_0 mat-vec
+(3 columns) 15.5, ~1800 small kernels ~13. Depth 3 (41.8 t/s) and confidence-gated drafting (37.9 / 43.2) lose because
+variable verify widths defeat graph reuse; depth 2 fixed stays.
+
+- Dense (26a96ef42, bit-exact): the Qwen-era mmvq_q8_0_v2 only covered K = 640/2560/6144; GLM's K (hidden 4096) now
+  dispatch there. mul_mat_vec_q at 3 columns loses 25% vs 1 column (Q8_0's 34-byte blocks); v2 is 12-27% faster at
+  3 columns for K <= 8192 (one column only for 12288/16384). Dense 15.5 -> 13.8 ms/step, 46.0 -> 46.8 t/s.
+- MoE (1d203ffd5, tolerance): the verify ran one warp per (token, slot), re-reading shared experts; distinct experts are
+  77.7% of pairs. The dedup kernel now takes Q4_K gate/up at K = 4096 with the SWIGLU_CLAMP epilogue and Q5_K down
+  (qh unpacked to 5-bit bytes once): 46.8 -> 49.1 -> 50.5 t/s. KL at ubatch 3 vs GGML_MOE_V2=0: 0.0180 (PPL 2.0289 vs
+  2.0429), numerics-only reference ubatch 4 vs 3: 0.0318 (PPL 2.0597).
+
+| streams (aggregate t/s) | 1 | 2 | 3 | 4 | 6 |
+|---|---|---|---|---|---|
+| 4th build | 47.4 | ~51 | 58.8 | 63.0 | 68.7 |
+| 5th build | 51.8 | 55.3 | 63.6 | 71.4 | 68.8 |
+
+Six streams (6-column MoE) still use the old kernel: the dedup kernel stops at 4 tokens. Next levers: extend it to 8,
+drafter catch-up merged into the first draft (~1.4 ms/step), the ~1800 small kernels.
