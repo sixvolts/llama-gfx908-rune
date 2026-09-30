@@ -1539,7 +1539,134 @@ struct llama_sampler_top_p : public llama_sampler_backend {
     const size_t min_keep;
 
     std::vector<llama_token_data> buf_sort;
+    std::vector<float>            buf_l;         // fast path (llama_sampler_top_p_fast): logit - max
+    std::vector<float>            buf_x;         // fast path: exp(logit - max)
 };
+
+// e[i] = exp(x[i]) for x[i] <= 0 (x = logit - max), branch-free so the compiler vectorizes it (one clone per ISA):
+// range reduction by ln 2 and a degree-6 polynomial, within ~1 ulp of expf; x < -87.3 (including -inf) gives 0.
+#if defined(__GNUC__) && !defined(__clang__) && defined(__x86_64__)
+__attribute__((target_clones("avx512f", "avx2", "default")))
+#endif
+static void llama_sampler_vexp(float * x, size_t n) {
+    for (size_t i = 0; i < n; ++i) {
+        const float v  = x[i] < -87.3f ? -87.3f : x[i];
+        const float t  = v*1.44269504088896341f + 12582912.0f;      // round(v / ln2) via the 1.5*2^23 trick
+        const float k  = t - 12582912.0f;
+        const float r  = (v - k*0.693359375f) + k*2.12194440e-4f;  // v - k*ln2 in two parts
+        float q = 1.9875691500e-4f;
+        q = q*r + 1.3981999507e-3f;
+        q = q*r + 8.3334519073e-3f;
+        q = q*r + 4.1665795894e-2f;
+        q = q*r + 1.6666665459e-1f;
+        q = q*r + 5.0000001201e-1f;
+        const float er = (q*r)*r + r + 1.0f;
+        int32_t bits;
+        const int32_t ki = (int32_t) k;
+        const int32_t eb = (ki + 127) << 23;
+        std::memcpy(&bits, &er, sizeof(bits));
+        bits += eb - (127 << 23);
+        float out;
+        std::memcpy(&out, &bits, sizeof(out));
+        x[i] = x[i] < -87.3f ? 0.0f : out;
+    }
+}
+
+// Top-p over a large unsorted array without sorting the whole vocabulary. With top-k off and a 150k+ vocabulary the
+// reference path costs ~2-10 ms per sampled token (the bucket pass, a full sort whenever the top 256 do not reach p,
+// and three passes writing every entry). Here: the logits are copied to a contiguous buffer and exp(l - max) is taken
+// vectorized (llama_sampler_vexp, within ~1 ulp of expf); one pass sums them in token order, as the reference does, and
+// accumulates the mass per 1/8-logit bucket below the max (4 interleaved histograms, so runs of the same bucket do not
+// serialize on one accumulator). The buckets holding p of the mass, plus one bucket of margin, bound the candidates;
+// those are gathered with probability e / sum, sorted and cut where the running sum reaches p, as the reference does.
+// Same kept set as the reference except where a probability rounds across the p boundary (exp differs in the last
+// bit), same order except among exactly equal logits. Returns false to fall back (non-finite max, or the gathered set
+// did not reach p). LLAMA_TOP_P_FAST=0 disables it.
+static bool llama_sampler_top_p_fast(llama_sampler_top_p * ctx, llama_token_data_array * cur_p) {
+    constexpr int   NB = 256;          // buckets of 1/8 logit below the max; the last one takes the rest
+    constexpr float BW = 8.0f;
+    constexpr int   NH = 4;            // interleaved histograms
+
+    const size_t n = cur_p->size;
+    const llama_token_data * d = cur_p->data;
+
+    // the only strided pass over the 12-byte entries: logit - max goes to lx, exp(logit - max) to ex (both contiguous)
+    auto & lx = ctx->buf_l;
+    auto & ex = ctx->buf_x;
+    lx.resize(n);
+    ex.resize(n);
+    for (size_t i = 0; i < n; ++i) {
+        lx[i] = d[i].logit;
+    }
+    float max_l = lx[0];
+    for (size_t i = 1; i < n; ++i) {
+        max_l = lx[i] > max_l ? lx[i] : max_l;
+    }
+    if (!std::isfinite(max_l)) {
+        return false;
+    }
+    for (size_t i = 0; i < n; ++i) {
+        lx[i] -= max_l;
+        ex[i]  = lx[i];
+    }
+    llama_sampler_vexp(ex.data(), n);
+
+    float mass[NB][NH] = {};
+    float cum_sum = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+        const float e = ex[i];
+        cum_sum += e;                                                  // token order, as the reference sums
+        const float db = -lx[i]*BW;
+        const int   b  = db < (float) (NB - 1) ? (int) db : NB - 1;  // -inf logits land in the last bucket
+        mass[b][i % NH] += e;
+    }
+    if (!(cum_sum > 0.0f)) {
+        return false;
+    }
+
+    // buckets needed for p of the mass, then one more as margin for the different summation order
+    const float target = ctx->p*cum_sum;
+    float acc = 0.0f;
+    int b_end = NB - 1;
+    for (int b = 0; b < NB; ++b) {
+        acc += (mass[b][0] + mass[b][1]) + (mass[b][2] + mass[b][3]);
+        if (acc >= target) {
+            b_end = std::min(b + 1, NB - 1);
+            break;
+        }
+    }
+    const float thr = b_end == NB - 1 ? -INFINITY : -(float) (b_end + 1)/BW;   // relative to the max
+
+    auto & cand = ctx->buf_sort;
+    cand.clear();
+    for (size_t i = 0; i < n; ++i) {
+        if (lx[i] >= thr) {
+            cand.push_back(llama_token_data{d[i].id, d[i].logit, ex[i]/cum_sum});
+        }
+    }
+    if (cand.size() < std::max<size_t>(ctx->min_keep, 1)) {
+        return false;
+    }
+    std::sort(cand.begin(), cand.end(), [](const llama_token_data & a, const llama_token_data & b) { return a.logit > b.logit; });
+
+    float  run = 0.0f;
+    size_t last_idx = 0;
+    for (size_t i = 0; i < cand.size(); ++i) {
+        run += cand[i].p;
+        if (run >= ctx->p && i + 1 >= ctx->min_keep) {
+            last_idx = i + 1;
+            break;
+        }
+    }
+    if (last_idx == 0) {
+        return false;
+    }
+
+    std::copy(cand.begin(), cand.begin() + last_idx, cur_p->data);
+    cur_p->size   = last_idx;
+    cur_p->sorted = true;
+    return true;
+}
 
 static const char * llama_sampler_top_p_name(const struct llama_sampler * smpl) {
     auto * sctx = (llama_sampler_top_p *) smpl->ctx;
@@ -1550,6 +1677,11 @@ static void llama_sampler_top_p_apply(struct llama_sampler * smpl, llama_token_d
     auto * ctx = (llama_sampler_top_p *) smpl->ctx;
 
     if (ctx->p >= 1.0f) {
+        return;
+    }
+
+    static const bool fast = !getenv("LLAMA_TOP_P_FAST") || atoi(getenv("LLAMA_TOP_P_FAST")) != 0;
+    if (fast && !cur_p->sorted && cur_p->size > 1024 && llama_sampler_top_p_fast(ctx, cur_p)) {
         return;
     }
 
@@ -1730,6 +1862,8 @@ struct llama_sampler * llama_sampler_init_top_p(float p, size_t min_keep) {
             /* .p        = */ p,
             /* .min_keep = */ min_keep,
             /* .buf_sort = */ {},
+            /* .buf_l    = */ {},
+            /* .buf_x    = */ {},
         }
     );
 }
