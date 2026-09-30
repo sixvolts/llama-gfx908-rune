@@ -310,3 +310,26 @@ Two prefill effects are open. The first prompt that reaches a new cache width pr
 same length (22.7k: 422 against 682 t/s in one server run), a one-time warm-up of per-shape state, not steady state.
 And the drafter's own prompt pass costs about a fifth of prefill at 108k (352 against 449 t/s without it).
 `LLAMA_DSA_SPARSE=1` is now the default in `glm53-env.sh`.
+
+## 10. Production readiness (2026-09-29/30, GLM replaces both Qwen stacks)
+
+- **Correctness:** perplexity depended on ubatch size (4k ctx: ubatch 512 2.04, ubatch 8 2.21-2.22, nondeterministic).
+  Root cause was ours: the Flash-Next host-path tuning copied scheduler inputs with an async H2D from pinned memory
+  and skipped the pre-set_inputs sync on graph reuse, so the next ubatch's tokens/positions/masks raced into the
+  current one. Fixed (9052d1413): ubatch 8 2.0306 against ubatch 512 2.0324. Residual run-to-run KL at 4k (indexer
+  active) ~0.0005, 20x below the numerics floor.
+- **Slots:** 6 x 128k fits the 9-stage layout with the MTP drafter on GPU 1; peak VRAM under 6 concurrent 22k-token
+  requests 30.1 of 34.3 GB on the fullest cards, GPU 1 at 8.2 GB. No layers need to move onto the drafter card.
+- **Adaptive speculation** (912d872ee, LLAMA_SPEC_MAX_GEN=2): MTP drafts only while <= 2 slots generate.
+- **Decode micro-batching** (splitting a concurrent decode step into 2-6 ubatches for pipeline overlap): tried and
+  dropped. 6 streams +7%, 3-4 streams -2% to -38%: the stages do not overlap on rune, so each micro-batch only
+  re-reads the weights. Making pipeline overlap work is the open lever for concurrent throughput.
+- **Fusion wave** (9db82ab54, 5beb30e68): single-stream decode without speculation 27.5 -> 32.2 t/s.
+
+Production-style configuration (6 x 128k, MTP depth 2 + adaptive speculation, sparse DSA, fusion wave), aggregate
+decode, short prompts:
+
+| concurrent streams | 1 | 2 | 3 | 4 | 6 |
+|---|---|---|---|---|---|
+| t/s per stream | 43.9 | 25.7 | 19.4 | 15.9 | 11.5 |
+| aggregate t/s | 43.9 | 51.5 | 58.2 | 63.6 | 69.0 |
