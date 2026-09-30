@@ -416,3 +416,23 @@ variable verify widths defeat graph reuse; depth 2 fixed stays.
 
 Six streams (6-column MoE) still use the old kernel: the dedup kernel stops at 4 tokens. Next levers: extend it to 8,
 drafter catch-up merged into the first draft (~1.4 ms/step), the ~1800 small kernels.
+
+### Follow-ups (6th build, ccae514db)
+
+- Expert dedup up to 8 tokens (324e6a153), 8 waves per block for 5..8 (b6605292c): 6-stream decode 68.8 -> 79.4 t/s,
+  5 streams 71.3 -> 74.7; KL at ubatch 6 vs the old kernel 0.0072 < numerics reference (ubatch 7) 0.0082; 1..4 tokens
+  bit-identical. Eval tests now reach the dedup kernels (Q4_K K=2560/4096 with SWIGLU/SWIGLU_CLAMP, Q5_K K=2048,
+  1..8 tokens, 32 experts, partial tiles): MUL_MAT_ID 1009/1009, MUL_MAT_VEC_FUSION 1275/1275. Q8_0 v2 is faster
+  than mul_mat_vec_q at 2 and 4 columns too (1..35%).
+- Varying drafts: caused by the old multi-token MoE kernel (mul_mat_vec_q_moe), which is nondeterministic run to run
+  (with GGML_MOE_V2=0 identical greedy requests give 57/76 vs 58/74 drafts and occasionally different text). The dedup
+  kernel handles every GLM MoE call of 1..8 tokens, so production decode is now deterministic; the old kernel is only
+  reached with GGML_MOE_V2=0 (not chased further).
+- Allocator ratchet (a decode-graph fallback realloc shrinking the reservation so later prompts re-reserve): not seen,
+  22.7k prompt right after multi-slot decode 624 t/s vs 633 fresh.
+- Merging the drafter catch-up into the first draft: dropped. The catch-up already overlaps host sampling (only ~0.5 ms
+  of its ~1.1 ms is exposed) and computes no output head; merging would delay it until after sampling. Net ~1%.
+
+| streams (aggregate t/s) | 1 | 2 | 3 | 4 | 6 |
+|---|---|---|---|---|---|
+| 6th build | 52.1 | ~55 | 62.7 | 70.6 | 79.4 |
