@@ -378,6 +378,18 @@ slot choice produce such gaps routinely. The server now gives a new task the idl
 busy slots, and moves a fragmenting LCP match into such a slot through the host prompt cache (~0.3 s for 650 tokens).
 `LLAMA_SLOT_COMPACT=0` reverts. After the same long-prompt history: 1/2/3/4/6 streams 41.6/50.6/58.2/63.0/69.0 t/s.
 
-Open: full prefills of the same >2k-token prompt are not deterministic run to run (greedy text differs from the first
-sentence on a word-salad prompt; first-token top-20 logprobs differ by up to 0.85 fresh vs fresh; perplexity KL between
-identical runs 0.0015). Present before these changes. A prefix restored from the prompt cache sits inside that spread.
+Moves are verified after the load (the new slot must hold at least the source's prefix, else the source slot is used),
+skipped when the prompt cache would refuse the entry (f_keep < 0.25) and bounded by `LLAMA_SLOT_MOVE_MAX` (65536
+tokens): 320 / 411 / 612 ms for 605 / 6k / 21k tokens, ~300 ms of it the fixed recurrent state (a1b976449).
+
+### Run-to-run variance: the radix top-k's order (904105df8)
+
+Full prefills of the same >2k-token prompt were not deterministic: greedy text differed from the first sentence,
+first-token logprobs by up to 0.85, and two identical perplexity runs by KL 0.0094 with the prefill padding (0.0015
+without). The radix top-k placed the entries above the k-th key with an atomic counter, so the selected set was
+stable but its order was not, and the sparse attention / indexer accumulate in list order. With the padding, early
+ubatches have more pools than k (most at -inf), so a real top-k ran where the unpadded path selected everything.
+A count pass plus per-block ballot compaction makes the order deterministic: identical runs now give mean KLD 0 and
+100% same top token (padded, unpadded, HC mix on). rocBLAS atomics (`ROCBLAS_DEFAULT_ATOMICS_MODE=0`) made no
+difference. Most of the earlier "padding KL 0.0103" was this noise; measured deterministically it is still 0.0103
+against the unpadded path (PPL 2.0359 vs 2.0351), below the ubatch-256 reference 0.0124 (PPL 2.0414).
