@@ -145,14 +145,82 @@ static __device__ __forceinline__ float moe_q4K_dot(const moe_q4K_pair & w, cons
     return (w.dsc_lo*d8l*dl - w.dmm_lo*s8[0]) + (w.dsc_hi*d8h*dh - w.dmm_hi*s8[1]);
 }
 
-template <int NSB, int NW, int RG, int NTMAX, bool GLU>
+// Q5_K (GLM-5.3-Flash down): the Q4_K layout plus qh[32], the 5th bit of every weight; pair pp takes bit 2pp (low
+// sub-block) and 2pp+1 (high) of qh[l] for element l, as dequantize_row_q5_K. Quants are unpacked to 5-bit bytes once.
+struct moe_q5K_pair {
+    int   lo[8], hi[8];         // 32 + 32 5-bit quants as bytes
+    float dsc_lo, dsc_hi;       // d*sc
+    float dmm_lo, dmm_hi;       // dmin*m
+};
+
+static __device__ __forceinline__ void moe_q5K_load(const block_q5_K * __restrict__ b, const int pp, moe_q5K_pair & w) {
+    const int4 h   = *((const int4 *) b);                       // d, dmin, scales[12]
+    const int4 qh0 = *((const int4 *) (b->qh));
+    const int4 qh1 = *((const int4 *) (b->qh + 16));
+    const int4 q0  = *((const int4 *) (b->qs + 32*pp));
+    const int4 q1  = *((const int4 *) (b->qs + 32*pp + 16));
+    const int q[8]  = { q0.x, q0.y, q0.z, q0.w, q1.x, q1.y, q1.z, q1.w };
+    const int qh[8] = { qh0.x, qh0.y, qh0.z, qh0.w, qh1.x, qh1.y, qh1.z, qh1.w };
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        w.lo[k] = ( q[k]       & 0x0F0F0F0F) | (((qh[k] >> (2*pp))     & 0x01010101) << 4);
+        w.hi[k] = ((q[k] >> 4) & 0x0F0F0F0F) | (((qh[k] >> (2*pp + 1)) & 0x01010101) << 4);
+    }
+
+    const float2 dm = __half22float2(*((const half2 *) &h.x));
+    const int s03 = h.y, s47 = h.z, s811 = h.w;
+    const int j0 = 2*pp;
+    int sc[2], mn[2];
+#pragma unroll
+    for (int s = 0; s < 2; ++s) {
+        const int j = j0 + s;
+        if (j < 4) {
+            sc[s] = (s03 >> (8*j)) & 63;
+            mn[s] = (s47 >> (8*j)) & 63;
+        } else {
+            const int b8  = (s811 >> (8*(j - 4))) & 0xFF;
+            const int bm4 = (s03  >> (8*(j - 4))) & 0xFF;
+            const int b0  = (s47  >> (8*(j - 4))) & 0xFF;
+            sc[s] = (b8 & 0xF) | ((bm4 >> 6) << 4);
+            mn[s] = (b8 >>  4) | ((b0  >> 6) << 4);
+        }
+    }
+    w.dsc_lo = dm.x*sc[0];
+    w.dsc_hi = dm.x*sc[1];
+    w.dmm_lo = dm.y*mn[0];
+    w.dmm_hi = dm.y*mn[1];
+}
+
+static __device__ __forceinline__ float moe_q5K_dot(const moe_q5K_pair & w, const block_q8_1 * __restrict__ ylo, const float * s8) {
+    const block_q8_1 * yhi = ylo + 1;
+    const int * ul = (const int *) ylo->qs;
+    const int * uh = (const int *) yhi->qs;
+    int dl = 0, dh = 0;
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        dl = ggml_cuda_dp4a(w.lo[k], ul[k], dl);
+        dh = ggml_cuda_dp4a(w.hi[k], uh[k], dh);
+    }
+    const float d8l = __low2float(ylo->ds);
+    const float d8h = __low2float(yhi->ds);
+    return (w.dsc_lo*d8l*dl - w.dmm_lo*s8[0]) + (w.dsc_hi*d8h*dh - w.dmm_hi*s8[1]);
+}
+
+// overloads so one kernel body serves both K-quants
+static __device__ __forceinline__ void  moe_kq_load(const block_q4_K * b, const int pp, moe_q4K_pair & w) { moe_q4K_load(b, pp, w); }
+static __device__ __forceinline__ void  moe_kq_load(const block_q5_K * b, const int pp, moe_q5K_pair & w) { moe_q5K_load(b, pp, w); }
+static __device__ __forceinline__ float moe_kq_dot(const moe_q4K_pair & w, const block_q8_1 * y, const float * s8) { return moe_q4K_dot(w, y, s8); }
+static __device__ __forceinline__ float moe_kq_dot(const moe_q5K_pair & w, const block_q8_1 * y, const float * s8) { return moe_q5K_dot(w, y, s8); }
+
+template <int NSB, int NW, int RG, int NTMAX, bool GLU, typename block_t = block_q4_K, typename pair_t = moe_q4K_pair>
 static __global__ void __launch_bounds__(NW*moe_warp_size, 1) mmvq_moe_q4K(
         const void * __restrict__ vx, const void * __restrict__ vgate, const void * __restrict__ vy,
         const int32_t * __restrict__ ids, float * __restrict__ dst,
         const int nrows, const int stride_row_x, const int stride_channel_x,
         const int stride_col_y, const int stride_channel_y, const int nchannels_y,
         const int stride_col_dst, const int stride_channel_dst,
-        const int n_used, const int ncols_dst, const int ids_stride, unsigned int * __restrict__ stats) {
+        const int n_used, const int ncols_dst, const int ids_stride, unsigned int * __restrict__ stats,
+        const bool glu_clamp, const float glu_limit) {
     static_assert(NSB % 2 == 0, "8 lanes per row need an even superblock count");
     constexpr int NP  = NSB/2;                              // pairs per lane and row
     constexpr int NBY = NSB*(QK_K/QK8_1);
@@ -172,21 +240,21 @@ static __global__ void __launch_bounds__(NW*moe_warp_size, 1) mmvq_moe_q4K(
     const int lane = threadIdx.x;
     const int l8   = lane % 8;
     const int row_base = (blockIdx.x*NW + threadIdx.y)*(8*RG) + lane/8;
-    const block_q4_K * bx = (const block_q4_K *) vx    + e*stride_channel_x;
-    const block_q4_K * bg = (const block_q4_K *) vgate + e*stride_channel_x;
+    const block_t * bx = (const block_t *) vx    + e*stride_channel_x;
+    const block_t * bg = (const block_t *) vgate + e*stride_channel_x;
 
-    auto load_item = [&](const int i, moe_q4K_pair & wu, moe_q4K_pair & wg) {
+    auto load_item = [&](const int i, pair_t & wu, pair_t & wg) {
         const int row = row_base + (i / NP)*8;
         const int p   = l8 + 8*(i % NP);
         if (row < nrows) {
-            moe_q4K_load(bx + row*stride_row_x + p/4, p%4, wu);
+            moe_kq_load(bx + row*stride_row_x + p/4, p%4, wu);
             if constexpr (GLU) {
-                moe_q4K_load(bg + row*stride_row_x + p/4, p%4, wg);
+                moe_kq_load(bg + row*stride_row_x + p/4, p%4, wg);
             }
         }
     };
 
-    moe_q4K_pair cu, cg, nu, ng;
+    pair_t cu, cg, nu, ng;
     load_item(0, cu, cg);
     moe_stage_y<NTMAX, NI, true, NBY>(y_sh, vy, sl, nchannels_y, stride_channel_y, stride_col_y, s8_sh);
 
@@ -210,9 +278,9 @@ static __global__ void __launch_bounds__(NW*moe_warp_size, 1) mmvq_moe_q4K(
             }
             const int ib = (p/4)*(QK_K/QK8_1) + 2*(p%4);
             const block_q8_1 * ylo = (const block_q8_1 *) y_sh[t] + ib;
-            acc[t] += moe_q4K_dot(cu, ylo, &s8_sh[t][ib]);
+            acc[t] += moe_kq_dot(cu, ylo, &s8_sh[t][ib]);
             if constexpr (GLU) {
-                accg[t] += moe_q4K_dot(cg, ylo, &s8_sh[t][ib]);
+                accg[t] += moe_kq_dot(cg, ylo, &s8_sh[t][ib]);
             }
         }
         if (k == NP - 1) {
@@ -233,7 +301,8 @@ static __global__ void __launch_bounds__(NW*moe_warp_size, 1) mmvq_moe_q4K(
                 if (l8 == 0 && row < nrows) {
                     float r = acc[t];
                     if constexpr (GLU) {
-                        r *= ggml_cuda_op_silu_single(accg[t]);
+                        // GGML_GLU_OP_SWIGLU, or GGML_GLU_OP_SWIGLU_CLAMP (GLM-5.3-Flash) as mul_mat_vec_q_moe applies it
+                        r = glu_clamp ? ggml_cuda_op_swiglu_clamp_single(accg[t], r, glu_limit) : r*ggml_cuda_op_silu_single(accg[t]);
                     }
                     dst[sl[t]*stride_channel_dst + t*stride_col_dst + row] = r;
                 }
@@ -410,20 +479,33 @@ bool ggml_cuda_mmvq_moe_dedup(
     if (!enabled || ncols_dst < 1 || ncols_dst > 4 || n_used*ncols_dst > 64 || !GGML_CUDA_CC_IS_CDNA(cc)) {
         return false;
     }
+    static const bool dbg = getenv("GGML_MOE_V2_DEBUG") && atoi(getenv("GGML_MOE_V2_DEBUG")) != 0;
+    if (dbg) {
+        static int n_logged = 0;
+        if (n_logged < 12) {
+            n_logged++;
+            GGML_LOG_WARN("moe_v2: type %d K %d rows %d ncols_dst %d n_used %d x_bias %d gate_bias %d x_scale %d gate_scale %d gate %d glu_op %d\n",
+                (int) type, ncols_x, nrows_x, ncols_dst, n_used, fusion.x_bias != nullptr, fusion.gate_bias != nullptr,
+                fusion.x_scale != nullptr, fusion.gate_scale != nullptr, fusion.gate != nullptr, (int) fusion.glu_op);
+        }
+    }
     if (fusion.x_bias || fusion.gate_bias || fusion.x_scale || fusion.gate_scale) {
         return false;
     }
     const bool glu = fusion.gate != nullptr;
-    if (glu && fusion.glu_op != GGML_GLU_OP_SWIGLU) {
+    if (glu && fusion.glu_op != GGML_GLU_OP_SWIGLU && fusion.glu_op != GGML_GLU_OP_SWIGLU_CLAMP) {
         return false;
     }
+    const bool  glu_clamp = glu && fusion.glu_op == GGML_GLU_OP_SWIGLU_CLAMP;
+    const float glu_limit = fusion.glu_limit;
     unsigned int * stats = moe_dedup_stats(device);
     // tuning: GGML_MOE_V2_Q4K = 10*NW + RG, GGML_MOE_V2_Q51 = 10*NW + RG (NW waves per block, RG row groups per wave)
     static const int cfg_q4k = getenv("GGML_MOE_V2_Q4K") ? atoi(getenv("GGML_MOE_V2_Q4K")) : 41;
     static const int cfg_q51 = getenv("GGML_MOE_V2_Q51") ? atoi(getenv("GGML_MOE_V2_Q51")) : 41;
     switch (type) {
         case GGML_TYPE_Q4_K: {
-            if (ncols_x != 10*QK_K) {
+            // Qwen3.8-Flash-Next: K = 2560 (10 superblocks); GLM-5.3-Flash gate/up: K = 4096 (16)
+            if (ncols_x != 10*QK_K && ncols_x != 16*QK_K) {
                 return false;
             }
             auto launch = [&](auto nw_tag, auto rg_tag) {
@@ -431,14 +513,22 @@ bool ggml_cuda_mmvq_moe_dedup(
                 constexpr int RG = decltype(rg_tag)::value;
                 const dim3 block_dims(moe_warp_size, NW, 1);
                 const dim3 block_nums((nrows_x + 8*RG*NW - 1) / (8*RG*NW), n_used*ncols_dst, 1);
-                if (glu) {
-                    mmvq_moe_q4K<10, NW, RG, 4, true><<<block_nums, block_dims, 0, stream>>>(vx, fusion.gate, vy, ids, dst,
-                        nrows_x, stride_row_x, stride_channel_x, stride_col_y, stride_channel_y, nchannels_y,
-                        stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats);
+                auto go = [&](auto nsb_tag) {
+                    constexpr int NSB = decltype(nsb_tag)::value;
+                    if (glu) {
+                        mmvq_moe_q4K<NSB, NW, RG, 4, true><<<block_nums, block_dims, 0, stream>>>(vx, fusion.gate, vy, ids, dst,
+                            nrows_x, stride_row_x, stride_channel_x, stride_col_y, stride_channel_y, nchannels_y,
+                            stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats, glu_clamp, glu_limit);
+                    } else {
+                        mmvq_moe_q4K<NSB, NW, RG, 4, false><<<block_nums, block_dims, 0, stream>>>(vx, vx, vy, ids, dst,
+                            nrows_x, stride_row_x, stride_channel_x, stride_col_y, stride_channel_y, nchannels_y,
+                            stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats, false, 0.0f);
+                    }
+                };
+                if (ncols_x == 16*QK_K) {
+                    go(std::integral_constant<int, 16>{});
                 } else {
-                    mmvq_moe_q4K<10, NW, RG, 4, false><<<block_nums, block_dims, 0, stream>>>(vx, vx, vy, ids, dst,
-                        nrows_x, stride_row_x, stride_channel_x, stride_col_y, stride_channel_y, nchannels_y,
-                        stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats);
+                    go(std::integral_constant<int, 10>{});
                 }
             };
             switch (cfg_q4k) {
@@ -449,6 +539,20 @@ bool ggml_cuda_mmvq_moe_dedup(
                 case 42: launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 2>{}); break;
                 default: launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 1>{}); break;
             }
+            return true;
+        }
+        case GGML_TYPE_Q5_K: {
+            // GLM-5.3-Flash down: K = 2048 (8 superblocks), no GLU
+            static const bool q5k_on = !getenv("GGML_MOE_V2_Q5K") || atoi(getenv("GGML_MOE_V2_Q5K")) != 0;
+            if (!q5k_on || ncols_x != 8*QK_K || glu) {
+                return false;
+            }
+            constexpr int NW = 4, RG = 1;
+            const dim3 block_dims(moe_warp_size, NW, 1);
+            const dim3 block_nums((nrows_x + 8*RG*NW - 1) / (8*RG*NW), n_used*ncols_dst, 1);
+            mmvq_moe_q4K<8, NW, RG, 4, false, block_q5_K, moe_q5K_pair><<<block_nums, block_dims, 0, stream>>>(vx, vx, vy, ids, dst,
+                nrows_x, stride_row_x, stride_channel_x, stride_col_y, stride_channel_y, nchannels_y,
+                stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats, false, 0.0f);
             return true;
         }
         case GGML_TYPE_Q5_1: {
