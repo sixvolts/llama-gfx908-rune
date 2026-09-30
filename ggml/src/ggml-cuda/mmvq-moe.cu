@@ -49,7 +49,7 @@ static __device__ __forceinline__ bool moe_route(const int32_t * __restrict__ id
 
 static __device__ __forceinline__ void moe_count(unsigned int * stats, const int n_used, const int ncols_dst) {
     if (stats && blockIdx.x == 0 && threadIdx.x == 0 && threadIdx.y == 0) {
-        // [0] distinct experts, [1] (token, slot) pairs, [2 + ncols_dst - 1] calls per batch size
+        // [0] distinct experts, [1] (token, slot) pairs, [2 + ncols_dst - 1] calls per batch size (1..8)
         atomicAdd(&stats[0], 1u);
         if (blockIdx.y == 0) {
             atomicAdd(&stats[1], (unsigned int) (n_used*ncols_dst));
@@ -442,8 +442,8 @@ static unsigned int * moe_dedup_stats(const int device) {
         return nullptr;
     }
     if (!ptr[device]) {
-        CUDA_CHECK(cudaMalloc((void **) &ptr[device], 8*sizeof(unsigned int)));
-        CUDA_CHECK(cudaMemset(ptr[device], 0, 8*sizeof(unsigned int)));
+        CUDA_CHECK(cudaMalloc((void **) &ptr[device], 12*sizeof(unsigned int)));
+        CUDA_CHECK(cudaMemset(ptr[device], 0, 12*sizeof(unsigned int)));
         static bool registered = false;
         if (!registered) {
             registered = true;
@@ -452,12 +452,12 @@ static unsigned int * moe_dedup_stats(const int device) {
                     if (!ptr[d]) {
                         continue;
                     }
-                    unsigned int h[8];
+                    unsigned int h[12];
                     if (cudaSetDevice(d) != cudaSuccess || cudaMemcpy(h, ptr[d], sizeof(h), cudaMemcpyDeviceToHost) != cudaSuccess) {
                         continue;
                     }
-                    fprintf(stderr, "moe_dedup_stats dev %d: distinct %u / pairs %u (%.3f), calls nt1 %u nt2 %u nt3 %u nt4 %u\n", d,
-                        h[0], h[1], h[1] ? (double) h[0] / h[1] : 0.0, h[2], h[3], h[4], h[5]);
+                    fprintf(stderr, "moe_dedup_stats dev %d: distinct %u / pairs %u (%.3f), calls by tokens 1..8: %u %u %u %u %u %u %u %u\n", d,
+                        h[0], h[1], h[1] ? (double) h[0] / h[1] : 0.0, h[2], h[3], h[4], h[5], h[6], h[7], h[8], h[9]);
                 }
             });
         }
@@ -476,7 +476,7 @@ bool ggml_cuda_mmvq_moe_dedup(
     static const bool enabled = !getenv("GGML_MOE_V2") || atoi(getenv("GGML_MOE_V2")) != 0;
     const int device = ggml_cuda_get_device();
     const int cc     = ggml_cuda_info().devices[device].cc;
-    if (!enabled || ncols_dst < 1 || ncols_dst > 4 || n_used*ncols_dst > 64 || !GGML_CUDA_CC_IS_CDNA(cc)) {
+    if (!enabled || ncols_dst < 1 || ncols_dst > 8 || n_used*ncols_dst > 64 || !GGML_CUDA_CC_IS_CDNA(cc)) {
         return false;
     }
     static const bool dbg = getenv("GGML_MOE_V2_DEBUG") && atoi(getenv("GGML_MOE_V2_DEBUG")) != 0;
@@ -513,22 +513,31 @@ bool ggml_cuda_mmvq_moe_dedup(
                 constexpr int RG = decltype(rg_tag)::value;
                 const dim3 block_dims(moe_warp_size, NW, 1);
                 const dim3 block_nums((nrows_x + 8*RG*NW - 1) / (8*RG*NW), n_used*ncols_dst, 1);
-                auto go = [&](auto nsb_tag) {
+                auto go = [&](auto nsb_tag, auto nt_tag) {
                     constexpr int NSB = decltype(nsb_tag)::value;
+                    constexpr int NT  = decltype(nt_tag)::value;
                     if (glu) {
-                        mmvq_moe_q4K<NSB, NW, RG, 4, true><<<block_nums, block_dims, 0, stream>>>(vx, fusion.gate, vy, ids, dst,
+                        mmvq_moe_q4K<NSB, NW, RG, NT, true><<<block_nums, block_dims, 0, stream>>>(vx, fusion.gate, vy, ids, dst,
                             nrows_x, stride_row_x, stride_channel_x, stride_col_y, stride_channel_y, nchannels_y,
                             stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats, glu_clamp, glu_limit);
                     } else {
-                        mmvq_moe_q4K<NSB, NW, RG, 4, false><<<block_nums, block_dims, 0, stream>>>(vx, vx, vy, ids, dst,
+                        mmvq_moe_q4K<NSB, NW, RG, NT, false><<<block_nums, block_dims, 0, stream>>>(vx, vx, vy, ids, dst,
                             nrows_x, stride_row_x, stride_channel_x, stride_col_y, stride_channel_y, nchannels_y,
                             stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats, false, 0.0f);
                     }
                 };
+                // 1..4 tokens keep the 4-token instantiation; 5..8 (concurrent decode, 6 slots) take 8
+                auto go_nt = [&](auto nsb_tag) {
+                    if (ncols_dst <= 4) {
+                        go(nsb_tag, std::integral_constant<int, 4>{});
+                    } else {
+                        go(nsb_tag, std::integral_constant<int, 8>{});
+                    }
+                };
                 if (ncols_x == 16*QK_K) {
-                    go(std::integral_constant<int, 16>{});
+                    go_nt(std::integral_constant<int, 16>{});
                 } else {
-                    go(std::integral_constant<int, 10>{});
+                    go_nt(std::integral_constant<int, 10>{});
                 }
             };
             switch (cfg_q4k) {
@@ -550,9 +559,15 @@ bool ggml_cuda_mmvq_moe_dedup(
             constexpr int NW = 4, RG = 1;
             const dim3 block_dims(moe_warp_size, NW, 1);
             const dim3 block_nums((nrows_x + 8*RG*NW - 1) / (8*RG*NW), n_used*ncols_dst, 1);
-            mmvq_moe_q4K<8, NW, RG, 4, false, block_q5_K, moe_q5K_pair><<<block_nums, block_dims, 0, stream>>>(vx, vx, vy, ids, dst,
-                nrows_x, stride_row_x, stride_channel_x, stride_col_y, stride_channel_y, nchannels_y,
-                stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats, false, 0.0f);
+            if (ncols_dst <= 4) {
+                mmvq_moe_q4K<8, NW, RG, 4, false, block_q5_K, moe_q5K_pair><<<block_nums, block_dims, 0, stream>>>(vx, vx, vy, ids, dst,
+                    nrows_x, stride_row_x, stride_channel_x, stride_col_y, stride_channel_y, nchannels_y,
+                    stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats, false, 0.0f);
+            } else {
+                mmvq_moe_q4K<8, NW, RG, 8, false, block_q5_K, moe_q5K_pair><<<block_nums, block_dims, 0, stream>>>(vx, vx, vy, ids, dst,
+                    nrows_x, stride_row_x, stride_channel_x, stride_col_y, stride_channel_y, nchannels_y,
+                    stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats, false, 0.0f);
+            }
             return true;
         }
         case GGML_TYPE_Q5_1: {
@@ -564,9 +579,15 @@ bool ggml_cuda_mmvq_moe_dedup(
                 constexpr int RG = decltype(rg_tag)::value;
                 const dim3 block_dims(moe_warp_size, NW, 1);
                 const dim3 block_nums((nrows_x + 16*RG*NW - 1) / (16*RG*NW), n_used*ncols_dst, 1);
-                mmvq_moe_q51<20, NW, RG, 4><<<block_nums, block_dims, 0, stream>>>(vx, vy, ids, dst,
-                    nrows_x, stride_row_x, stride_channel_x, stride_col_y, stride_channel_y, nchannels_y,
-                    stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats);
+                if (ncols_dst <= 4) {
+                    mmvq_moe_q51<20, NW, RG, 4><<<block_nums, block_dims, 0, stream>>>(vx, vy, ids, dst,
+                        nrows_x, stride_row_x, stride_channel_x, stride_col_y, stride_channel_y, nchannels_y,
+                        stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats);
+                } else {
+                    mmvq_moe_q51<20, NW, RG, 8><<<block_nums, block_dims, 0, stream>>>(vx, vy, ids, dst,
+                        nrows_x, stride_row_x, stride_channel_x, stride_col_y, stride_channel_y, nchannels_y,
+                        stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats);
+                }
             };
             switch (cfg_q51) {
                 case 11: launch(std::integral_constant<int, 1>{}, std::integral_constant<int, 1>{}); break;
