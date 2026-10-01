@@ -2763,6 +2763,33 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     bool use_cuda_graph = true;
     // Loop over nodes in GGML graph to obtain info needed for CUDA graph
 
+    // Prompt-sized batches do not use graphs (GGML_CUDA_GRAPH_MAX_BATCH, default 32 rows: decode and speculative
+    // verify batches of every slot stay graphed). On rune (GLM-5.3 745B, 10x MI100) replaying captured instances
+    // across prompt ubatches - every ubatch is a new n_kv, so the 64-entry cache thrashes and reuses entries
+    // chunk to chunk - intermittently corrupted whole 4k-token chunks (PPL 2.5 -> 3600, KLD inf) in 4 of 6
+    // prefill runs; with graphs off, or with ubatch 64 (64 shapes per chunk, never reused), every run sat at the
+    // numerics floor. The row count is read from the weight matmuls' activations.
+    static const int64_t max_batch = getenv("GGML_CUDA_GRAPH_MAX_BATCH") ? atoll(getenv("GGML_CUDA_GRAPH_MAX_BATCH")) : 32;
+    if (max_batch > 0) {
+        int64_t batch = 0;
+        for (int i = 0; i < cgraph->n_nodes; i++) {
+            const ggml_tensor * node = cgraph->nodes[i];
+            if ((node->op == GGML_OP_MUL_MAT || node->op == GGML_OP_MUL_MAT_ID) && node->src[0] && node->src[1] &&
+                node->src[0]->buffer && ggml_backend_buffer_get_usage(node->src[0]->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                batch = std::max(batch, node->op == GGML_OP_MUL_MAT ? node->src[1]->ne[1] : node->src[1]->ne[2]);
+            }
+        }
+        if (batch > max_batch) {
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                GGML_LOG_INFO("%s: not using CUDA graphs for batches over %lld rows (GGML_CUDA_GRAPH_MAX_BATCH); first seen %lld\n",
+                        __func__, (long long) max_batch, (long long) batch);
+            }
+            return false;
+        }
+    }
+
     for (int i = 0; i < cgraph->n_nodes; i++) {
         ggml_tensor * node = cgraph->nodes[i];
 

@@ -82,12 +82,42 @@ Measured (8k, placed, MTP n=2, single stream):
 
 Drafting 3 tokens instead of 2: 18.3 t/s, prose 15.6 t/s (accept 0.56). Kept 2.
 
-Quality gate (wikitext, c=4096 x 12 chunks, dense ub128 as the base): sparse mean KLD 0.043, PPL +3.2% - but the
-per-chunk table shows every chunk at KLD 0.0001-0.003 except chunk 5 (standalone PPL base 4.5, sparse 6.6), and the
-"numerics floor" run (dense, ub 129) is catastrophic on that same chunk only (PPL ~3600, KLD 0.83 there, ~0.001
-elsewhere). One numerically unstable chunk, shared with the dense path, accounts for the whole difference; isolation
-(base re-run, fused indexer off, sparse at ub 129, dense at ub 64/130) is in `~/glm53-big/kl-floor.sh`, and the chunk
-is carved out as `~/glm53-big/wiki-chunk5.txt` for one-chunk probes.
+Quality gate (wikitext, c=4096 x 12 chunks, dense ub128 as the base). The first pass read sparse mean KLD 0.043,
+PPL +3.2%, but the per-chunk table had every chunk at KLD 0.0001-0.003 except one, and the "numerics floor" run
+(dense, ub 129) was catastrophic on that same chunk only (PPL ~3600): an intermittent prefill corruption shared
+with the dense path, section 3a. With prompt batches no longer replaying HIP graphs (the gate of 3a):
+
+| vs the dense ub128 base | mean KLD | max KLD | 99.9% | same top-1 |
+|---|---|---|---|---|
+| dense ub128, re-run (numerics floor) | 0.0093 | 4.18 | 0.31 | 96.96% |
+| **sparse ub128** | **0.0098** | 1.35 | 0.33 | 96.81% |
+
+Every chunk sits at 0.001-0.003 in both. The sparse path is at the floor.
+
+### 3a. Intermittent prefill corruption: HIP graph replay across prompt ubatches
+
+Floor matrix (`~/glm53-big/kl-floor.sh`, all dense unless noted, vs the dense ub128 base):
+
+| run | result |
+|---|---|
+| identical re-run of the base config (ub 128) | chunk 7 corrupted, KLD inf |
+| ub 129, fused indexer on / off | chunk 5 corrupted both times (PPL ~3600) |
+| ub 130 | chunk 10 corrupted |
+| sparse ub 128 / ub 129 | chunk 5 corrupted (mildly / fully) |
+| **ub 64** | **clean: mean KLD 0.009, max 0.87** |
+| **ub 128 with `GGML_CUDA_DISABLE_GRAPHS=1`** | **clean: mean KLD 0.009, max 4.2** |
+
+Prompt ubatches are captured as HIP graphs here (upstream no longer gates graphs on batch size). The cache key is
+shape-complete, so every prompt ubatch (a new n_kv) is a new key; the 64-entry LRU thrashes ("evicting LRU graph
+entry" floods the log) and entries are reused chunk to chunk. Four of six graph-enabled prefill runs corrupted one
+whole 4k-token chunk each; ub 64 (64 shapes per chunk, nothing is ever reused) and graphs-off never did.
+`GGML_CUDA_GRAPH_DIAG=1` (full node-property compare on every call instead of the uid shortcut) still corrupted a
+chunk (KLD 0.41), so the replayed instance matches every recorded property and is wrong anyway: the stale state is
+something a capture bakes in that the properties do not cover, most likely pool scratch allocated inside a kernel.
+The fix applied regardless is the gate upstream used to have: `GGML_CUDA_GRAPH_MAX_BATCH` (default 32 rows, read
+from the weight matmuls' activations) keeps decode and speculative-verify batches graphed and runs prompt batches
+eagerly. Flash production shares this graph code; its KL gates ran with single-ubatch 512-token chunks (graphs reused
+across all 100 chunks) without a catastrophe, but that is not a proof - worth a graphs-off KL comparison there.
 
 ## 4. Memory arithmetic for long context
 
@@ -100,8 +130,11 @@ halve the KV term.
 
 ## 5. Open items
 
-- Prefill: 62 t/s at 5.4k tokens on the test launcher (ub 128, without `LLAMA_PIPELINE_PARALLEL` /
-  `LLAMA_KV_PAD_PREFILL`); prod Flash runs 580-630 with them. Being measured.
+- Prefill is ~10x off: 62-64 t/s at ub 128, 54 t/s with pipeline parallelism forced on (`-ot` overrides disable
+  it unless `LLAMA_PIPELINE_PARALLEL=1`, llama-context.cpp) plus the 32k KV pad, 75 t/s at ub 256 (13.6k-token
+  prompt, 32k placement), ub 512 does not fit (4.5 GB prompt scratch on ROCm0). Reading every expert once per ubatch
+  bounds ub 128 at ~430 t/s, so the prompt path itself is slow, not the pipeline; the 256-expert MoE does take the
+  MMQ path for Q2_K/Q3_K on gfx908 (`n_experts > 64`). A rocprofv3 kernel profile of one prefill ubatch is queued.
 - q3_K experts are 1.6x slower per MoE block than q4_K on the MI100 (413 vs 253 us at the head's shape) despite fewer
   bytes; the 43 hot layers' gate/up are q3_K. The next decode lever after the attention fix.
 - The chunk-5 instability above.
