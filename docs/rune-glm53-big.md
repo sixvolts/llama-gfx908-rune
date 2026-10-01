@@ -134,7 +134,13 @@ halve the KV term.
   it unless `LLAMA_PIPELINE_PARALLEL=1`, llama-context.cpp) plus the 32k KV pad, 75 t/s at ub 256 (13.6k-token
   prompt, 32k placement), ub 512 does not fit (4.5 GB prompt scratch on ROCm0). Reading every expert once per ubatch
   bounds ub 128 at ~430 t/s, so the prompt path itself is slow, not the pipeline; the 256-expert MoE does take the
-  MMQ path for Q2_K/Q3_K on gfx908 (`n_experts > 64`). A rocprofv3 kernel profile of one prefill ubatch is queued.
+  MMQ path for Q2_K/Q3_K on gfx908 (`n_experts > 64`). rocprofv3 (2 x 2048 tokens, ub 256): kernel time 37 s per
+  4096 tokens, of which `mul_mat_q` Q2_K 40% (9.8 ms per 1 GB expert tensor, ~108 GB/s), Q3_K 26% (~184 GB/s),
+  Q4_K 8% (~380 GB/s), sparse attention 5%. At ~8 rows per expert the MMQ inner loop is VALU-bound on the K-quant
+  unpack, not bandwidth or MFMA. Levers, in order: a larger prompt ubatch (an expert's weights are unpacked once per
+  64-row tile, so ub 2048 is up to ~8x cheaper per token than ub 256, bounded by bandwidth) once the prompt scratch
+  is shrunk; a cheaper Q2_K/Q3_K unpack in MMQ (the same lever as Q3_K decode); requantizing the hot gate/up to
+  Q4_K (+~10 GB, no room today).
 - q3_K experts are 1.6x slower per MoE block than q4_K on the MI100 (413 vs 253 us at the head's shape) despite fewer
   bytes; the 43 hot layers' gate/up are q3_K. The next decode lever after the attention fix.
 - The chunk-5 instability above.

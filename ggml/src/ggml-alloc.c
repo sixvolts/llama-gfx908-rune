@@ -881,6 +881,40 @@ static bool ggml_gallocr_reserve_n_impl(
             }
         }
     }
+    // GGML_GALLOC_DEBUG>=2: the largest allocations of this graph per buffer (what a compute buffer's size is made of)
+    {
+        static int dbg2 = -1;
+        if (dbg2 < 0) { const char * e = getenv("GGML_GALLOC_DEBUG"); dbg2 = e ? atoi(e) : 0; }
+        if (dbg2 >= 2) {
+            for (int b = 0; b < galloc->n_buffers; b++) {
+                size_t top_sz[8] = {0};
+                const struct ggml_tensor * top_t[8] = {0};
+                for (int i = 0; i < graph->n_nodes; i++) {
+                    const struct node_alloc * na = &galloc->node_allocs[i];
+                    if (na->dst.buffer_id != b) {
+                        continue;
+                    }
+                    const size_t sz = na->dst.size_max;
+                    for (int k = 0; k < 8; k++) {
+                        if (sz > top_sz[k]) {
+                            for (int m = 7; m > k; m--) { top_sz[m] = top_sz[m-1]; top_t[m] = top_t[m-1]; }
+                            top_sz[k] = sz; top_t[k] = graph->nodes[i];
+                            break;
+                        }
+                    }
+                }
+                if (top_sz[0] == 0) {
+                    continue;
+                }
+                GGML_LOG_INFO("gallocr buffer %d (%s), %d nodes: largest allocations\n", b, ggml_backend_buft_name(galloc->bufts[b]), graph->n_nodes);
+                for (int k = 0; k < 8 && top_t[k]; k++) {
+                    const struct ggml_tensor * t = top_t[k];
+                    GGML_LOG_INFO("   %8.1f MiB  %-14s %-36s [%ld,%ld,%ld,%ld] %s\n", top_sz[k] / 1048576.0, ggml_op_name(t->op), t->name,
+                            (long) t->ne[0], (long) t->ne[1], (long) t->ne[2], (long) t->ne[3], ggml_type_name(t->type));
+                }
+            }
+        }
+    }
     if (galloc->n_leafs < graph->n_leafs) {
         free(galloc->leaf_allocs);
         galloc->leaf_allocs = calloc(graph->n_leafs, sizeof(galloc->leaf_allocs[0]));
