@@ -326,3 +326,51 @@ row-cost lever either.
   32.84 ms (two runs). The four latency-bound rows (40 dependent float2 loads per thread) become the critical path of a
   launch whose 320 Q8_0 blocks finish sooner, and nothing else can hide them inside one kernel. Reverted; the inject
   GEMV stays a separate launch. A bit-exact fold needs the row split across blocks, which changes the summation order.
+
+## 2026-10-01: MMQ pre-scaled int8 tiles for Q2_K / Q3_K (CDNA)
+
+Ground truth: a `rocprofv3` trace of GLM-5.3 745B (Q3_K_M e-waste quant) prefill at ubatch 256 had `mul_mat_q` at
+74% of kernel time, Q2_K 40% and Q3_K 26%: a 1 GB Q2_K expert tensor took 9.8 ms per call (~108 GB/s on a 1.2 TB/s
+card), Q3_K ~184 GB/s, Q4_K ~380. The MoE-block microbenchmark (`~/glm53-big/moebench`, gate+up+down, 256 experts,
+8 active, 6144<->2048) put Q2_K at 30.5 ms for 256 tokens against 15.7 ms for Q8_0 reading 3x the bytes, and 79.7 vs
+36.9 ms at 2048 tokens: neither bandwidth nor MFMA throughput, the K-quant path itself.
+
+Cause: on the MFMA path both types keep their 16-element sub-block scales as per-(row, block) factors next to the
+tile, so after every 16-wide MFMA step the int32 result is converted and scaled per element (LDS read, cvt, several
+FMAs per lane per MFMA), while Q8_0 scales once per 32 elements with a per-row factor. Q2_K adds a per-16 min term
+from the activation block sums.
+
+Change (`mmq.cuh`, `mmq-config-cdna.cuh`, `mmq-load-tiles.cuh`, `mmq-vec-dot.cuh`; CDNA only, other architectures
+keep the existing code):
+- The tile loaders fold the sub-block scale into the int8 weights. Q2_K: `sc_b*q` (<= 45), the 16 mins one byte
+  each after the weights, (d, dmin) per row. Q3_K: `sc_b*q` reaches +128 (sc = -32, q = -4), so the tile holds
+  `-sc_b*q` in [-128, 124], exact, and the row factor is -d. SRAM layouts `Q2_K_PS` (stride 76) and `Q3_K_PS` (68)
+  are smaller than the ones they replace (100, 84).
+- One dot for both (`ggml_cuda_mmq_vec_dot_ps_mma`): the Q8_0 MFMA structure, 32-element steps, the per-row factor
+  hoisted out of the K loop. Q2_K runs a second MFMA chain against the same activation tile with each weight replaced
+  by its block's min (a byte per (row, block), replicated into the operand in registers), so
+  `sum += dB*(d*C - dmin*Cm)` per step. Q2_K's activations use the `D2S6` layout: the scale per 64 elements sits in
+  entry 0 (.x / .y), not at `k01/8` - the first build read the block sums as scales.
+- Split prefetch loaders (`mmq_x_prefetch<Q2_K|Q3_K>`) so the next step's global loads overlap the MFMAs, as the
+  Q4_K/Q5_1/Q8_0 loaders have since the 09-15 campaign. This was the largest single step for Q2_K (-45% at 256
+  tokens): the dot change alone left the loader exposed.
+- Q3_K's unpack multiplies 4 signed bytes by -sc with two packed 16-bit multiplies (`v_pk_mul_lo_u16`): the byte
+  products are taken mod 256, so the unsigned byte values give the same low byte and no sign extension is needed.
+
+MoE block, ms per call at 256 / 512 / 1024 / 2048 tokens (MI100, `test-backend-ops` MUL_MAT and MUL_MAT_ID vs the
+CPU reference pass at every step):
+
+| | before | dot only | + prefetch | + packed unpack |
+|---|---|---|---|---|
+| Q2_K | 30.5 / 30.9 / 46.7 / 79.7 | 25.4 / 29.7 / 38.6 / 58.3 | 13.9 / 20.7 / 36.3 / 54.6 | 13.9 / 20.7 / 36.4 / 54.7 |
+| Q3_K | 21.8 / 25.1 / 34.0 / 53.9 | 23.2 / 25.4 / 31.0 / 48.6 | 19.8 / 21.7 / 27.9 / 43.9 | **16.7 / 19.1 / 25.3 / 39.9** |
+| Q8_0 (reference) | 15.7 / 17.4 / 23.4 / 36.7 | | | |
+
+Q2_K is now faster than Q8_0 at 256 tokens and within 1.5x at 2048 (its second MFMA chain); Q3_K is within 7-9% of
+Q8_0 at every size. Not done: the Q2_K min term as one K=16 MFMA per 64-element half on the activation block sums
+(int8 hi/lo split) would cut its MFMA count by ~17%.
+
+On the model (745B Q3_K_M, 10x MI100, sparse DSA attention, MTP n=2): KL gate against the dense ub128 base mean
+0.0098, max 1.09, every chunk at 0.001-0.003 (the floor); prefill at ubatch 512 93-104 -> 110-120 t/s, at ubatch
+1024 81-121 -> 113-136 t/s (5.4k and 13.6k-token prompts, 32k placement, no pipeline parallelism); decode 19.4 t/s
+and acceptance unchanged.

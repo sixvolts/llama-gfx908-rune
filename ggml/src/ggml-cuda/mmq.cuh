@@ -128,6 +128,10 @@ enum ggml_cuda_mmq_sram_layout {
     GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1,
     GGML_CUDA_MMQ_SRAM_LAYOUT_Q2_K,
     GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K,
+    // CDNA pre-scaled int8 tiles (mmq-load-tiles.cuh ggml_cuda_mmq_load_tiles_q{2,3}_K_ps): 2*MMQ_TILE_NE_K ints of
+    // sc*q (Q2_K) / -sc*q (Q3_K), then 4 ints of per-block mins (Q2_K only), then the per-row (d[, dmin]) floats
+    GGML_CUDA_MMQ_SRAM_LAYOUT_Q2_K_PS,
+    GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K_PS,
     GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K,
     GGML_CUDA_MMQ_SRAM_LAYOUT_FP4,   // MXFP4 and NVFP4 on Blackwell.
     GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4, // Generic NVFP4
@@ -143,6 +147,10 @@ static constexpr __host__ __device__ int ggml_cuda_mmq_get_sram_stride(ggml_cuda
             return 2*MMQ_TILE_NE_K + MMQ_TILE_NE_K         + 4;
         case GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K:
             return 2*MMQ_TILE_NE_K + MMQ_TILE_NE_K/2       + 4;
+        case GGML_CUDA_MMQ_SRAM_LAYOUT_Q2_K_PS:
+            return 2*MMQ_TILE_NE_K + 4 + 2                 + 6;
+        case GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K_PS:
+            return 2*MMQ_TILE_NE_K + 2                     + 2;
         case GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K:
             return 2*MMQ_TILE_NE_K + MMQ_TILE_NE_K/QI6_K   + MMQ_TILE_NE_K/8 + 7;
         case GGML_CUDA_MMQ_SRAM_LAYOUT_FP4:
@@ -158,6 +166,8 @@ static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0)  % 8
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1)  % 8 == 4, "Wrong padding.");
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q2_K)  % 8 == 4, "Wrong padding.");
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K)  % 8 == 4, "Wrong padding.");
+static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q2_K_PS) % 8 == 4, "Wrong padding.");
+static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K_PS) % 8 == 4, "Wrong padding.");
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K)  % 8 == 4, "Wrong padding.");
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_FP4)   % 8 == 4, "Wrong padding.");
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4) % 8 == 4, "Wrong padding.");
@@ -776,6 +786,22 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
 // ---------------------------------------------------------------------------------------------
+#if defined(AMD_MFMA_AVAILABLE)
+        // pre-scaled int8 tiles: the 16-element sub-block scales are folded into the tile at load time, so the MFMA
+        // chain and the epilogue run per 32 elements like Q8_0 instead of per 16 (see mmq-vec-dot.cuh)
+        case GGML_TYPE_Q2_K:
+            return ggml_cuda_mmq_util_funcs(
+                -1,
+                ggml_cuda_mmq_load_tiles_q2_K_ps<type, J, fallback>,
+                ggml_cuda_mmq_vec_dot_ps_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D2S6, true>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback>);
+        case GGML_TYPE_Q3_K:
+            return ggml_cuda_mmq_util_funcs(
+                -1,
+                ggml_cuda_mmq_load_tiles_q3_K_ps<type, J, fallback>,
+                ggml_cuda_mmq_vec_dot_ps_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4, false>,
+                ggml_cuda_mmq_write_back_mma<type, J, fallback>);
+#else
         case GGML_TYPE_Q2_K:
             return ggml_cuda_mmq_util_funcs(
                 -1,
@@ -788,6 +814,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 ggml_cuda_mmq_load_tiles_q3_K<type, J, fallback>,
                 ggml_cuda_mmq_vec_dot_q8_0_16_q8_1_mma<type, J, fallback>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
+#endif // defined(AMD_MFMA_AVAILABLE)
         case GGML_TYPE_Q4_K:
             return ggml_cuda_mmq_util_funcs(
                 -1,
