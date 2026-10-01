@@ -1861,6 +1861,31 @@ void llama_kv_cache::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch 
     }
 }
 
+void llama_kv_cache::set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+    GGML_ASSERT(dst->type == GGML_TYPE_F32);
+
+    const int64_t  n_kv     = dst->ne[0];
+    const int64_t  n_stream = dst->ne[3];
+    const uint32_t n_tokens = ubatch->n_tokens;
+
+    GGML_ASSERT(n_tokens % n_stream == 0);
+
+    const int64_t n_tps = n_tokens/n_stream;
+
+    float * data = (float *) dst->data;
+
+    for (int64_t s = 0; s < n_stream; ++s) {
+        const auto & cells = v_cells[seq_to_stream[ubatch->seq_id[s*n_tps][0]]];
+
+        GGML_ASSERT((uint32_t) n_kv <= cells.size());
+
+        for (int64_t j = 0; j < n_kv; ++j) {
+            data[s*n_kv + j] = cells.is_empty(j) ? 1e9f : (float) cells.pos_get(j);
+        }
+    }
+}
+
 void llama_kv_cache::set_input_k_rot(ggml_tensor * dst) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
 
@@ -2868,6 +2893,10 @@ void llama_kv_cache_context::set_input_v_idxs(ggml_tensor * dst, const llama_uba
 
 void llama_kv_cache_context::set_input_kq_mask(ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const {
     kv->set_input_kq_mask(dst, ubatch, causal_attn);
+}
+
+void llama_kv_cache_context::set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ubatch) const {
+    kv->set_input_kv_pos(dst, ubatch);
 }
 
 void llama_kv_cache_context::set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const {

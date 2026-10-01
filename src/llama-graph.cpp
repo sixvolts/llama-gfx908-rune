@@ -567,7 +567,19 @@ bool llm_graph_input_attn_kv_msa::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_attn_k_dsa::set_input(const llama_ubatch * ubatch) {
     mctx->get_mla()->set_input_k_idxs(self_k_idxs_mla, ubatch);
 
-    mctx->get_mla()->set_input_kq_mask(self_kq_mask_mla, ubatch, cparams.causal_attn);
+    if (self_kq_mask_mla) {
+        mctx->get_mla()->set_input_kq_mask(self_kq_mask_mla, ubatch, cparams.causal_attn);
+    } else {
+        mctx->get_mla()->set_input_kv_pos(self_kv_pos_mla, ubatch);
+
+        GGML_ASSERT(ggml_backend_buffer_is_host(self_q_pos_mla->buffer));
+        GGML_ASSERT((uint32_t) ggml_nelements(self_q_pos_mla) == ubatch->n_tokens);
+
+        float * qp = (float *) self_q_pos_mla->data;
+        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+            qp[i] = (float) ubatch->pos[i];
+        }
+    }
 
     mctx->get_lid()->set_input_k_idxs(self_k_idxs_lid, ubatch);
 
@@ -591,7 +603,14 @@ bool llm_graph_input_attn_k_dsa::can_reuse_impl(const llm_graph_params & params)
     res &= self_k_idxs_mla->ne[0] == params.ubatch.n_tokens;
     res &= self_k_idxs_lid->ne[0] == params.ubatch.n_tokens;
 
-    res &= can_reuse_kq_mask(self_kq_mask_mla, mctx->get_mla(), params.ubatch, params.cparams);
+    if (self_kq_mask_mla) {
+        res &= can_reuse_kq_mask(self_kq_mask_mla, mctx->get_mla(), params.ubatch, params.cparams);
+    } else {
+        const int64_t n_stream = params.cparams.kv_unified ? 1 : params.ubatch.n_seqs_unq;
+        res &= self_kv_pos_mla->ne[0] == (int64_t) mctx->get_mla()->get_n_kv();
+        res &= self_kv_pos_mla->ne[3] == n_stream;
+        res &= self_q_pos_mla->ne[2] == n_stream && self_q_pos_mla->ne[1]*n_stream == (int64_t) params.ubatch.n_tokens;
+    }
     res &= can_reuse_kq_mask(self_kq_mask_lid, mctx->get_lid(), params.ubatch, params.cparams);
 
     return res;
@@ -3315,8 +3334,21 @@ static std::unique_ptr<llm_graph_input_attn_k_dsa> build_attn_inp_k_dsa_impl(
     {
         inp->self_k_idxs_mla = mctx_cur->get_mla()->build_input_k_idxs(ctx0, ubatch);
 
-        inp->self_kq_mask_mla = build_attn_inp_kq_mask(ctx0, mctx_cur->get_mla(), ubatch, cparams);
-        inp->self_kq_mask_mla_cnv = inp->self_kq_mask_mla;
+        // LLAMA_DSA_SPARSE, one sequence per stream, causal, no SWA: cell positions instead of the n_kv x n_batch mask
+        if (llama_kpool_sparse_attn() && !cparams.kv_unified && cparams.causal_attn && hparams.swa_type == LLAMA_SWA_TYPE_NONE &&
+                hparams.n_pos_per_embd() == 1) {
+            const auto n_kv     = mctx_cur->get_mla()->get_n_kv();
+            const auto n_stream = ubatch.n_seqs_unq;
+
+            inp->self_kv_pos_mla = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv, 1, 1, n_stream);
+            ggml_set_input(inp->self_kv_pos_mla);
+
+            inp->self_q_pos_mla = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, ubatch.n_tokens/n_stream, n_stream);
+            ggml_set_input(inp->self_q_pos_mla);
+        } else {
+            inp->self_kq_mask_mla = build_attn_inp_kq_mask(ctx0, mctx_cur->get_mla(), ubatch, cparams);
+            inp->self_kq_mask_mla_cnv = inp->self_kq_mask_mla;
+        }
     }
 
     {
@@ -3945,8 +3977,6 @@ ggml_tensor * llm_graph_context::build_attn_sparse_topk(
     // the ubatch's own keys are stored first: the gather reads them back
     ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, inp->get_k_idxs_mla(), il));
 
-    const auto & kq_mask = inp->get_kq_mask_mla(); // [n_kv, n_tps, 1, n_stream]
-
     ggml_tensor * k = mctx_cur->get_k(ctx0, il); // [D, 1, n_kv, n_stream]
 
     GGML_ASSERT(k->ne[1] == 1 && "sparse top-k attention is MQA (one KV head)");
@@ -3963,19 +3993,36 @@ ggml_tensor * llm_graph_context::build_attn_sparse_topk(
     GGML_ASSERT(n_tps*n_stream == n_toks);
     GGML_ASSERT(top_k->type == GGML_TYPE_I32 && ggml_is_contiguous(top_k));
     GGML_ASSERT(top_k->ne[1] == n_tps && top_k->ne[2]*top_k->ne[3] == n_stream);
-    GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream);
 
     const int64_t n_sel = top_k->ne[0];
 
     ggml_tensor * idx = ggml_reshape_3d(ctx0, top_k, n_sel, n_tps, n_stream); // I32 [n_sel, n_tps, n_stream]
 
-    // load bearing as in build_attn_sparse: the KQ mask at every listed cell keeps an empty, future or
-    // foreign-sequence cell masked whatever the list says (top-k fills its slots from -INFINITY scores too)
-    ggml_tensor * mask;
-    {
-        ggml_tensor * kqm = ggml_view_4d(ctx0, kq_mask, 1, n_kv, n_tps, n_stream,
-                ggml_element_size(kq_mask), kq_mask->nb[1], kq_mask->nb[3], 0);
-        kqm  = ggml_get_rows(ctx0, kqm, idx); // F32 [1, n_sel, n_tps, n_stream]
+    // load bearing as in build_attn_sparse: an empty, future or foreign-sequence cell stays masked whatever the
+    // list says (top-k fills its slots from -INFINITY scores too). The views below are created once per graph: a
+    // view per layer would give every layer's split its own scheduler copy of the input.
+    ggml_tensor * mask = nullptr;
+    if (inp->self_kv_pos_mla) {
+        // from cell positions: a listed cell is masked when it is empty (position 1e9) or after the query. The 2-D
+        // index keeps the gather on the [n_kv]-row input itself, so the scheduler copies n_kv floats per device,
+        // not an n_kv x n_tps mask. -1e30 instead of -INFINITY: finite, exp() underflows to 0 all the same.
+        GGML_ASSERT(inp->self_kv_pos_mla->ne[0] == n_kv && inp->self_kv_pos_mla->ne[3] == n_stream);
+        GGML_ASSERT(inp->self_q_pos_mla->ne[1] == n_tps && inp->self_q_pos_mla->ne[2] == n_stream);
+        if (!inp->self_kv_pos_mla_rows) {
+            inp->self_kv_pos_mla_rows = ggml_reshape_4d(ctx0, inp->self_kv_pos_mla, 1, n_kv, 1, n_stream);
+        }
+        ggml_tensor * cp = ggml_get_rows(ctx0, inp->self_kv_pos_mla_rows, ggml_reshape_3d(ctx0, idx, n_sel*n_tps, 1, n_stream));
+        cp = ggml_reshape_3d(ctx0, cp, n_sel, n_tps, n_stream);                // F32 cell positions per listed slot
+        ggml_tensor * d = ggml_sub(ctx0, cp, inp->self_q_pos_mla);              // cell pos - query pos, > 0: masked
+        mask = ggml_scale(ctx0, ggml_step(ctx0, d), -1e30f);
+    } else {
+        const auto & kq_mask = inp->get_kq_mask_mla(); // [n_kv, n_tps, 1, n_stream]
+        GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream);
+        if (!inp->self_kq_mask_mla_col) {
+            inp->self_kq_mask_mla_col = ggml_view_4d(ctx0, kq_mask, 1, n_kv, n_tps, n_stream,
+                    ggml_element_size(kq_mask), kq_mask->nb[1], kq_mask->nb[3], 0);
+        }
+        ggml_tensor * kqm = ggml_get_rows(ctx0, inp->self_kq_mask_mla_col, idx); // F32 [1, n_sel, n_tps, n_stream]
         mask = ggml_reshape_3d(ctx0, kqm, n_sel, n_tps, n_stream);
     }
     cb(mask, "sparse_mask", il);

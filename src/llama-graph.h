@@ -430,6 +430,14 @@ public:
     ggml_tensor * self_kq_mask_lid     = nullptr; // F32     [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_lid_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
+    // LLAMA_DSA_SPARSE with one sequence per stream: cell positions replace the n_kv x n_batch MLA mask, which is
+    // then not built (self_kq_mask_mla == nullptr); build_attn_sparse_topk derives each listed cell's mask from them
+    ggml_tensor * self_kv_pos_mla = nullptr; // F32 [n_kv, 1, 1, n_stream], 1e9 = empty cell
+    ggml_tensor * self_q_pos_mla  = nullptr; // F32 [1, n_batch/n_stream, n_stream]
+    // per-graph views of the inputs above, created once so that every layer's split shares one scheduler copy
+    ggml_tensor * self_kv_pos_mla_rows = nullptr; // [1, n_kv, 1, n_stream]
+    ggml_tensor * self_kq_mask_mla_col = nullptr; // [1, n_kv, n_batch/n_stream, n_stream]
+
     ggml_tensor * self_k_rot_lid = nullptr;
 
     const llama_hparams hparams;

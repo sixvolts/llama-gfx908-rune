@@ -239,6 +239,10 @@ public:
 
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    // F32 [n_kv, 1, 1, n_stream]: every cell's position, 1e9 for an empty cell. The sparse top-k attention derives a
+    // listed cell's mask from it (empty or after the query -> masked) instead of an n_kv x n_batch KQ mask; valid when
+    // a stream holds one sequence (non-unified KV), attention is causal and there is no SWA
+    void set_input_kv_pos    (ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
@@ -447,6 +451,7 @@ public:
     void set_input_k_shift   (ggml_tensor * dst) const;
     void set_input_kq_mask   (ggml_tensor * dst, const llama_ubatch * ubatch, bool causal_attn) const;
     void set_input_pos_bucket(ggml_tensor * dst, const llama_ubatch * ubatch) const;
+    void set_input_kv_pos    (ggml_tensor * dst, const llama_ubatch * ubatch) const;
 
     void set_input_k_rot(ggml_tensor * dst) const;
     void set_input_v_rot(ggml_tensor * dst) const;
