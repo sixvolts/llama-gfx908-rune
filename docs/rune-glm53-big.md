@@ -128,6 +128,17 @@ f32 KQ masks and indexer scores scale with n_kv x n_ubatch, and ROCm0 hosts five
 128k is out of reach for the 745B on 10 x 32 GB with an f16 K cache; a q8_0 K-cache variant of the fused kernel would
 halve the KV term.
 
+What the prompt scratch is (`GGML_GALLOC_DEBUG=2`): at 128k/ub512 the largest allocations on every card are copies
+of the n_kv-wide f32 KQ mask input, [131072 x 512] = 256 MiB each, one per scheduler split on that device (eight on
+ROCm0: every expert tensor placed off its home adds a round trip and so two more splits, each with its own copy).
+At ub 128 the same eight copies are 64 MiB each, most of ROCm0's 915 MiB. At 32k/ub2048 the MoE intermediates
+dominate instead, `ffn_moe_down` / `ffn_moe_weighted` [6144 x 8 x 2048] f32 = 384 MiB each, ~4.3 GB on ROCm0.
+Fixes, in order: a position-based per-cell mask for the sparse path (gather the listed cells' positions and compare
+with the query's; an empty cell gets a sentinel), which removes the n_kv x n_ubatch MLA mask input altogether; one
+input copy per device per graph in the scheduler instead of one per split; the indexer's own n_kv-wide mask stays
+(its kernel takes it) and can go to f16; for ub 1024-2048 prefill, fuse the down-projection with the weighted
+reduction so the [6144 x 8 x n] intermediate never exists.
+
 ## 5. Open items
 
 - Prefill is ~10x off: 62-64 t/s at ub 128, 54 t/s with pipeline parallelism forced on (`-ot` overrides disable
