@@ -139,6 +139,21 @@ input copy per device per graph in the scheduler instead of one per split; the i
 (its kernel takes it) and can go to f16; for ub 1024-2048 prefill, fuse the down-projection with the weighted
 reduction so the [6144 x 8 x n] intermediate never exists.
 
+### 4a. After the position-based mask
+
+The n_kv x n_ubatch MLA mask is gone from the sparse path (cell positions, one 512 KB input at 128k) and the gather's
+views are created once per graph. 128k at ubatch 512 then loads with 0.6-0.75 GB of scratch per card (the fused
+indexer's f32 score tensor, 256 MiB per full-indexer layer, transient), 0.15-0.32 GB at ubatch 128. With the sparse
+drafter, **112k single-slot fits with no CPU spill** (placement at reserve 900 MiB: all ten cards at 31.6-32.6 GB,
+135-290 MiB of scratch): 16.6 t/s on a 5k-token prompt, 15.5 t/s at 31.6k, acceptance 0.79-0.83. 128k + drafter is
+still ~1 GB short at any workable reserve; a q8_0 K cache would be the next lever (the gather reference path already
+takes a quantized cache, the fused kernel is f16-only).
+
+Pipeline parallelism costs memory on this layout: with `LLAMA_PIPELINE_PARALLEL=1` the scheduler reports 184 splits
+(every expert tensor off its home is a round trip) and keeps overlapping splits' intermediates live, so a 32k/512
+prompt graph that needs 0.35 GB per card without it asks for 2 GB with it - and it brought no prefill gain here (54
+vs 64 t/s), since the expert GEMMs, not inter-card transfers, are the bound. The 745B runs without it.
+
 ## 5. Open items
 
 - Prefill is ~10x off: 62-64 t/s at ub 128, 54 t/s with pipeline parallelism forced on (`-ot` overrides disable
