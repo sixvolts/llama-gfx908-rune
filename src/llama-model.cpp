@@ -12,6 +12,7 @@
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa.h"
 #include "llama-kv-cache-dsa-iswa.h"
+#include "llama-kv-cache-kpool.h"
 #include "llama-kv-cache-msa.h"
 #include "llama-kv-cache-dsv4.h"
 #include "llama-memory-hybrid.h"
@@ -2297,7 +2298,31 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
         case LLM_ARCH_GLM_DSA:
         case LLM_ARCH_DEEPSEEK32:
             {
-                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hparams.n_layer_nextn > 0) {
+                if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hparams.n_layer_nextn > 0 &&
+                    arch == LLM_ARCH_GLM_DSA && llama_kpool_sparse_attn_mtp() && layers[hparams.n_layer()].indexer_attn_k) {
+                    // LLAMA_DSA_SPARSE and the NextN block ships its own lightning indexer (GLM-5.2/5.3): the draft
+                    // head attends its top-k cells like the trunk, so its context gets the DSA cache (MLA latents +
+                    // indexer keys) for the nextn layer(s). A draft only proposes; the trunk's verification keeps the
+                    // output distribution exact, so this changes acceptance at most, not results.
+                    llama_kv_cache::layer_filter_cb filter =
+                        [&](uint32_t il) { return il >= hparams.n_layer(); };
+
+                    res = new llama_kv_cache_dsa(
+                            *this,
+                            params.type_k,
+                            params.type_v,
+                            !cparams.flash_attn,
+                            cparams.offload_kqv,
+                            cparams.kv_unified,
+                            cparams.n_ctx_seq,
+                            cparams.n_seq_max,
+                            1,
+                            hparams.n_swa,
+                            hparams.swa_type,
+                            filter,
+                            filter,
+                            nullptr);
+                } else if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && hparams.n_layer_nextn > 0) {
                     // The NextN/MTP draft head runs dense MLA (no DSA indexer), so the
                     // MTP context uses a plain attention KV cache holding only the
                     // nextn layer(s) - same pattern as the hybrid Qwen3.5 MTP context.

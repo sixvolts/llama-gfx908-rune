@@ -310,9 +310,10 @@ bool ggml_cuda_sparse_attn_supported(int device, const ggml_tensor * dst) {
     if (q->type != GGML_TYPE_F32 || k->type != GGML_TYPE_F16 || idx->type != GGML_TYPE_I32 || mask->type != GGML_TYPE_F32) {
         return false;
     }
-    // instantiated for the GLM-5.3 DSA shape only: 512-wide latent rows, heads in groups of 16
+    // instantiated for the GLM DSA shapes: a 512-wide latent V row, K = latent (Flash) or latent + 64 rope (GLM-5.2/5.3
+    // absorbed MLA, 576), heads in groups of 16
     const int64_t D_v = dst->ne[0];
-    if (q->ne[0] != 512 || D_v != 512 || q->ne[1] % SA_HEADS != 0) {
+    if ((q->ne[0] != 512 && q->ne[0] != 576) || D_v != 512 || q->ne[1] % SA_HEADS != 0) {
         return false;
     }
     // 16-byte row loads and float4 Q loads
@@ -322,18 +323,30 @@ bool ggml_cuda_sparse_attn_supported(int device, const ggml_tensor * dst) {
     return ggml_is_contiguous(idx) && ggml_is_contiguous(mask) && ggml_is_contiguous(dst);
 }
 
+template <int D, int DV>
+static void ggml_cuda_sparse_attn_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
+
 void ggml_cuda_sparse_attn(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
-    const ggml_tensor * q    = dst->src[0];
-    const ggml_tensor * k    = dst->src[1];
-    const ggml_tensor * idx  = dst->src[2];
-    const ggml_tensor * mask = dst->src[3];
+    const ggml_tensor * q = dst->src[0];
+    const ggml_tensor * k = dst->src[1];
 
     GGML_ASSERT(ggml_cuda_sparse_attn_supported(ctx.device, dst));
     // the kernel reads K rows and Q with 16-byte loads: a cache view at a row offset and a compute buffer both are
     GGML_ASSERT(((uintptr_t) k->data) % 16 == 0 && ((uintptr_t) q->data) % 16 == 0);
 
-    constexpr int D  = 512;
-    constexpr int DV = 512;
+    if (q->ne[0] == 576) {
+        ggml_cuda_sparse_attn_launch<576, 512>(ctx, dst);
+    } else {
+        ggml_cuda_sparse_attn_launch<512, 512>(ctx, dst);
+    }
+}
+
+template <int D, int DV>
+static void ggml_cuda_sparse_attn_launch(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * q    = dst->src[0];
+    const ggml_tensor * k    = dst->src[1];
+    const ggml_tensor * idx  = dst->src[2];
+    const ggml_tensor * mask = dst->src[3];
 
     const float scale  = ggml_get_op_params_f32(dst, 0);
     const int   n_head = q->ne[1];

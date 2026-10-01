@@ -25,6 +25,9 @@ uint32_t llama_kpool_select_k(uint32_t n_pools, uint32_t indexer_top_k, uint32_t
 // Read once; 0 when unset.
 int llama_kpool_sparse_attn_mode();
 bool llama_kpool_sparse_attn();
+// the NextN/MTP draft context's own switch: LLAMA_MTP_DSA_SPARSE=0 keeps the draft head dense while the trunk is
+// sparse (A/B of the draft's own indexer); unset, it follows LLAMA_DSA_SPARSE
+bool llama_kpool_sparse_attn_mtp();
 
 // `kv` must be the ATTENTION (MLA) cache; the indexer cache shares its slot layout.
 //   pool_cells  pool member -> cell, 0 if not resident

@@ -11582,6 +11582,7 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         for (int64_t nq : { 1, 3, 64 }) {
             for (int64_t ns : { 1, 2 }) {
                 test_cases.emplace_back(new test_sparse_attn(512, 512, 64, 4096, n_sel, nq, ns));
+                test_cases.emplace_back(new test_sparse_attn(576, 512, 64, 4096, n_sel, nq, ns)); // GLM-5.2/5.3 absorbed MLA
             }
         }
     }

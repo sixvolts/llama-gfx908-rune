@@ -37,6 +37,14 @@ bool llama_kpool_sparse_attn() {
     return llama_kpool_sparse_attn_mode() != 0;
 }
 
+bool llama_kpool_sparse_attn_mtp() {
+    static const bool v = [] {
+        const char * e = getenv("LLAMA_MTP_DSA_SPARSE");
+        return llama_kpool_sparse_attn() && (e == nullptr || atoi(e) != 0);
+    }();
+    return v;
+}
+
 // sel_mask and cand_mask hold only 0.0f and -INFINITY, so f16 is exact here
 template <typename T> struct kpool_mask_of;
 

@@ -1405,6 +1405,23 @@ struct llm_graph_context {
                   float   kq_scale,
                     int   il) const;
 
+    // LLAMA_DSA_SPARSE for the per-token lightning indexer (GLM-5.2/5.3 glm-dsa): each query attends only the
+    // n_top_k cells its indexer selected, gathered from the MLA cache, instead of build_attn(llm_graph_input_attn_k_dsa)'s
+    // dense KQ over every cell behind an n_kv-wide mask. The KQ mask is looked up at the listed cells, so a slot that
+    // top-k filled from a masked (-INFINITY) score stays masked.
+    ggml_tensor * build_attn_sparse_topk(
+            llm_graph_input_attn_k_dsa * inp,
+            ggml_tensor * wo,
+            ggml_tensor * wo_b,
+            ggml_tensor * wo_s,
+            ggml_tensor * q_cur,      // [n_embd_head_k, n_head_q, n_tokens]
+            ggml_tensor * k_cur,      // [n_embd_head_k, 1, n_tokens]
+            ggml_tensor * v_cur,      // [n_embd_head_v, 1, n_tokens], the first n_embd_head_v values of the K rows
+            ggml_tensor * v_mla,      // [n_embd_head_v, n_embd_head_v_mla, n_head_q]
+            ggml_tensor * top_k,      // I32 [n_top_k, n_tps, 1, n_stream] cells selected by the indexer
+                  float   kq_scale,
+                    int   il) const;
+
     //
     // pooling
     //
