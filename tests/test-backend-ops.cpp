@@ -11597,6 +11597,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
 
+    // GLM-5.3 745B sparse DSA attention at decode, verify and prefill widths (32k cache, 2048 selected cells)
+    for (int64_t nq : { 1, 3, 256, 1024 }) {
+        test_cases.emplace_back(new test_sparse_attn(576, 512, 64, 32768, 2048, nq, 1));
+    }
+    // its per-cell position gather: 1-element rows, 2048 cells x 1024 queries out of a 32k-cell table
+    test_cases.emplace_back(new test_get_rows(GGML_TYPE_F32, 1, 32768, 2048*1024, 1, 1));
+
     // halo-hybrid: the fused hyper-connection prologue at decode widths
     for (int64_t nt : {1, 3}) {
         test_cases.emplace_back(new test_dsv4_hc_mix(GGML_TYPE_Q8_0, 4096, nt, 4));

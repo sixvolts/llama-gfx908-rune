@@ -786,7 +786,7 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
                 ggml_cuda_mmq_vec_dot_q8_0_q8_1_mma<type, J, fallback, MMQ_Q8_1_DS_LAYOUT_D4>,
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
 // ---------------------------------------------------------------------------------------------
-#if defined(AMD_MFMA_AVAILABLE)
+#if defined(AMD_MFMA_AVAILABLE) && !defined(GGML_CUDA_NO_MMQ_PS)
         // pre-scaled int8 tiles: the 16-element sub-block scales are folded into the tile at load time, so the MFMA
         // chain and the epilogue run per 32 elements like Q8_0 instead of per 16 (see mmq-vec-dot.cuh)
         case GGML_TYPE_Q2_K:

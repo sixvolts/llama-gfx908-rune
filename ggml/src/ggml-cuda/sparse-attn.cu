@@ -56,10 +56,13 @@ static __global__ void sparse_attn_mfma(
     const int l16  = lane % 16;
     const int g    = lane / 16;
 
-    const int tok   = blockIdx.x; // s*n_q + t
+    // head group fastest: the n_head/SA_HEADS blocks of one query gather the same K rows, so launched back to back
+    // they hit L2 instead of each re-reading the cache (prefill: 4x the HBM traffic otherwise)
+    const int n_hg  = n_head/SA_HEADS;
+    const int tok   = blockIdx.x / n_hg; // s*n_q + t
     const int s     = tok / n_q;
     const int t     = tok % n_q;
-    const int h0    = blockIdx.y*SA_HEADS;
+    const int h0    = (blockIdx.x % n_hg)*SA_HEADS;
     const int split = blockIdx.z;
 
     const int32_t * idx_row  = idx  + (int64_t) tok*n_sel;
@@ -242,7 +245,7 @@ static __global__ void sparse_attn_mfma(
             }
         }
     } else {
-        const int64_t n_rows = (int64_t) gridDim.x*n_head;
+        const int64_t n_rows = (int64_t) (gridDim.x/n_hg)*n_head;
         float * po = part_o + (int64_t) split*n_rows*DV;
 #pragma unroll
         for (int v = 0; v < 4; ++v) {
@@ -368,7 +371,7 @@ static void ggml_cuda_sparse_attn_launch(ggml_backend_cuda_context & ctx, ggml_t
 
     cudaStream_t stream = ctx.stream();
 
-    const dim3 grid(n_tok, n_hg, n_split);
+    const dim3 grid(n_tok*n_hg, 1, n_split); // head group fastest, see the kernel
     const dim3 block(SA_NW*64, 1, 1);
 
     if (n_split == 1) {
