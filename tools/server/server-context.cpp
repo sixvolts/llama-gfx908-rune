@@ -56,6 +56,31 @@ static common_speculative_output_limits server_output_limits(const common_params
     return result;
 }
 
+// a checkpoint restore dropped tokens the target had accepted - re-accept them rather than verify again
+static std::vector<llama_token> server_accept_replay(
+        common_sampler * smpl,
+        llama_context * ctx,
+        const std::vector<int32_t> & idxs,
+        const llama_tokens & draft) {
+    GGML_ASSERT(idxs.size() == draft.size() + 1);
+
+    std::vector<llama_token> result;
+    result.reserve(idxs.size());
+
+    for (size_t i = 0; i < draft.size(); ++i) {
+        // the token is discarded - the call is what advances the sampler over this position
+        common_sampler_sample(smpl, ctx, idxs[i]);
+        common_sampler_accept(smpl, draft[i], true);
+        result.push_back(draft[i]);
+    }
+
+    const llama_token id = common_sampler_sample(smpl, ctx, idxs[draft.size()]);
+    common_sampler_accept(smpl, id, true);
+    result.push_back(id);
+
+    return result;
+}
+
 // synthetic draft verification for benchmarking - accept draft tokens at random instead of by match with the target
 // on replay the draft was already accepted before a context checkpoint restore, so repeat the same decisions
 static std::vector<llama_token> server_sample_and_accept_synth(
@@ -91,29 +116,6 @@ static std::vector<llama_token> server_sample_and_accept_synth(
         common_sampler_accept(smpl, id, true);
         result.push_back(id);
         return result;
-    }
-
-    const llama_token id = common_sampler_sample(smpl, ctx, idxs[draft.size()]);
-    common_sampler_accept(smpl, id, true);
-    result.push_back(id);
-
-    return result;
-}
-
-// the replay after a checkpoint restore of a draft that lossless speculative sampling verified: the replayed tokens
-// are committed output that RS chose (the target's own sample need not reproduce them, so the compare path would cut
-// the replay short), so accept them as-is and sample only the bonus token from the target
-static std::vector<llama_token> server_accept_replay(
-        common_sampler * smpl,
-        llama_context * ctx,
-        const std::vector<int32_t> & idxs,
-        const llama_tokens & draft) {
-    GGML_ASSERT(idxs.size() == draft.size() + 1);
-
-    std::vector<llama_token> result(draft.begin(), draft.end());
-    result.reserve(idxs.size());
-    for (const llama_token t : draft) {
-        common_sampler_accept(smpl, t, true);
     }
 
     const llama_token id = common_sampler_sample(smpl, ctx, idxs[draft.size()]);
@@ -328,6 +330,9 @@ struct server_slot {
     common_speculative * spec;
 
     llama_tokens spec_draft;
+
+    // draft candidates per token in spec_draft; only draft-simple and draft-mtp fill it
+    std::vector<std::vector<llama_token_data>> spec_draft_q;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
@@ -362,13 +367,6 @@ struct server_slot {
     }
     std::mt19937 spec_synth_rng;
 
-    // lossless speculative sampling (on by default, LLAMA_SPEC_RS=0 disables): the drafter's distribution for each
-    // token of spec_draft (filled by the drafter when the task samples at temperature > 0) and the acceptance rng
-    std::vector<std::vector<llama_token_data>> spec_draft_q;
-    uint32_t spec_rs_rng     = 0x9E3779B9u; // acceptance draws (common_rs_seed stream 1 of the request seed)
-    uint32_t spec_rs_rng_dft = 0x2545F491u; // draft draws (stream 2)
-    bool     spec_rs_ok      = false;       // the target samples on the host (no backend sampler), so RS can verify
-    bool     spec_rs_replay  = false;       // the pending replay re-decodes tokens that RS emitted: accept them as-is
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -496,7 +494,6 @@ struct server_slot {
         SLT_DBG(*this, "%s", "\n");
 
         spec_is_replay = false;
-        spec_rs_replay = false;
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -597,6 +594,12 @@ struct server_slot {
 
     bool can_speculate() const {
         return !!spec;
+    }
+
+    // at temp 0 both p and q are point masses, so rejection is the same as sample-and-match
+    // at temp 0 both p and q are point masses, so rejection is the same as sample-and-match
+    bool use_spec_rejection() const {
+        return task && task->params.sampling.temp > 0.0f;
     }
 
     void add_token(const completion_token_output & token) {
@@ -2240,13 +2243,6 @@ private:
                     : task.params.sampling.seed;
                 slot.spec_synth_rng.seed(seed);
             }
-            if (spec) {
-                // the chain's resolved seed (a random one for LLAMA_DEFAULT_SEED), mixed into two independent streams
-                const uint32_t seed = common_sampler_get_seed(slot.smpl.get());
-                slot.spec_rs_rng     = common_rs_seed(seed, 1);
-                slot.spec_rs_rng_dft = common_rs_seed(seed, 2);
-                slot.spec_rs_ok      = !use_backend_sampling;
-            }
         } else {
             slot.smpl.reset();
         }
@@ -3596,6 +3592,9 @@ private:
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
 
+                    // stale candidates: a replay never reads them, a new draft refills them
+                    slot.spec_draft_q.clear();
+
                     if (!slot.spec_draft.empty()) {
                         // we have a previous (partial) draft to reuse
                         if (use_ckpt_tgt) {
@@ -3615,6 +3614,8 @@ private:
 
                         slot.spec_prompt = slot.prompt.tokens.get_text_tokens();
 
+                        const bool spec_reject = slot.use_spec_rejection();
+
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
                             /* .n_max    = */ n_draft_max,
@@ -3622,27 +3623,10 @@ private:
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
+                            /* .result_q = */ spec_reject ? &slot.spec_draft_q : nullptr,
+                            /* .temp     = */ slot.task->params.sampling.temp,
+                            /* .seed     = */ slot.task->params.sampling.seed,
                         };
-
-                        // lossless speculative sampling when the task samples (LLAMA_SPEC_RS=0 disables)
-                        slot.spec_draft_q.clear();
-                        {
-                            static const bool spec_rs = getenv("LLAMA_SPEC_RS") == nullptr || atoi(getenv("LLAMA_SPEC_RS")) != 0;
-                            const float temp = slot.task->params.sampling.temp;
-                            // only sample the draft when the RS verifier will test it: a sampled draft that is
-                            // compared against the target's own sample would just lose acceptance
-                            if (spec_rs && temp > 0.0f && slot.spec_rs_ok && common_sampler_rs_compatible(slot.smpl.get())) {
-                                auto & dp = common_speculative_get_draft_params(spec.get(), slot.id);
-                                dp.temp     = temp;
-                                dp.result_q = &slot.spec_draft_q;
-                                dp.rng      = &slot.spec_rs_rng_dft;
-                                static const bool mirror = getenv("LLAMA_SPEC_RS_NOTRUNC") == nullptr;
-                                if (mirror) {
-                                    dp.top_p = slot.task->params.sampling.top_p;
-                                    dp.min_p = slot.task->params.sampling.min_p;
-                                }
-                            }
-                        }
 
                         drafting.push_back(&slot);
                     }
@@ -4628,19 +4612,25 @@ private:
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
+                GGML_ASSERT(slot.spec_draft_q.empty() || (slot.spec_draft_q.size() == slot.spec_draft.size()));
                 const auto & synth_probs = common_speculative_get_synth_probs(spec.get());
-                const bool use_rs = synth_probs.empty() && !slot.spec_is_replay && slot.spec_draft_q.size() == n_draft;
-                auto accepted = !synth_probs.empty()
-                    ? server_sample_and_accept_synth(
+
+                // drafters that fill no distribution fall back here
+                const bool use_rejection = slot.use_spec_rejection() && !slot.spec_draft_q.empty();
+
+                std::vector<llama_token> accepted;
+                if (!synth_probs.empty()) {
+                    // synthetic acceptance replaces verification entirely, so it comes first
+                    accepted = server_sample_and_accept_synth(
                             slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
-                            synth_probs, slot.spec_synth_rng, slot.spec_is_replay)
-                    : use_rs
-                    ? common_sampler_sample_and_accept_n_rs(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft,
-                            slot.spec_draft_q, slot.spec_rs_rng)
-                    : slot.spec_is_replay && slot.spec_rs_replay
-                    ? server_accept_replay(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft)
-                    : common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
-                slot.spec_draft_q.clear();
+                            synth_probs, slot.spec_synth_rng, slot.spec_is_replay);
+                } else if (slot.spec_is_replay && slot.use_spec_rejection()) {
+                    accepted = server_accept_replay(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                } else if (use_rejection) {
+                    accepted = common_sampler_sample_and_accept_n_rejection(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_draft_q);
+                } else {
+                    accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                }
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -4660,7 +4650,6 @@ private:
 
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_is_replay = true;
-                        slot.spec_rs_replay = use_rs;
                         slot.spec_draft = std::move(accepted);
 
                         const auto & ckpt = slot.spec_ckpt;
@@ -4698,7 +4687,6 @@ private:
                 n_accepted--;
             }
             slot.spec_is_replay = false;
-            slot.spec_rs_replay = false;
 
             slot.stats.update_gen_last();
 
