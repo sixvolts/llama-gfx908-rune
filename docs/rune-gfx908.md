@@ -374,3 +374,25 @@ On the model (745B Q3_K_M, 10x MI100, sparse DSA attention, MTP n=2): KL gate ag
 0.0098, max 1.09, every chunk at 0.001-0.003 (the floor); prefill at ubatch 512 93-104 -> 110-120 t/s, at ubatch
 1024 81-121 -> 113-136 t/s (5.4k and 13.6k-token prompts, 32k placement, no pipeline parallelism); decode 19.4 t/s
 and acceptance unchanged.
+
+### 2026-10-02 follow-up pass
+
+- `sparse-attn.cu`: the n_head/16 blocks of one query gather the same K rows; with the head group as the fastest
+  grid dimension they run back to back and reuse L2: nq=1024 11.2 -> 10.0 ms, nq=256 2.88 -> 2.58 ms (32k cells,
+  2048 selected), decode widths unchanged. Only -10% where the traffic argument promised 4x: the kernel is
+  latency-bound on its per-tile V^T staging through LDS and ~10 barriers, so the real lever is a block that owns all
+  64 heads of a query (K rows loaded once for four head groups), a larger rewrite - parked.
+- `getrows.cu`: rows of <= 4 elements take one thread per row; the sparse attention's position gather
+  ([1, 2048*1024] out of a 32k table) 2.7 ms -> 58 us. `GGML_CUDA_GETROWS_SMALL=0` restores the generic kernel.
+- Tried and reverted: the Q2_K min term as one f16 MFMA per 64-element half (A = the row's 4 block mins, B = the
+  column's 4 block sums, exact). The block sums cost 16 LDS loads plus dp4a in a quarter-wave divergent branch per
+  column tile and half, more than the 4 int8 MFMAs they replace: 13.9/20.7/36.4/54.7 -> 21.4/28.3/47.5/73.1 ms.
+- Prefill with the kept changes: 112-126 t/s at ubatch 512, 107-142 at 1024 (5.4k / 13.6k prompts, 32k placement).
+- Correctness hunt: one 12-chunk KL run had a corrupted chunk again (chunk 2, partial, the rest at the floor) after
+  four clean gated runs. Isolation: a 2-chunk reproducer on the real file (2.5 min, ~1 in 4 hits during the bad
+  period); three sparse repeats identical and clean on a carved copy; fused indexer off clean; reference gather
+  instead of the fused sparse kernel still corrupted (chunk 12), so not the sparse kernel; old vs new position
+  gather 0/10 vs 0/10 on the current build (both kernels exonerated). Every corrupted run coincided with a
+  48-thread `llama-quantize` loading the host; the twenty clean runs came after it finished - a host-side race that
+  surfaces when the inference thread is descheduled, the family of the earlier pinned-input race. Being confirmed
+  with the reproducer under artificial CPU load.
