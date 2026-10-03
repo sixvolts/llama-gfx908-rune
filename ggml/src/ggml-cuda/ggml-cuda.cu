@@ -2770,6 +2770,11 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     // prefill runs; with graphs off, or with ubatch 64 (64 shapes per chunk, never reused), every run sat at the
     // numerics floor. The row count is read from the weight matmuls' activations.
     static const int64_t max_batch = getenv("GGML_CUDA_GRAPH_MAX_BATCH") ? atoll(getenv("GGML_CUDA_GRAPH_MAX_BATCH")) : 32;
+    // GGML_CUDA_GRAPH_FULL_BATCH=<ubatch>: prompt batches of exactly that many rows stay graphed. With a KV pad the
+    // full ubatches have few distinct shapes (one per pad step), so they never recycle the shape cache, and they are
+    // where graphs pay (GLM-5.3-Flash prefill 497 vs 408 t/s on rune); the partial last ubatch of a prompt, whose row
+    // count is arbitrary and which is what makes the cache thrash, still runs eagerly.
+    static const int64_t full_batch = getenv("GGML_CUDA_GRAPH_FULL_BATCH") ? atoll(getenv("GGML_CUDA_GRAPH_FULL_BATCH")) : 0;
     if (max_batch > 0) {
         int64_t batch = 0;
         for (int i = 0; i < cgraph->n_nodes; i++) {
@@ -2779,7 +2784,7 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 batch = std::max(batch, node->op == GGML_OP_MUL_MAT ? node->src[1]->ne[1] : node->src[1]->ne[2]);
             }
         }
-        if (batch > max_batch) {
+        if (batch > max_batch && !(full_batch > 0 && batch == full_batch)) {
             static bool logged = false;
             if (!logged) {
                 logged = true;

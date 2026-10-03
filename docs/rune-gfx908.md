@@ -396,3 +396,18 @@ and acceptance unchanged.
   48-thread `llama-quantize` loading the host; the twenty clean runs came after it finished - a host-side race that
   surfaces when the inference thread is descheduled, the family of the earlier pinned-input race. Being confirmed
   with the reproducer under artificial CPU load.
+
+## 2026-10-03 HIP graphs on GLM-5.3-Flash: GGML_CUDA_GRAPH_FULL_BATCH
+
+The 745B prompt-batch corruption (GGML_CUDA_GRAPH_MAX_BATCH, 94c4fa88e) reproduces on GLM-5.3-Flash in a milder form,
+only when the 64-entry shape cache recycles: ub 128 with n_kv advancing every ubatch (384 distinct shapes per 4k chunk)
+gives KL 0.00086 / 0.0021 / 0.00078 vs graphs-off across runs (run-to-run different, median 0, no whole-chunk blowup),
+while graphs-off repeats and the gated runs are 0.000000. Prod-shaped prompts (ub 512, LLAMA_KV_PAD_PREFILL=32768, with
+or without a partial last ubatch) are 0.000000 with graphs on: two shapes per pad step never recycle the cache.
+
+The plain gate costs 18% prefill on Flash (497 -> 408 t/s on prod's config; graphs pay for 512-row ubatches here, unlike
+the 745B). GGML_CUDA_GRAPH_FULL_BATCH=<ubatch> keeps batches of exactly that many rows graphed (with the KV pad: one
+shape per pad step, <= 24 for 786k) and runs only the arbitrary-size partial ubatch eagerly: prefill 493.5 t/s, KL
+0.000000 on the partial-ubatch prompts (x2), and the stress pattern still perturbs when every 128-row batch counts as
+"full" (0.00078) - the trigger is cache recycling, not partial batches. Unset by default; prod should set it to its -ub.
+Logs and scripts: ~/glm53-flash/ab (kl-graphs*.sh, window{,2,3}.sh, ab-results.txt).
