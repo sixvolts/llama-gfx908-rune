@@ -54,6 +54,7 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
+    bool sched_copies;       // scheduler keeps GGML_SCHED_MAX_COPIES input copies + events (pipeline_parallel, or LLAMA_SCHED_COPIES_SINGLE)
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 
