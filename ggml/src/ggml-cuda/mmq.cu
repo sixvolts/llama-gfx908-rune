@@ -229,6 +229,21 @@ void ggml_cuda_mul_mat_q(
                 hist[0],hist[1],hist[2],hist[3],hist[4],hist[5],hist[6],hist[7], (long long) tiles, (long long) full16, (long long) tiles*4);
         }
     }
+    // Diagnostics: GGML_MMQ_DUMP_IDS_FILE=<path> appends every call's rows-per-expert vector (unsorted, expert order)
+    // as one line "<src0 name> <type> K M tokens used : r0 r1 ..." (host sync; graphs must be off; not for production).
+    {
+        static FILE * fdump = [] { const char * e = getenv("GGML_MMQ_DUMP_IDS_FILE"); return e ? fopen(e, "a") : (FILE *) nullptr; }();
+        if (fdump) {
+            std::vector<int32_t> eb(ne02 + 1);
+            CUDA_CHECK(cudaMemcpyAsync(eb.data(), expert_bounds.get(), eb.size()*sizeof(int32_t), cudaMemcpyDeviceToHost, stream));
+            CUDA_CHECK(cudaStreamSynchronize(stream));
+            fprintf(fdump, "%s %s %lld %lld %lld %lld :", src0->name, ggml_type_name(src0->type), (long long) ne00, (long long) ne01,
+                (long long) ne12, (long long) n_expert_used);
+            for (int64_t e = 0; e < ne02; ++e) { fprintf(fdump, " %d", eb[e+1] - eb[e]); }
+            fprintf(fdump, "\n");
+            fflush(fdump);
+        }
+    }
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
         ggml_cuda_mmq_get_y_padding(src0->type, fallback, cc);
     ggml_cuda_pool_alloc<char> src1_q8_1(ctx.pool(), nbytes_src1_q8_1);
