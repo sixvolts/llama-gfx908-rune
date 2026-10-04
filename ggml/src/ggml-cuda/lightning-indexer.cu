@@ -382,6 +382,254 @@ static __global__ void lightning_indexer_kernel_vec(
     }
 }
 
+// rune gfx908: tiled f32 indexer, BIT-EXACT with lightning_indexer_kernel_vec (f32 K path).
+//
+// The vec kernel spends its time in warp shuffles (one 5-step butterfly per (query, head, key)), keeps only one
+// query per block (every K row is re-read for each of the n_batch queries) and scores every padded pool, including
+// the ones the mask hides. This kernel reproduces the vec kernel's arithmetic exactly, per output:
+//   leaf l (= vec lane l, dims 4l..4l+3): s_l = 0; s_l += q.x*k.x; s_l += q.y*k.y; s_l += q.z*k.z; s_l += q.w*k.w
+//   dot = the xor-butterfly sum over the 32 leaves (offsets 16, 8, 4, 2, 1): a balanced binary tree over the leaves
+//         taken in bit-reversed lane order, pairs (l, l^16) first -> evaluated here per thread as the same tree
+//         (IEEE add is commutative, so only the grouping matters, and the grouping is identical)
+//   score += relu(dot) * w[h] over heads 0..N_HEAD-1 in order; dst = score + mask
+// but each thread computes a 2 query x 4 key micro-tile with no shuffles, K is staged once per block for 32 queries
+// and all heads, and a (32 query x 64 key) tile whose mask is entirely -inf is not scored at all: its outputs are
+// written as the mask value (-inf), which is what score + (-inf) gives for any finite score.
+// GGML_CUDA_LI_TILED=0 restores the vec kernel.
+namespace li_tiled {
+
+constexpr int BQ      = 32;          // queries per block
+constexpr int BP      = 64;          // keys (pools) per block
+constexpr int NT      = 256;         // threads per block
+constexpr int TQ      = 2;           // queries per thread
+constexpr int TP      = 4;           // keys per thread
+constexpr int ROW     = 128 + 4;     // LDS row stride in floats (pad: spreads key rows over banks)
+
+static_assert((BQ/TQ) * (BP/TP) == NT, "thread tile");
+
+constexpr int bitrev5(int x) {
+    return ((x & 1) << 4) | ((x & 2) << 2) | (x & 4) | ((x & 8) >> 2) | ((x & 16) >> 4);
+}
+
+template <int LO, int N>
+struct tree {
+    static __device__ __forceinline__ void run(float (&out)[TQ*TP], const float * const (&qr)[TQ], const float * const (&kr)[TP]) {
+        if constexpr (N == 1) {
+            constexpr int l = bitrev5(LO);
+            float4 qv[TQ];
+            float4 kv[TP];
+#pragma unroll
+            for (int i = 0; i < TQ; ++i) {
+                qv[i] = *(const float4 *) (qr[i] + 4*l);
+            }
+#pragma unroll
+            for (int j = 0; j < TP; ++j) {
+                kv[j] = *(const float4 *) (kr[j] + 4*l);
+            }
+#pragma unroll
+            for (int i = 0; i < TQ; ++i) {
+#pragma unroll
+                for (int j = 0; j < TP; ++j) {
+                    float s = 0.0f;
+                    ggml_cuda_mad(s, qv[i].x, kv[j].x);
+                    ggml_cuda_mad(s, qv[i].y, kv[j].y);
+                    ggml_cuda_mad(s, qv[i].z, kv[j].z);
+                    ggml_cuda_mad(s, qv[i].w, kv[j].w);
+                    out[i*TP + j] = s;
+                }
+            }
+        } else {
+            float a[TQ*TP];
+            float b[TQ*TP];
+            tree<LO,       N/2>::run(a, qr, kr);
+            tree<LO + N/2, N/2>::run(b, qr, kr);
+#pragma unroll
+            for (int o = 0; o < TQ*TP; ++o) {
+                out[o] = a[o] + b[o];
+            }
+        }
+    }
+};
+
+} // namespace li_tiled
+
+template <int64_t N_HEAD>
+static __global__ void __launch_bounds__(li_tiled::NT, 1) lightning_indexer_kernel_tiled_f32(
+        const float * Q, const char * K, const float * W, const half * M, float * dst,
+        int64_t n_stream, int64_t n_batch, int64_t n_kv,
+        size_t nb1, size_t nb2, size_t nb3,
+        size_t nbq1, size_t nbq2, size_t nbq3,
+        size_t nbk1, size_t nbk2, size_t nbk3,
+        size_t nbw1, size_t nbw2, size_t nbw3,
+        size_t nbm1, size_t nbm2, size_t nbm3,
+        int64_t nem3) {
+    using namespace li_tiled;
+    GGML_UNUSED_VARS(n_stream, nb2, nbk1, nbw2, nbm2);
+
+    const int tid      = threadIdx.x;
+    const int tx       = tid % (BP/TP);      // key group: keys tx + 16*j
+    const int ty       = tid / (BP/TP);      // query group: queries TQ*ty + i
+    const int p0       = blockIdx.x * BP;
+    const int q0       = blockIdx.y * BQ;
+    const int i_stream = blockIdx.z;
+
+    // phase 0 - mask of this thread's outputs; skip the tile when the mask hides all of it
+    float mval[TQ*TP];
+    int visible = 0;
+#pragma unroll
+    for (int i = 0; i < TQ; ++i) {
+        const int iq = q0 + TQ*ty + i;
+        const half * m_row = (const half *) ((const char *) M + (int64_t) iq*nbm1 + (i_stream % nem3)*nbm3);
+#pragma unroll
+        for (int j = 0; j < TP; ++j) {
+            const int ip = p0 + tx + (BP/TP)*j;
+            float mv = -INFINITY;
+            if (iq < n_batch && ip < n_kv) {
+                mv = __half2float(m_row[ip]);
+            }
+            mval[i*TP + j] = mv;
+            visible |= !(isinf(mv) && mv < 0.0f);
+        }
+    }
+    if (!__syncthreads_or(visible)) {
+#pragma unroll
+        for (int i = 0; i < TQ; ++i) {
+            const int iq = q0 + TQ*ty + i;
+            if (iq >= n_batch) {
+                continue;
+            }
+            float * d_row = (float *) ((char *) dst + (int64_t) iq*nb1 + i_stream*nb3);
+#pragma unroll
+            for (int j = 0; j < TP; ++j) {
+                const int ip = p0 + tx + (BP/TP)*j;
+                if (ip < n_kv) {
+                    d_row[ip] = mval[i*TP + j];
+                }
+            }
+        }
+        return;
+    }
+
+    __shared__ __align__(16) float k_s[BP*ROW];
+    __shared__ __align__(16) float q_s[BQ*ROW];
+    __shared__ float w_s[BQ][N_HEAD];
+
+    // phase 1 - K tile (all heads share it) and the head weights of the tile's queries
+    for (int e = tid; e < BP*32; e += NT) {
+        const int r  = e / 32;
+        const int c4 = e % 32;
+        const int ip = p0 + r;
+        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (ip < n_kv) {
+            v = ((const float4 *) (K + (int64_t) ip*nbk2 + i_stream*nbk3))[c4];
+        }
+        *(float4 *) (k_s + r*ROW + 4*c4) = v;
+    }
+    for (int e = tid; e < BQ*N_HEAD; e += NT) {
+        const int r  = e / N_HEAD;
+        const int h  = e % N_HEAD;
+        const int iq = q0 + r;
+        w_s[r][h] = iq < n_batch ? ((const float *) ((const char *) W + (int64_t) iq*nbw1 + i_stream*nbw3))[h] : 0.0f;
+    }
+
+    const char * q_base = (const char *) Q + i_stream*nbq3;
+    constexpr int NQ4 = BQ*32 / NT;     // float4 of one head's Q tile per thread
+    float4 q_next[NQ4];
+#pragma unroll
+    for (int u = 0; u < NQ4; ++u) {
+        const int e  = tid + u*NT;
+        const int r  = e / 32;
+        const int c4 = e % 32;
+        const int iq = q0 + r;
+        q_next[u] = iq < n_batch ? ((const float4 *) (q_base + (int64_t) iq*nbq2))[c4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+
+    const float * qr[TQ];
+    const float * kr[TP];
+#pragma unroll
+    for (int i = 0; i < TQ; ++i) {
+        qr[i] = q_s + (TQ*ty + i)*ROW;
+    }
+#pragma unroll
+    for (int j = 0; j < TP; ++j) {
+        kr[j] = k_s + (tx + (BP/TP)*j)*ROW;
+    }
+
+    float score[TQ*TP];
+#pragma unroll
+    for (int o = 0; o < TQ*TP; ++o) {
+        score[o] = 0.0f;
+    }
+
+    for (int h = 0; h < N_HEAD; ++h) {
+        __syncthreads();     // previous head's q_s reads are done (and, for h == 0, k_s/w_s are written)
+#pragma unroll
+        for (int u = 0; u < NQ4; ++u) {
+            const int e  = tid + u*NT;
+            const int r  = e / 32;
+            const int c4 = e % 32;
+            *(float4 *) (q_s + r*ROW + 4*c4) = q_next[u];
+        }
+        __syncthreads();
+        if (h + 1 < N_HEAD) {
+#pragma unroll
+            for (int u = 0; u < NQ4; ++u) {
+                const int e  = tid + u*NT;
+                const int r  = e / 32;
+                const int c4 = e % 32;
+                const int iq = q0 + r;
+                q_next[u] = iq < n_batch ?
+                    ((const float4 *) (q_base + (int64_t) iq*nbq2 + (int64_t) (h + 1)*nbq1))[c4] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            }
+        }
+
+        float dot[TQ*TP];
+        tree<0, 32>::run(dot, qr, kr);
+
+#pragma unroll
+        for (int i = 0; i < TQ; ++i) {
+            const float w_val = w_s[TQ*ty + i][h];
+#pragma unroll
+            for (int j = 0; j < TP; ++j) {
+                float sum = dot[i*TP + j];
+                // ReLU, weight
+                sum = (sum > 0.0f) ? sum : 0.0f;
+                score[i*TP + j] += sum * w_val;
+            }
+        }
+    }
+
+#pragma unroll
+    for (int i = 0; i < TQ; ++i) {
+        const int iq = q0 + TQ*ty + i;
+        if (iq >= n_batch) {
+            continue;
+        }
+        float * d_row = (float *) ((char *) dst + (int64_t) iq*nb1 + i_stream*nb3);
+#pragma unroll
+        for (int j = 0; j < TP; ++j) {
+            const int ip = p0 + tx + (BP/TP)*j;
+            if (ip < n_kv) {
+                d_row[ip] = score[i*TP + j] + mval[i*TP + j];
+            }
+        }
+    }
+}
+
+// GGML_CUDA_LI_TILED: unset/1 = tiled kernel for f32 K when the batch has >= GGML_CUDA_LI_TILED_MIN queries (default 32;
+// MI100, 8192 pools: vec/tiled = 0.20x at 1 query, 0.58x at 8, 0.99x at 16, 1.80x at 32, 2.84x at 128), 0 = never,
+// 2 = always
+static bool lightning_indexer_use_tiled(const ggml_tensor * k, int64_t n_batch) {
+    const char * e = getenv("GGML_CUDA_LI_TILED");
+    const int mode = e != nullptr ? atoi(e) : 1;
+    if (mode == 0 || k->type != GGML_TYPE_F32) {
+        return false;
+    }
+    const char * em = getenv("GGML_CUDA_LI_TILED_MIN");
+    const int64_t min_batch = em != nullptr ? atoi(em) : 32;
+    return mode == 2 || n_batch >= min_batch;
+}
+
 #define LIGHTNING_INDEXER_CASE(lightning_indexer_kernel, n_embd, n_head, K, type_K)         \
     if (K->type == (type_K)) {                                                              \
         lightning_indexer_kernel<WARPS_PER_BLOCK, K_VECS_PER_BLOCK, n_embd, n_head, type_K> \
@@ -445,6 +693,28 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int device = ggml_cuda_get_device();
     const int cc     = ggml_cuda_info().devices[device].cc;
+
+    if (n_embd == 128 && (n_head == 64 || n_head == 32) && lightning_indexer_use_tiled(k, n_batch)) {
+        dim3 block(li_tiled::NT, 1, 1);
+        dim3 grid((n_kv + li_tiled::BP - 1) / li_tiled::BP, (n_batch + li_tiled::BQ - 1) / li_tiled::BQ, n_stream);
+        auto launch = [&](auto kern) {
+            kern<<<grid, block, 0, ctx.stream()>>>(
+                q_d, k_d, w_d, m_d, dst_d,
+                n_stream, n_batch, n_kv,
+                nb1, nb2, nb3,
+                nbq1, nbq2, nbq3,
+                nbk1, nbk2, nbk3,
+                nbw1, nbw2, nbw3,
+                nbm1, nbm2, nbm3,
+                nem3);
+        };
+        if (n_head == 64) {
+            launch(lightning_indexer_kernel_tiled_f32<64>);
+        } else {
+            launch(lightning_indexer_kernel_tiled_f32<32>);
+        }
+        return;
+    }
 
     if (n_embd == 128 && n_head == 64) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
