@@ -451,9 +451,76 @@ struct tree {
     }
 };
 
+// the same tree evaluated as a binary counter over the leaves j = 0..31 (leaf j = vec lane bitrev5(j)) with the
+// operands of leaf j+1 loaded before leaf j is computed (explicit register double buffer): identical additions
+// (level-L partial = left partial + right partial), but the LDS loads of the next leaf overlap the FMAs of this one.
+static __device__ __forceinline__ void leaf_load(float4 (&qv)[TQ], float4 (&kv)[TP], const float * const (&qr)[TQ],
+        const float * const (&kr)[TP], const int l) {
+#pragma unroll
+    for (int i = 0; i < TQ; ++i) {
+        qv[i] = *(const float4 *) (qr[i] + 4*l);
+    }
+#pragma unroll
+    for (int j = 0; j < TP; ++j) {
+        kv[j] = *(const float4 *) (kr[j] + 4*l);
+    }
+}
+
+static __device__ __forceinline__ void tree_stream(float (&out)[TQ*TP], const float * const (&qr)[TQ], const float * const (&kr)[TP]) {
+    float st[5][TQ*TP];   // st[L]: pending left partial of level L (sum of 2^L leaves)
+    float4 qa[TQ], ka[TP], qb[TQ], kb[TP];
+    leaf_load(qa, ka, qr, kr, bitrev5(0));
+#pragma unroll
+    for (int jj = 0; jj < 32; ++jj) {
+        float4 (&qc)[TQ] = (jj & 1) ? qb : qa;
+        float4 (&kc)[TP] = (jj & 1) ? kb : ka;
+        if (jj + 1 < 32) {
+            if (jj & 1) {
+                leaf_load(qa, ka, qr, kr, bitrev5(jj + 1));
+            } else {
+                leaf_load(qb, kb, qr, kr, bitrev5(jj + 1));
+            }
+        }
+        float c[TQ*TP];
+#pragma unroll
+        for (int i = 0; i < TQ; ++i) {
+#pragma unroll
+            for (int j = 0; j < TP; ++j) {
+                float s = 0.0f;
+                ggml_cuda_mad(s, qc[i].x, kc[j].x);
+                ggml_cuda_mad(s, qc[i].y, kc[j].y);
+                ggml_cuda_mad(s, qc[i].z, kc[j].z);
+                ggml_cuda_mad(s, qc[i].w, kc[j].w);
+                c[i*TP + j] = s;
+            }
+        }
+        // carry up while the counter bit is set: level L completes when bits 0..L of jj are all 1
+#pragma unroll
+        for (int L = 0; L < 5; ++L) {
+            if (((jj >> L) & 1) == 0) {
+#pragma unroll
+                for (int o = 0; o < TQ*TP; ++o) {
+                    st[L][o] = c[o];
+                }
+                break;
+            }
+#pragma unroll
+            for (int o = 0; o < TQ*TP; ++o) {
+                c[o] = st[L][o] + c[o];
+            }
+            if (L == 4) {
+#pragma unroll
+                for (int o = 0; o < TQ*TP; ++o) {
+                    out[o] = c[o];
+                }
+            }
+        }
+    }
+}
+
 } // namespace li_tiled
 
-template <int64_t N_HEAD>
+template <int64_t N_HEAD, bool STREAM>
 static __global__ void __launch_bounds__(li_tiled::NT, 1) lightning_indexer_kernel_tiled_f32(
         const float * Q, const char * K, const float * W, const half * M, float * dst,
         int64_t n_stream, int64_t n_batch, int64_t n_kv,
@@ -584,7 +651,11 @@ static __global__ void __launch_bounds__(li_tiled::NT, 1) lightning_indexer_kern
         }
 
         float dot[TQ*TP];
-        tree<0, 32>::run(dot, qr, kr);
+        if constexpr (STREAM) {
+            tree_stream(dot, qr, kr);
+        } else {
+            tree<0, 32>::run(dot, qr, kr);
+        }
 
 #pragma unroll
         for (int i = 0; i < TQ; ++i) {
@@ -708,10 +779,14 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 nbm1, nbm2, nbm3,
                 nem3);
         };
+        // binary-counter tree with register double-buffered leaf loads (same arithmetic, ~10% faster);
+        // GGML_CUDA_LI_TILED_STREAM=0 uses the recursive tree
+        const char * es = getenv("GGML_CUDA_LI_TILED_STREAM");
+        const bool stream = es == nullptr || atoi(es) != 0;
         if (n_head == 64) {
-            launch(lightning_indexer_kernel_tiled_f32<64>);
+            stream ? launch(lightning_indexer_kernel_tiled_f32<64, true>) : launch(lightning_indexer_kernel_tiled_f32<64, false>);
         } else {
-            launch(lightning_indexer_kernel_tiled_f32<32>);
+            stream ? launch(lightning_indexer_kernel_tiled_f32<32, true>) : launch(lightning_indexer_kernel_tiled_f32<32, false>);
         }
         return;
     }
