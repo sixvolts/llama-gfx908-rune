@@ -2021,7 +2021,12 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // GGML_MMQ_DENSE_MIN_M=<rows> sets the threshold (0 disables).
     {
         static const int64_t min_m = [] { const char * e = getenv("GGML_MMQ_DENSE_MIN_M"); return e ? atoll(e) : 6144; }();
-        if (min_m > 0 && GGML_CUDA_CC_IS_CDNA1(cc) && src0->type == GGML_TYPE_Q8_0 && ne11 > 128 && ne01 >= min_m
+        // thin Q8_0 projections (M <= GGML_MMQ_DENSE_THIN_M, default 1024; 0 disables) also go to MMQ at prefill: rocBLAS
+        // pays a per-call Q8_0->f16 weight dequant + f32->f16 activation convert and runs M=24..512 tiles at 1-8 TFLOPS
+        // (GLM-5.3: hc_*_fn M=24, ssm_f_a/g_a M=128, ssm_beta M=64, indexer k / compressor gate M=128, kv_a M=512).
+        static const int64_t thin_m = [] { const char * e = getenv("GGML_MMQ_DENSE_THIN_M"); return e ? atoll(e) : 1024; }();
+        if (GGML_CUDA_CC_IS_CDNA1(cc) && src0->type == GGML_TYPE_Q8_0 && ne11 > 128
+                && ((min_m > 0 && ne01 >= min_m) || (thin_m > 0 && ne01 <= thin_m))
                 && ne00 % 256 == 0 && ne02 == 1 && ne03 == 1 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
             mm_path("mmq-dense-rule");
             ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
