@@ -3892,8 +3892,14 @@ ggml_tensor * llm_graph_context::build_attn_sparse_gather(
     // load bearing as in build_attn_sparse: the KQ mask at every listed cell keeps an empty, future or
     // foreign-sequence cell masked whatever the lists say
     {
-        ggml_tensor * kqm = ggml_view_4d(ctx0, kq_mask, 1, n_kv, n_tps, n_stream,
-                ggml_element_size(kq_mask), kq_mask->nb[1], kq_mask->nb[3], 0);
+        // LLAMA_GRAPH_VIEW_CACHE=0: a fresh view per layer (each one is a separate split input of the stage)
+        static const bool view_cache = !(getenv("LLAMA_GRAPH_VIEW_CACHE") && atoi(getenv("LLAMA_GRAPH_VIEW_CACHE")) == 0);
+        ggml_tensor * kqm = view_cache ? inp->kq_mask_rows : nullptr;
+        if (kqm == nullptr) {
+            kqm = ggml_view_4d(ctx0, kq_mask, 1, n_kv, n_tps, n_stream,
+                    ggml_element_size(kq_mask), kq_mask->nb[1], kq_mask->nb[3], 0);
+            inp->kq_mask_rows = kqm;
+        }
         kqm = ggml_get_rows(ctx0, kqm, idx); // F32 [1, n_sel, n_tps, n_stream]
         mask = ggml_add(ctx0, mask, ggml_reshape_3d(ctx0, kqm, n_sel, n_tps, n_stream));
     }

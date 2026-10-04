@@ -103,6 +103,11 @@ public:
     ggml_tensor * tail_cells = nullptr;   // I32 [kpool - 1, n_tps, n_stream]
     ggml_tensor * tail_mask  = nullptr;   // F32 [kpool - 1, n_tps, n_stream]
 
+    // per-graph caches of the views the indexer takes of pool_cells / pool_bias (one split input per pipeline stage
+    // instead of one per DSA layer)
+    ggml_tensor * pool_cells_3d = nullptr;
+    ggml_tensor * pool_bias_4d  = nullptr;
+
     const llama_kv_cache_context * mctx_attn;
     const llama_kv_cache_context * mctx_idx;
 
