@@ -822,6 +822,15 @@ struct ggml_backend_sched {
     int n_graph_inputs;
     int graph_inputs_capacity;
 
+    // copy rotation on a reused graph (ggml_backend_sched_rotate_copy): the node sources that point at a split-input
+    // copy, rebuilt lazily after each split_graph, and one graph uid per (split, copy)
+    struct ggml_sched_rot_patch { struct ggml_tensor * node; int j; size_t id; int backend_id; } * rot_patches;
+    int        n_rot_patches;
+    int        rot_patches_capacity;
+    bool       rot_valid;
+    uint64_t * rot_uids;          // [n_splits][n_copies], 0 = not assigned yet
+    int        rot_uids_capacity;
+
     struct ggml_context * ctx;
 
     ggml_backend_sched_eval_callback callback_eval;
@@ -1587,6 +1596,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; ++i) {
         sched->splits[i].graph.uid = ggml_graph_next_uid();
     }
+    sched->rot_valid = false;
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
@@ -1800,6 +1810,16 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                     copy_experts(first_id, last_id);
                 } else {
+                    // a device-to-device async copy runs on the SOURCE backend's stream, which is not ordered after the
+                    // split backend's last use of this copy (the event_wait above only orders the split backend): with
+                    // rotating copies the source may run up to n_copies ubatches ahead, so make the source stream wait
+                    // for that use too (GPU side, no host block). GGML_SCHED_NO_SRC_WAIT=1 disables (A/B).
+                    static const bool no_src_wait = getenv("GGML_SCHED_NO_SRC_WAIT") != NULL && atoi(getenv("GGML_SCHED_NO_SRC_WAIT")) != 0;
+                    if (!no_src_wait && sched->n_copies > 1 && input_backend != split_backend && input_backend->iface.event_wait != NULL &&
+                        sched->events[split_backend_id][sched->cur_copy] != NULL && split_backend->iface.cpy_tensor_async &&
+                        ggml_backend_dev_type(ggml_backend_get_device(input_backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                        ggml_backend_event_wait(input_backend, sched->events[split_backend_id][sched->cur_copy]);
+                    }
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
@@ -1954,6 +1974,8 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     }
     free(sched->splits);
     free(sched->graph_inputs);
+    free(sched->rot_patches);
+    free(sched->rot_uids);
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_copies);
     free(sched->node_backend_ids);
@@ -2083,6 +2105,80 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_splits;
+}
+
+// Pipeline parallelism with a REUSED graph (llama graph reuse skips sched_alloc_graph, the only place cur_copy advances):
+// without this every prompt ubatch of a llama_decode used the same copy, so each split's input wait
+// (events[backend][cur_copy]) waited for the previous ubatch on that GPU and the stages never overlapped. This advances
+// to the next copy and repoints every node source that reads a split-input copy at that copy (the copies of all
+// n_copies are allocated by alloc_graph as separate leafs, so their buffers are already valid). User inputs that are
+// consumed on their own backend (graph_inputs) are NOT repointed: the caller writes the original tensor every ubatch.
+// Each (split, copy) keeps its own graph uid, so backend graph caches (CUDA graphs) see a stable graph per copy.
+void ggml_backend_sched_rotate_copy(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    if (sched->n_copies <= 1 || !sched->is_alloc) {
+        return;
+    }
+    if (!sched->rot_valid) {
+        // map split-input copy tensors -> (input hash id, backend)
+        std::unordered_map<const ggml_tensor *, std::pair<size_t, int>> copies;
+        for (int i = 0; i < sched->n_splits; i++) {
+            const struct ggml_backend_sched_split * split = &sched->splits[i];
+            for (int k = 0; k < split->n_inputs; k++) {
+                const size_t id = hash_id(split->inputs[k]);
+                for (int c = 0; c < sched->n_copies; c++) {
+                    const ggml_tensor * t = tensor_id_copy(id, split->backend_id, c);
+                    if (t) {
+                        copies[t] = { id, split->backend_id };
+                    }
+                }
+            }
+        }
+        sched->n_rot_patches = 0;
+        for (int i = 0; i < sched->graph.n_nodes; i++) {
+            struct ggml_tensor * node = sched->graph.nodes[i];
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                if (node->src[j] == NULL) {
+                    continue;
+                }
+                auto it = copies.find(node->src[j]);
+                if (it == copies.end()) {
+                    continue;
+                }
+                if (sched->n_rot_patches >= sched->rot_patches_capacity) {
+                    sched->rot_patches_capacity = std::max(256, 2*sched->rot_patches_capacity);
+                    sched->rot_patches = (struct ggml_backend_sched::ggml_sched_rot_patch *) realloc(sched->rot_patches,
+                        sched->rot_patches_capacity * sizeof(sched->rot_patches[0]));
+                }
+                sched->rot_patches[sched->n_rot_patches++] = { node, j, it->second.first, it->second.second };
+            }
+        }
+        const int n_uids = sched->n_splits * sched->n_copies;
+        if (n_uids > sched->rot_uids_capacity) {
+            sched->rot_uids_capacity = n_uids;
+            sched->rot_uids = (uint64_t *) realloc(sched->rot_uids, n_uids * sizeof(uint64_t));
+        }
+        memset(sched->rot_uids, 0, n_uids * sizeof(uint64_t));
+        for (int i = 0; i < sched->n_splits; i++) {
+            sched->rot_uids[i*sched->n_copies + sched->cur_copy] = sched->splits[i].graph.uid;
+        }
+        sched->rot_valid = true;
+    }
+
+    sched->cur_copy  = sched->next_copy;
+    sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
+
+    for (int p = 0; p < sched->n_rot_patches; p++) {
+        const auto & rp = sched->rot_patches[p];
+        rp.node->src[rp.j] = tensor_id_copy(rp.id, rp.backend_id, sched->cur_copy);
+    }
+    for (int i = 0; i < sched->n_splits; i++) {
+        uint64_t & uid = sched->rot_uids[i*sched->n_copies + sched->cur_copy];
+        if (uid == 0) {
+            uid = ggml_graph_next_uid();
+        }
+        sched->splits[i].graph.uid = uid;
+    }
 }
 
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {

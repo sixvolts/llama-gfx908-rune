@@ -2849,11 +2849,23 @@ static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
     }
     // every node's shape: a KV view that grows with the context, or a batch of another size, is then a different
     // cached instance instead of a property change that restarts this instance's warmup
+    // GGML_CUDA_GRAPH_KEY_INPUTS (default 1): also the data of every input-flagged source (the scheduler's per-copy input
+    // copies): a reused graph that rotates pipeline copies (ggml_backend_sched_rotate_copy) gets one cached instance per
+    // copy instead of one instance whose properties change every call (eager forever)
+    static const bool key_inputs = !(getenv("GGML_CUDA_GRAPH_KEY_INPUTS") && atoi(getenv("GGML_CUDA_GRAPH_KEY_INPUTS")) == 0);
     for (int i = 0; i < cgraph->n_nodes; ++i) {
         const ggml_tensor * n = cgraph->nodes[i];
         mix((uint64_t) n->op);
         for (int d = 0; d < GGML_MAX_DIMS; ++d) {
             mix((uint64_t) n->ne[d]);
+        }
+        if (key_inputs && key_mode) {
+            for (int j = 0; j < GGML_MAX_SRC; ++j) {
+                const ggml_tensor * s = n->src[j];
+                if (s && (s->flags & GGML_TENSOR_FLAG_INPUT)) {
+                    mix((uint64_t) (uintptr_t) s->data);
+                }
+            }
         }
     }
     return (const void *) (uintptr_t) h;
@@ -5632,6 +5644,7 @@ static void ggml_backend_cuda_event_wait(ggml_backend_t backend, ggml_backend_ev
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     if (ggml_backend_is_cuda(backend)) {
+        ggml_cuda_set_device(cuda_ctx->device);   // the event may belong to another device (scheduler source-stream waits)
         CUDA_CHECK(cudaStreamWaitEvent(cuda_ctx->stream(), (cudaEvent_t)event->context, 0));
     } else {
 #if 0
