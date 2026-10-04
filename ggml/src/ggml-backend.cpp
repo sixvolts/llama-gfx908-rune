@@ -1916,9 +1916,12 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // a device-to-device async copy runs on the SOURCE backend's stream, which is not ordered after the
                     // split backend's last use of this copy (the event_wait above only orders the split backend): with
                     // rotating copies the source may run up to n_copies ubatches ahead, so make the source stream wait
-                    // for that use too (GPU side, no host block). GGML_SCHED_NO_SRC_WAIT=1 disables (A/B).
+                    // for that use too. Not needed when the user inputs are staged: refilling a staged slot already
+                    // waits (host) for every consumer's use of this copy n_copies ubatches ago, so no source can be
+                    // that far ahead; and the cross-device wait is expensive where the GPUs are not peers (rune: the
+                    // gpu9 -> gpu6 crossing cost ~180 ms of host time per ubatch). GGML_SCHED_NO_SRC_WAIT=1 disables.
                     static const bool no_src_wait = getenv("GGML_SCHED_NO_SRC_WAIT") != NULL && atoi(getenv("GGML_SCHED_NO_SRC_WAIT")) != 0;
-                    if (!no_src_wait && sched->n_copies > 1 && input_backend != split_backend && input_backend->iface.event_wait != NULL &&
+                    if (!no_src_wait && sched->rotating && !stage_inputs && input_backend != split_backend && input_backend->iface.event_wait != NULL &&
                         sched->events[split_backend_id][sched->cur_copy] != NULL && split_backend->iface.cpy_tensor_async &&
                         ggml_backend_dev_type(ggml_backend_get_device(input_backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
                         ggml_backend_event_wait(input_backend, sched->events[split_backend_id][sched->cur_copy]);
