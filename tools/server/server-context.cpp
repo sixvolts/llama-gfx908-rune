@@ -1686,8 +1686,9 @@ private:
                 // conversation's state (f_keep >= 0.5: not even parked in the host cache) or park it, to reuse what any
                 // empty slot can load from the snapshot; the empty slot is then chosen below (if it keeps busy slots as
                 // contiguous as the best idle slot would - otherwise the selector parks an idle conversation instead)
-                if (prefix_share > 0 && prompt_cache && tokens.size() > lcp_len + server_prompt_cache::shared_margin && has_empty_idle_slot() &&
-                    prompt_cache->shared_prefix_len(task.tokens) + server_prompt_cache::shared_margin >= lcp_len) {   // the LCP usually runs a few tokens past the snapshot (e.g. the <|user|> token)
+                const size_t n_shared = prefix_share > 0 && prompt_cache ? prompt_cache->shared_prefix_len(task.tokens) : 0;
+                if (n_shared > 0 && tokens.size() > lcp_len + server_prompt_cache::shared_margin && has_empty_idle_slot() &&
+                    n_shared + server_prompt_cache::shared_margin >= lcp_len) {   // the LCP usually runs a few tokens past the snapshot (e.g. the <|user|> token)
                     SLT_INF(slot, " - not taking over this slot for its %zu-token shared prefix (f_keep %.3f): snapshot + empty slot\n",
                             lcp_len, float(lcp_len) / tokens.size());
                     share_guard = true;
