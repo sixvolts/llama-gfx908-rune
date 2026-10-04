@@ -2514,10 +2514,17 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
+        const int64_t t_ckpt0 = ggml_time_us();
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        const int64_t t_ckpt1 = ggml_time_us();
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+        const int64_t t_ckpt2 = ggml_time_us();
+        if (t_ckpt2 - t_ckpt0 > 50000) {
+            SLT_INF(slot, "context checkpoint at n_tokens = %" PRId64 " took %.1f ms (target %.1f ms, %.1f MiB)\n",
+                    cur.n_tokens, (t_ckpt2 - t_ckpt0)/1e3, (t_ckpt1 - t_ckpt0)/1e3, (float) cur.size() / 1024 / 1024);
+        }
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -3375,6 +3382,10 @@ private:
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
+        // LLAMA_CKPT_TAIL_ALIGN=1: take the far end-of-prompt context checkpoint at a natural batch boundary instead of
+        // splitting the prompt at n - (4 + n_ubatch) (default 0 = upstream behaviour)
+        static const bool ckpt_tail_align = getenv("LLAMA_CKPT_TAIL_ALIGN") && atoi(getenv("LLAMA_CKPT_TAIL_ALIGN")) != 0;
+
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
@@ -3843,6 +3854,10 @@ private:
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
+                                // tail-align mode: no forced split at n - (4 + n_ubatch) (see ckpt_tail_align)
+                                if (ckpt_tail_align && offset != 4) {
+                                    continue;
+                                }
                                 const int n_last = std::min(n_batch, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;
@@ -3860,7 +3875,16 @@ private:
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
-                    const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
+                    // tail-align mode: the "far" end-of-prompt checkpoint (upstream: a forced split at n - (4 + n_ubatch))
+                    // is taken at the natural batch boundary at or before that point, i.e. before the batch that spans
+                    // it, so the last n_ubatch tokens stay in a full pipelined batch instead of an isolated ubatch that
+                    // drains the 9-stage pipeline (~1.6 s per request on rune). The checkpoint ends up 4 + n_ubatch ..
+                    // 4 + n_ubatch + n_batch tokens before the end instead of exactly 4 + n_ubatch.
+                    const int32_t n_far = slot.task->n_tokens() - (4 + n_ubatch);
+                    const bool near_prompt_end = ckpt_tail_align
+                        ? (n_tokens_start <= n_far && slot.prompt.n_tokens() > n_far) ||
+                          slot.prompt.n_tokens() == slot.task->n_tokens()
+                        : slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
