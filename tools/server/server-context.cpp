@@ -355,6 +355,9 @@ struct server_slot {
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
+        // the drafter's carry-over state belongs with the saved state, as it does with every context checkpoint (no-op
+        // for drafters without one, e.g. draft-mtp)
+        common_speculative_get_state(spec, id, cur->data.spec);
         const int64_t t3 = ggml_time_us();
         SRV_TRC(" - prompt_save timing: alloc %.1f ms, target state %.1f ms, draft state %.1f ms\n", (t1 - t0)/1e3, (t2 - t1)/1e3, (t3 - t2)/1e3);
 
@@ -362,9 +365,13 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        std::vector<uint8_t> data_spec;
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, &data_spec);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+        } else if (!data_spec.empty()) {
+            // the loaded state's drafter carry-over, not this slot's previous occupant's
+            common_speculative_set_state(spec, id, data_spec);
         }
 
         return res;
@@ -1637,6 +1644,8 @@ private:
         server_slot * ret = nullptr;
 
         bool update_cache = false;
+        bool share_guard  = false;   // LLAMA_PREFIX_SHARE: an LCP match was skipped in favour of snapshot + empty slot
+        bool lcp_hook     = false;   // LLAMA_SLOT_CACHE_LCP: the cache update was requested because an entry reuses more
 
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
@@ -1673,13 +1682,15 @@ private:
                 const size_t lcp_len = tokens.get_common_prefix(task.tokens);
                 const float f_sim_cur = float(lcp_len) / task.tokens.size();
 
-                // with a shared prefix snapshot covering the match, taking over this slot would only destroy (f_keep >= 0.5:
-                // truncated, not even parked in the host cache) or evict another conversation's state to reuse what any
-                // empty slot can load from the snapshot
-                if (prefix_share > 0 && prompt_cache && tokens.size() > lcp_len + 512 && has_empty_idle_slot() &&
-                    prompt_cache->shared_prefix_len(task.tokens) + 512 >= lcp_len) {   // the LCP usually runs a few tokens past the snapshot (e.g. the <|user|> token)
+                // with a shared prefix snapshot covering the match, taking over this slot would truncate another
+                // conversation's state (f_keep >= 0.5: not even parked in the host cache) or park it, to reuse what any
+                // empty slot can load from the snapshot; the empty slot is then chosen below (if it keeps busy slots as
+                // contiguous as the best idle slot would - otherwise the selector parks an idle conversation instead)
+                if (prefix_share > 0 && prompt_cache && tokens.size() > lcp_len + server_prompt_cache::shared_margin && has_empty_idle_slot() &&
+                    prompt_cache->shared_prefix_len(task.tokens) + server_prompt_cache::shared_margin >= lcp_len) {   // the LCP usually runs a few tokens past the snapshot (e.g. the <|user|> token)
                     SLT_INF(slot, " - not taking over this slot for its %zu-token shared prefix (f_keep %.3f): snapshot + empty slot\n",
                             lcp_len, float(lcp_len) / tokens.size());
+                    share_guard = true;
                     continue;
                 }
 
@@ -1779,6 +1790,41 @@ private:
             }
         }
 
+        // LLAMA_PREFIX_SHARE: the takeover guard skipped an LCP match because an empty slot can load the shared snapshot -
+        // pick that empty slot here (the LRU selector below ranks by contiguity first and would otherwise prefer a
+        // non-empty idle slot, parking its conversation: a 0.7-1.2 s prompt_save stall plus an eviction). An empty slot
+        // that would fragment the busy slots is not taken: a gap costs an extra ubatch on every decode step for the
+        // request's lifetime, more than the one-off park.
+        if (ret == nullptr && share_guard) {
+            const bool by_runs = compact && !params_base.kv_unified;
+            int best_runs_any = INT_MAX;
+            for (const server_slot & slot : slots) {
+                if (!slot.is_processing()) {
+                    best_runs_any = std::min(best_runs_any, by_runs ? n_runs_with(slot) : 0);
+                }
+            }
+            server_slot * best_empty = nullptr;
+            int best_empty_runs = INT_MAX;
+            for (server_slot & slot : slots) {
+                if (slot.is_processing() || !slot.prompt.tokens.empty()) {
+                    continue;
+                }
+                const int runs = by_runs ? n_runs_with(slot) : 0;
+                if (!best_empty || runs < best_empty_runs || (runs == best_empty_runs && slot.t_last_used <= best_empty->t_last_used)) {
+                    best_empty      = &slot;
+                    best_empty_runs = runs;
+                }
+            }
+            if (best_empty && best_empty_runs <= best_runs_any) {
+                ret = best_empty;
+                update_cache = true;
+                SLT_INF(*ret, "%s", "selected empty slot for the shared prefix snapshot\n");
+            } else if (best_empty) {
+                SLT_INF(*best_empty, "empty slot would split the busy slots (%d vs %d runs) - using the idle-slot selector\n",
+                        best_empty_runs, best_runs_any);
+            }
+        }
+
         // find the slot that has been least recently used (see above)
         if (ret == nullptr) {
             int64_t t_last = -1;
@@ -1816,6 +1862,7 @@ private:
             if (lcp_cache > lcp_slot) {
                 SLT_INF(*ret, "host prompt cache reuses more than this slot (%zu vs %zu tokens) - loading from it\n", lcp_cache, lcp_slot);
                 update_cache = true;
+                lcp_hook     = true;
             }
         }
 
@@ -1830,10 +1877,25 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                const size_t lcp_before = ret->prompt.tokens.get_common_prefix(task.tokens);
+                bool         saved      = ret->prompt_save(*prompt_cache);
+                if (lcp_hook && !saved) {
+                    saved = prompt_cache->contains(ret->prompt.tokens);   // prompt_save skips a prompt the cache already holds
+                }
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                if (lcp_hook && !saved) {
+                    // LLAMA_SLOT_CACHE_LCP: this slot's own conversation could not be parked (e.g. over the cache limit);
+                    // loading over it would lose it, so keep it and reuse what it has
+                    SLT_WRN(*ret, "%s", "host cache could not hold this slot's state - not loading over it\n");
+                } else if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
+                } else if (lcp_hook) {
+                    const size_t lcp_after = ret->prompt.tokens.get_common_prefix(task.tokens);
+                    if (lcp_after <= lcp_before) {
+                        // the better entry was evicted while making room for this slot's own state: the save was wasted
+                        SLT_WRN(*ret, "host cache entry was evicted while parking this slot (reuse %zu -> %zu tokens)\n",
+                                lcp_before, lcp_after);
+                    }
                 }
 
                 prompt_cache->update();
@@ -4037,6 +4099,8 @@ private:
                                 if (ctx_dft) {
                                     llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), sz_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
                                 }
+                                // drafter carry-over at the snapshot point (restored by prompt_load; empty for draft-mtp)
+                                common_speculative_get_state(spec.get(), slot.id, cur->data.spec);
                                 prompt_cache->update();
                                 SLT_INF(slot, "saved shared prefix snapshot of %d tokens (%.1f MiB) in %.1f ms\n",
                                         n_tokens_start, (sz_tgt + sz_dft) / 1048576.0, (ggml_time_us() - t0) / 1e3);
