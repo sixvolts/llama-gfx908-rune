@@ -10981,6 +10981,25 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {256,  8, 512, 1}, 256, GGML_ROPE_TYPE_NEOX,   512, 1.0f, 0.0f, 1.0f, false, 0, true)); // gemma4 E2B sliding
     test_cases.emplace_back(new test_rope(GGML_TYPE_F32, {512,  8, 512, 1}, 128, GGML_ROPE_TYPE_NEOX,   512, 1.0f, 0.0f, 1.0f, true,  0, true)); // gemma4 E4B global
 
+    // rune seqmix: prefill shapes of the new gfx908 paths (KDA lpc + exp(g), sparse attention 2 head groups per block,
+    // hc_post hc=4, tiled indexer incl. partial tiles and a batch below the tiled minimum)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 64, 1, 1, false, true, 3));
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 4, 128, 37, 1, 1, false, true, 1));
+    test_cases.emplace_back(new test_sparse_attn(512, 512, 64, 4096, 2051, 33, 1));
+    test_cases.emplace_back(new test_sparse_attn(512, 512, 32, 1000, 300, 17, 2));
+    test_cases.emplace_back(new test_dsv4_hc_post(4096, 33));
+    test_cases.emplace_back(new test_lightning_indexer(128, 32, 1000, 77, 1, 1, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer(128, 64, 333, 40, 2, 1, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer(128, 32, 4096, 15, 1, 1, GGML_TYPE_F32));
+
+    // rune: dim-0 concat with a transposed src1 (KDA conv input at prefill) - tiled path and its edges
+    for (ggml_type t : {GGML_TYPE_F32, GGML_TYPE_F16}) {
+        test_cases.emplace_back(new test_concat_transpose(t, {3, 12288, 1, 1}, 512));
+        test_cases.emplace_back(new test_concat_transpose(t, {3, 100, 2, 1}, 37));
+        test_cases.emplace_back(new test_concat_transpose(t, {3, 33, 1, 2}, 64));
+        test_cases.emplace_back(new test_concat_transpose(t, {5, 64, 2, 1}, 16));
+    }
+
     for (int v : { 0, 1, 2, 3 }) {
         for (int dim : { 0, 1, 2, 3, }) {
             test_cases.emplace_back(new test_concat(GGML_TYPE_F32, {11, 12, 13, 14}, 7, dim, v));
@@ -11596,6 +11615,16 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // rune GLM-5.3-Flash prefill shapes (ub 512): indexer over 8192/32768 pools (f32 pooled keys, 32 heads), causal mask
+    // pattern comes from init_tensor_kq_mask; KDA conv-input concat [3 + 512, 12288]
+    test_cases.emplace_back(new test_lightning_indexer(128, 32, 8192, 512, 1, 1, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer(128, 32, 32768, 512, 1, 1, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_concat_transpose(GGML_TYPE_F32, {3, 12288, 1, 1}, 512));
+    // KDA prefill ubatch (32 heads x 128, 512 tokens, 3 rollback slots), Flash DSA sparse attention (latent 512, 64 heads)
+    test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 512, 1, 1, false, true, 3));
+    test_cases.emplace_back(new test_sparse_attn(512, 512, 64, 32768, 2051, 512, 1));
+    test_cases.emplace_back(new test_dsv4_hc_post(4096, 512));
 
     // GLM-5.3 745B sparse DSA attention at decode, verify and prefill widths (32k cache, 2048 selected cells)
     for (int64_t nq : { 1, 3, 256, 1024 }) {
