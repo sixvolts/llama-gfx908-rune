@@ -234,6 +234,18 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
 
     const auto * mctx_cur = inp_rs->mctx;
 
+    // build_rs() below expands the conv/ssm state gathers into gf right away. They do not depend on the layer input,
+    // so without this expand they land BEFORE the previous layer's (still unexpanded) FFN tail. At a pipeline stage
+    // boundary that tail lives on the previous GPU, which splits the graph into prev | next(state gather) | prev(0
+    // inputs: the whole FFN tail) | next, and the 0-input split makes the scheduler block the host on the next GPU's
+    // previous ubatch (ggml_backend_sched_compute_splits) -> the prompt pipeline never overlaps. Expanding the layer
+    // input first keeps the previous layer contiguous; it only moves the state gathers after hc_pre/attn_norm (no
+    // fusion spans them), the ops and their inputs are unchanged. LLAMA_GLM5_KDA_ORDER=0 restores the old order.
+    static const bool kda_order = !(getenv("LLAMA_GLM5_KDA_ORDER") && atoi(getenv("LLAMA_GLM5_KDA_ORDER")) == 0);
+    if (kda_order) {
+        ggml_build_forward_expand(gf, cur);
+    }
+
     // f, g and beta read the layer input, NOT the convolved q/k/v
     ggml_tensor * inp = cur;
 
