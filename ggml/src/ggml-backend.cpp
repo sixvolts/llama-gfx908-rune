@@ -2302,6 +2302,24 @@ void ggml_backend_sched_rotate_copy(ggml_backend_sched_t sched) {
     sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
     sched->rotating  = true;
 
+    // No backend may still be using the copy we rotate onto. The per-split input wait only orders the split backend's
+    // own stream, but a peer device-to-device copy into a split input runs on the SOURCE backend's stream, and nothing
+    // else orders it after the destination's last use of this copy (n_copies ubatches ago) unless the source-stream
+    // wait or a staged-input refill happens to cover it (not on the first wrap after start-up, nor for a new input).
+    // Make it an invariant here: host-wait every backend's last use of this copy. In steady state this is free (the
+    // staged-input refill already waits on the same events, and the GPUs are never n_copies ubatches behind the host).
+    // GGML_SCHED_ROTATE_WAIT=0 disables (A/B only).
+    static const bool rotate_wait = !(getenv("GGML_SCHED_ROTATE_WAIT") && atoi(getenv("GGML_SCHED_ROTATE_WAIT")) == 0);
+    if (rotate_wait) {
+        for (int b = 0; b < sched->n_backends; b++) {
+            if (sched->events[b][sched->cur_copy] != NULL) {
+                ggml_backend_event_synchronize(sched->events[b][sched->cur_copy]);
+            } else {
+                ggml_backend_synchronize(sched->backends[b]);
+            }
+        }
+    }
+
     for (int p = 0; p < sched->n_rot_patches; p++) {
         const auto & rp = sched->rot_patches[p];
         rp.node->src[rp.j] = tensor_id_copy(rp.id, rp.backend_id, sched->cur_copy);
