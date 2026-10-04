@@ -772,6 +772,11 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #ifndef GGML_SCHED_MAX_COPIES
 #define GGML_SCHED_MAX_COPIES 4
 #endif
+// runtime override of the number of pipeline copies (GGML_SCHED_COPIES=<n>, 2..GGML_SCHED_COPIES_CAP; default: the
+// compile-time GGML_SCHED_MAX_COPIES): changing the cmake value recompiles every ggml target incl. all HIP kernels
+#ifndef GGML_SCHED_COPIES_CAP
+#define GGML_SCHED_COPIES_CAP (GGML_SCHED_MAX_COPIES > 16 ? GGML_SCHED_MAX_COPIES : 16)
+#endif
 
 struct ggml_backend_sched_split {
     int backend_id;
@@ -817,7 +822,7 @@ struct ggml_backend_sched {
     int n_copies;
     int cur_copy;
     int next_copy;
-    ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
+    ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_COPIES_CAP];
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
@@ -1909,7 +1914,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
 
     sched->n_backends = n_backends;
-    sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+    int n_copies_rt = GGML_SCHED_MAX_COPIES;
+    if (getenv("GGML_SCHED_COPIES")) {
+        n_copies_rt = std::max(2, std::min((int) GGML_SCHED_COPIES_CAP, atoi(getenv("GGML_SCHED_COPIES"))));
+    }
+    sched->n_copies = parallel ? n_copies_rt : 1;
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
