@@ -3985,6 +3985,12 @@ static bool ggml_cuda_kda_conv_rows_disabled() {
     return disabled;
 }
 
+// rune: prefill (nt > 8) through the tiled kernel; GGML_CUDA_KDA_CONV_ROWS_PREFILL=0 keeps prefill unfused
+static bool ggml_cuda_kda_conv_rows_prefill_enabled() {
+    static const bool en = getenv("GGML_CUDA_KDA_CONV_ROWS_PREFILL") == nullptr || atoi(getenv("GGML_CUDA_KDA_CONV_ROWS_PREFILL")) != 0;
+    return en;
+}
+
 // use count of any tensor in the graph (views included), -1 when unknown
 static int kda_use_count(const ggml_cgraph * g, const ggml_tensor * t) {
     if (!g->use_counts || !ggml_hash_contains(&g->visited_hash_set, (ggml_tensor *) t)) {
@@ -4010,7 +4016,8 @@ static bool ggml_cuda_kda_conv_rows_find(const ggml_cgraph * g, int i, ggml_cuda
     const ggml_tensor * q = c1->src[0];
     const ggml_tensor * k = c1->src[1];
     const int64_t nt = q->ne[1];
-    if (nt < 1 || nt > 8 || !kda_f32_cols(q, nt) || !kda_f32_cols(k, nt) || kda_use_count(g, c1) != 1) {
+    if (nt < 1 || (nt > KDA_CONV_ROWS_DECODE_MAX_NT && !ggml_cuda_kda_conv_rows_prefill_enabled()) ||
+            !kda_f32_cols(q, nt) || !kda_f32_cols(k, nt) || kda_use_count(g, c1) != 1) {
         return false;
     }
     int j = dsv4_hc_next(g, i + 1);
@@ -4122,6 +4129,22 @@ static bool ggml_cuda_kda_conv_rows_disjoint(const ggml_cuda_kda_conv_rows_match
     return true;
 }
 
+// the tiled prefill kernel writes the slots from other blocks than the one that reads the states: no slot may alias them
+static bool ggml_cuda_kda_conv_rows_slots_apart(const ggml_cuda_kda_conv_rows_match & m) {
+    const ggml_tensor * st = m.c3->src[0];
+    const char * s0 = (const char *) st->data;
+    const char * s1 = s0 + ggml_nbytes(st);
+    for (int a = 0; a < m.n_cpy; ++a) {
+        const ggml_tensor * d = m.cpy[a]->src[1];
+        const char * d0 = (const char *) d->data;
+        const char * d1 = d0 + ggml_nbytes(d);
+        if (d0 < s1 && s0 < d1) {
+            return false;
+        }
+    }
+    return true;
+}
+
 static int ggml_cuda_try_fuse_kda_conv_rows(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
     if (ggml_cuda_kda_conv_rows_disabled()) {
         return 0;
@@ -4130,7 +4153,7 @@ static int ggml_cuda_try_fuse_kda_conv_rows(ggml_backend_cuda_context * cuda_ctx
     if (!ggml_cuda_kda_conv_rows_find(cgraph, i, m)) {
         return 0;
     }
-    if (!ggml_cuda_kda_conv_rows_disjoint(m)) {
+    if (!ggml_cuda_kda_conv_rows_disjoint(m) || (m.c1->src[0]->ne[1] > KDA_CONV_ROWS_DECODE_MAX_NT && !ggml_cuda_kda_conv_rows_slots_apart(m))) {
         // expected only where graph_optimize's alloc deps did not run (an RPC server's graphs are allocated by the client)
         static bool logged = false;
         if (!logged) {

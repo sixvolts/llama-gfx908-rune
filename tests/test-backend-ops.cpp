@@ -9447,9 +9447,9 @@ static const ggml_type other_types[] = {
 // Test cases for evaluation: should try to cover edge cases while using small input sizes to keep the runtime low
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
-    // KDA conv-input assembly (llama-halo-hybrid; one launch at decode on CUDA/HIP, nt <= 8; gated off at nt = 64)
+    // KDA conv-input assembly (llama-halo-hybrid; one launch at decode on CUDA/HIP, nt <= 8; rune: tiled kernel at nt > 8)
     for (int64_t C : {24576, 300}) {
-        for (int64_t nt : {1, 2, 3, 4, 8, 64}) {
+        for (int64_t nt : {1, 2, 3, 4, 8, 9, 64, 77, 512}) {
             for (int64_t K : {1, 3, 4}) {
                 test_cases.emplace_back(new test_kda_conv_state(C, nt, K, "leaf"));
             }
