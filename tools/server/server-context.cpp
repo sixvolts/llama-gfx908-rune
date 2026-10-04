@@ -3473,9 +3473,17 @@ private:
                         [&](const server_slot * a, const server_slot * b) { return key[a->id] < key[b->id]; });
             }
 
+            // with LLAMA_PROMPT_SJF, a batch in which a prompt completes is not topped up with another slot's prompt
+            // tokens: the finishing request would otherwise wait for up to n_batch tokens of someone else's prefill
+            // before its first token (the other prompt continues in the next batch)
+            bool prompt_done_in_batch = false;
+
             iterate(fill_order, [&](server_slot & slot) {
                 if (!add_ok || batch.size() >= n_batch_prompt) {
                     return; // batch is full, skip remaining slots
+                }
+                if (prompt_sjf > 0.0 && prompt_done_in_batch) {
+                    return;
                 }
 
                 if (!slot.is_processing()) {
@@ -3966,6 +3974,7 @@ private:
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
+                        prompt_done_in_batch = true;
 
                         GGML_ASSERT(batch.size() > 0);
 
