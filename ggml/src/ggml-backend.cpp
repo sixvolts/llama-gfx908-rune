@@ -1746,10 +1746,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     sched->compute_gen++;
     static const bool stage_inputs = !(getenv("GGML_SCHED_STAGE_INPUTS") && atoi(getenv("GGML_SCHED_STAGE_INPUTS")) == 0);
 
+    // GGML_SCHED_TIMING=1: host time per backend spent on split inputs vs graph launch (multi-split graphs only),
+    // logged every 200 computes. Diagnostics only.
+    static const bool sched_timing = getenv("GGML_SCHED_TIMING") && atoi(getenv("GGML_SCHED_TIMING")) != 0;
+    static double  st_in[GGML_SCHED_MAX_BACKENDS] = {}, st_cp[GGML_SCHED_MAX_BACKENDS] = {};
+    static int64_t st_calls = 0;
+    const bool timing = sched_timing && sched->n_splits > 2;
+    int64_t t_split0 = timing ? ggml_time_us() : 0;
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        if (timing) { t_split0 = ggml_time_us(); }
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1929,10 +1938,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        const int64_t t_split1 = timing ? ggml_time_us() : 0;
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
+            }
+            if (timing) {
+                st_in[split_backend_id] += t_split1 - t_split0;
+                st_cp[split_backend_id] += ggml_time_us() - t_split1;
             }
         } else {
             // similar to ggml_backend_compare_graph_backend
@@ -1974,6 +1988,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         prev_backend_id = split_backend_id;
+    }
+
+    if (timing && ++st_calls % 200 == 0) {
+        char buf[1024]; int o = 0;
+        for (int b = 0; b < sched->n_backends && o < (int) sizeof(buf) - 40; b++) {
+            o += snprintf(buf + o, sizeof(buf) - o, " %d:%.1f/%.1f", b, st_in[b]/st_calls/1e3, st_cp[b]/st_calls/1e3);
+        }
+        GGML_LOG_WARN("sched timing (n=%lld, ms per compute, inputs/launch per backend):%s\n", (long long) st_calls, buf);
     }
 
     return GGML_STATUS_SUCCESS;

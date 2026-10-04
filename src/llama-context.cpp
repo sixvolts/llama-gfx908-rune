@@ -1429,6 +1429,12 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // LLAMA_GRAPH_TIMING=1 (below) also reports the memory apply and the host time between consecutive process_ubatch calls
+    static const bool graph_timing_ap = getenv("LLAMA_GRAPH_TIMING") && atoi(getenv("LLAMA_GRAPH_TIMING")) != 0;
+    static int64_t t_prev_end = 0;
+    static double  ap_sum = 0, gap_sum = 0;
+    static int64_t ap_n = 0;
+    const int64_t t_ap0 = graph_timing_ap ? ggml_time_us() : 0;
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1550,6 +1556,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 __func__, reused ? "REUSED " : "REBUILT", (long long) gt_n[r], ubatch.n_tokens,
                 gt_sum[r][0]/gt_n[r]/1e3, gt_sum[r][1]/gt_n[r]/1e3, gt_sum[r][2]/gt_n[r]/1e3, gt_sum[r][3]/gt_n[r]/1e3);
         }
+    }
+
+    if (graph_timing_ap && ubatch.n_tokens >= 64) {
+        const int64_t t_end = ggml_time_us();
+        ap_sum += (double) (gt_t[0] ? gt_t[0] : t_end) - t_ap0;
+        if (t_prev_end) { gap_sum += t_ap0 - t_prev_end; }
+        if (++ap_n % 200 == 0) {
+            LLAMA_LOG_WARN("%s: graph timing prompt ubatches (n=%lld): memory apply %.2f | host outside process_ubatch %.2f ms\n",
+                __func__, (long long) ap_n, ap_sum/ap_n/1e3, gap_sum/ap_n/1e3);
+        }
+        t_prev_end = t_end;
     }
 
     ret = GGML_STATUS_SUCCESS;
