@@ -37,8 +37,11 @@ static ggml_tensor * build_attn_inp_kq_mask(
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
-    // flash attention requires an f16 mask
-    const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    // flash attention requires an f16 mask. LLAMA_KQ_MASK_F16=1 also uses f16 without flash attention: the mask only
+    // holds 0 / -INF (exact in f16) and the consumers (soft_max_ext, the sparse-gather get_rows -> f32) accept f16; it
+    // halves the n_kv x n_ubatch input that is uploaded to every pipeline stage for every ubatch and per pipeline copy
+    static const bool f16_mask = getenv("LLAMA_KQ_MASK_F16") && atoi(getenv("LLAMA_KQ_MASK_F16")) == 1;
+    const auto type = (cparams.flash_attn || f16_mask) ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
     ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
     ggml_set_input(res);
