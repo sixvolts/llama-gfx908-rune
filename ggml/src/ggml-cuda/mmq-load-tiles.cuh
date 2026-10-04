@@ -698,6 +698,18 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #endif // !(defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)) || defined(AMD_WMMA_AVAILABLE)
 }
 
+// Same result as unpack_scales_q45_K on the three scale ints held in registers: the runtime index is resolved with
+// selects instead of an indexed array, which would force the array (and the whole prefetch register set holding it)
+// into scratch memory and make every prefetched global load wait before its scratch store (gfx908 codegen).
+static __device__ __forceinline__ int unpack_scales_q45_K_reg(const int s0, const int s1, const int s2, const int ksc) {
+    const int ilo = (ksc%2) + (ksc!=0);
+    const int ihi = ksc/2;
+    const int lo  = ilo == 0 ? s0 : (ilo == 1 ? s1 : s2);
+    const int hi  = ihi == 0 ? s0 : (ihi == 1 ? s1 : s2);
+    return ((lo >> (4 * (ksc & (ksc/2)))) & 0x0F0F0F0F) | // lower 4 bits
+           ((hi >> (2 * (ksc % 2)))       & 0x30303030);  // upper 2 bits
+}
+
 static __device__ __forceinline__ int unpack_scales_q45_K(const int * scales, const int ksc) {
     // scale arrangement after the following two lines:
     //   - ksc == 0: sc0, sc1, sc2, sc3
@@ -1962,8 +1974,9 @@ template <int J, bool fallback> struct mmq_x_prefetch<GGML_TYPE_Q4_K, J, fallbac
             if (i < I) {
                 if (fallback) { i = min(i, i_max); }
                 const int ksc = threadIdx.x % 2;
-                const int sc32 = unpack_scales_q45_K(r.sc[n], ksc + 0);
-                const int  m32 = unpack_scales_q45_K(r.sc[n], ksc + 2);
+                // register-only scale unpack (bit-exact; keeps the prefetch registers out of scratch)
+                const int sc32 = unpack_scales_q45_K_reg(r.sc[n][0], r.sc[n][1], r.sc[n][2], ksc + 0);
+                const int  m32 = unpack_scales_q45_K_reg(r.sc[n][0], r.sc[n][1], r.sc[n][2], ksc + 2);
                 const uint8_t * sc8 = (const uint8_t *) &sc32;
                 const uint8_t *  m8 = (const uint8_t *)  &m32;
                 const half2 dm = r.dm[n] * make_half2(1.0f, -1.0f);
