@@ -361,6 +361,9 @@ template <ggml_type type, int J, bool fallback, int NJ> static __device__ __forc
 
     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
 
+    // unrolled (bit-exact: same per-element operation order): lets the scheduler overlap the LDS reads and MFMAs of
+    // consecutive k01 steps (Q4_K MoE at prefill -4..7%; not done for the Q8_0 variant, where it measured slower)
+#pragma unroll
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) {
         const int k0 = k00 + k01;
 
