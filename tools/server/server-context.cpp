@@ -1673,9 +1673,10 @@ private:
                 const size_t lcp_len = tokens.get_common_prefix(task.tokens);
                 const float f_sim_cur = float(lcp_len) / task.tokens.size();
 
-                // with a shared prefix snapshot covering the match, taking over this slot would only evict another
-                // conversation (f_keep < 0.5) to reuse what any empty slot can load from the snapshot
-                if (prefix_share > 0 && prompt_cache && 2*lcp_len < tokens.size() && has_empty_idle_slot() &&
+                // with a shared prefix snapshot covering the match, taking over this slot would only destroy (f_keep >= 0.5:
+                // truncated, not even parked in the host cache) or evict another conversation's state to reuse what any
+                // empty slot can load from the snapshot
+                if (prefix_share > 0 && prompt_cache && tokens.size() > lcp_len + 512 && has_empty_idle_slot() &&
                     prompt_cache->shared_prefix_len(task.tokens) + 512 >= lcp_len) {   // the LCP usually runs a few tokens past the snapshot (e.g. the <|user|> token)
                     SLT_INF(slot, " - not taking over this slot for its %zu-token shared prefix (f_keep %.3f): snapshot + empty slot\n",
                             lcp_len, float(lcp_len) / tokens.size());
