@@ -1611,6 +1611,27 @@ private:
         return nullptr;
     }
 
+    // LLAMA_PREFIX_SHARE=<min tokens> (0/unset = off): shared prefix snapshots in the host prompt cache (see update_slots)
+    const int32_t prefix_share = getenv("LLAMA_PREFIX_SHARE") ? atoi(getenv("LLAMA_PREFIX_SHARE")) : 0;
+
+    bool has_empty_idle_slot() const {
+        for (const server_slot & s : slots) {
+            if (!s.is_processing() && s.prompt.tokens.empty()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static int32_t first_user_pos(const common_chat_msg_spans & spans) {
+        for (const auto & sp : spans.spans) {
+            if (sp.role == COMMON_CHAT_ROLE_USER) {
+                return (int32_t) sp.pos;
+            }
+        }
+        return -1;
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
@@ -1650,6 +1671,15 @@ private:
                 // fraction of the Longest Common Prefix length with respect to the input prompt length
                 const size_t lcp_len = tokens.get_common_prefix(task.tokens);
                 const float f_sim_cur = float(lcp_len) / task.tokens.size();
+
+                // with a shared prefix snapshot covering the match, taking over this slot would only evict another
+                // conversation (f_keep < 0.5) to reuse what any empty slot can load from the snapshot
+                if (prefix_share > 0 && prompt_cache && 2*lcp_len < tokens.size() && has_empty_idle_slot() &&
+                    prompt_cache->shared_prefix_len(task.tokens) >= lcp_len) {
+                    SLT_INF(slot, " - not taking over this slot for its %zu-token shared prefix (f_keep %.3f): snapshot + empty slot\n",
+                            lcp_len, float(lcp_len) / tokens.size());
+                    continue;
+                }
 
                 SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
 
@@ -2514,6 +2544,8 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
+        const int64_t t_ckpts = ggml_time_us();
+        llama_synchronize(ctx_tgt);   // update_tgt syncs anyway; done here only to time the wait apart from the copy
         const int64_t t_ckpt0 = ggml_time_us();
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         const int64_t t_ckpt1 = ggml_time_us();
@@ -2521,9 +2553,9 @@ private:
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
         const int64_t t_ckpt2 = ggml_time_us();
-        if (t_ckpt2 - t_ckpt0 > 50000) {
-            SLT_INF(slot, "context checkpoint at n_tokens = %" PRId64 " took %.1f ms (target %.1f ms, %.1f MiB)\n",
-                    cur.n_tokens, (t_ckpt2 - t_ckpt0)/1e3, (t_ckpt1 - t_ckpt0)/1e3, (float) cur.size() / 1024 / 1024);
+        if (t_ckpt2 - t_ckpts > 50000) {
+            SLT_INF(slot, "context checkpoint at n_tokens = %" PRId64 " took %.1f ms (target %.1f ms, %.1f MiB; sync wait before it %.1f ms)\n",
+                    cur.n_tokens, (t_ckpt2 - t_ckpt0)/1e3, (t_ckpt1 - t_ckpt0)/1e3, (float) cur.size() / 1024 / 1024, (t_ckpt0 - t_ckpts)/1e3);
         }
 
         SLT_TRC(slot,
@@ -3933,6 +3965,31 @@ private:
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                    }
+
+                    // LLAMA_PREFIX_SHARE=<min tokens>: when a batch starts at the first user message, the slot holds
+                    // exactly the shared prefix (system prompt + tool definitions); keep a copy of that state in the
+                    // host prompt cache so a new conversation with the same prefix starts from it in any slot instead
+                    // of prefilling it again (or evicting another live conversation's slot through LCP similarity).
+                    if (prefix_share > 0 && prompt_cache && !has_mtmd && pos_min >= 0 &&
+                        n_tokens_start >= prefix_share && n_tokens_start == first_user_pos(spans)) {
+                        server_tokens pref = slot.prompt.tokens.clone();
+                        pref.keep_first(n_tokens_start);
+                        if (prompt_cache->shared_prefix_len(pref) < (size_t) n_tokens_start) {
+                            const int64_t t0 = ggml_time_us();
+                            const size_t sz_tgt =           llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                            const size_t sz_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+                            auto * cur = prompt_cache->alloc_shared(pref, sz_tgt, sz_dft);
+                            if (cur) {
+                                llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), sz_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                                if (ctx_dft) {
+                                    llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), sz_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                                }
+                                prompt_cache->update();
+                                SLT_INF(slot, "saved shared prefix snapshot of %d tokens (%.1f MiB) in %.1f ms\n",
+                                        n_tokens_start, (sz_tgt + sz_dft) / 1048576.0, (ggml_time_us() - t0) / 1e3);
+                            }
+                        }
                     }
                 }
 

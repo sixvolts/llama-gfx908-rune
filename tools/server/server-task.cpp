@@ -1747,7 +1747,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (len == (int) it->prompt.tokens.size()) {
+        if (len == (int) it->prompt.tokens.size() && !it->shared) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
             it = states.erase(it);
@@ -1759,10 +1759,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     if (limit_size > 0) {
         // make room before allocating the new vectors to avoid breaching the limit
         while (!states.empty() && size() + state_size_new > limit_size) {
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
+            SRV_WRN("%s", " - making room for prompt cache entry, removing oldest entry\n");
 
-            states.pop_front();
+            evict_one();
         }
     }
 
@@ -1823,6 +1822,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             continue;
         }
 
+        // a shared snapshot has no checkpoints: only useful when the new prompt contains all of it
+        if (it->shared && lcp_cur != (int) it->prompt.tokens.size()) {
+            continue;
+        }
+
         if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
@@ -1833,6 +1837,11 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+
+        const bool shared = it_best->shared;
+        if (shared) {
+            SRV_INF(" - loading shared prefix snapshot (%d tokens) by copy\n", it_best->prompt.n_tokens());
+        }
 
         {
             auto & data = it_best->data.main;
@@ -1845,8 +1854,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 return false;
             }
 
-            data.clear();
-            data.shrink_to_fit();
+            if (!shared) {
+                data.clear();
+                data.shrink_to_fit();
+            }
         }
 
         {
@@ -1863,14 +1874,22 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                     return false;
                 }
 
-                data.clear();
-                data.shrink_to_fit();
+                if (!shared) {
+                    data.clear();
+                    data.shrink_to_fit();
+                }
             }
         }
 
-        prompt = std::move(it_best->prompt);
+        if (shared) {
+            prompt = it_best->prompt.clone();
+            // keep it warm: most recently used shared entries are evicted last
+            states.splice(states.end(), states, it_best);
+        } else {
+            prompt = std::move(it_best->prompt);
 
-        states.erase(it_best);
+            states.erase(it_best);
+        }
     }
 
     return true;
@@ -1879,9 +1898,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 void server_prompt_cache::update() {
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+            SRV_WRN("%s", " - cache size limit reached, removing oldest entry\n");
 
-            states.pop_front();
+            evict_one();
         }
     }
 
@@ -1893,10 +1912,10 @@ void server_prompt_cache::update() {
 
     if (limit_tokens > 0) {
         while (!states.empty() && n_tokens() > limit_tokens_cur) {
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry\n",
+                    limit_tokens, limit_tokens_cur);
 
-            states.pop_front();
+            evict_one();
         }
     }
 
@@ -1907,4 +1926,78 @@ void server_prompt_cache::update() {
         SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
                 (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
     }
+}
+
+bool server_prompt_cache::evict_one() {
+    if (states.empty()) {
+        return false;
+    }
+    auto it = states.begin();
+    while (it != states.end() && it->shared) {
+        ++it;
+    }
+    if (it == states.end()) {
+        it = states.begin();   // only shared snapshots left: drop the least recently used one
+    }
+    SRV_WRN(" - evicting cached prompt (%d tokens, shared = %d, size = %.3f MiB)\n",
+            it->prompt.n_tokens(), (int) it->shared, it->size() / (1024.0 * 1024.0));
+    states.erase(it);
+    return true;
+}
+
+size_t server_prompt_cache::shared_prefix_len(const server_tokens & tokens) const {
+    size_t best = 0;
+    for (const auto & st : states) {
+        if (!st.shared) {
+            continue;
+        }
+        const size_t n = st.prompt.tokens.size();
+        if (n > best && (size_t) st.prompt.tokens.get_common_prefix(tokens) == n) {
+            best = n;
+        }
+    }
+    return best;
+}
+
+server_prompt_cache_state * server_prompt_cache::alloc_shared(const server_tokens & tokens, size_t state_size_tgt, size_t state_size_dft) {
+    for (const auto & st : states) {
+        if (st.shared && st.prompt.tokens.size() == tokens.size() &&
+            (size_t) st.prompt.tokens.get_common_prefix(tokens) == tokens.size()) {
+            return nullptr;   // already have it
+        }
+    }
+
+    const size_t state_size_new = state_size_tgt + state_size_dft;
+    if (limit_size > 0 && state_size_new > limit_size) {
+        return nullptr;
+    }
+    if (limit_size > 0) {
+        while (!states.empty() && size() + state_size_new > limit_size) {
+            evict_one();
+        }
+    }
+
+    std::vector<uint8_t> state_data_tgt;
+    std::vector<uint8_t> state_data_dft;
+    try {
+        state_data_tgt.resize(state_size_tgt);
+        state_data_dft.resize(state_size_dft);
+    } catch (const std::bad_alloc & e) {
+        SRV_ERR("failed to allocate memory for a shared prefix snapshot: %s\n", e.what());
+        return nullptr;
+    }
+
+    states.push_back({
+        /*.prompt =*/ {
+            /*.tokens      =*/ tokens.clone(),
+            /*.checkpoints =*/ {},
+        },
+        /*.data   =*/ {
+            /*.main =*/ std::move(state_data_tgt),
+            /*.drft =*/ std::move(state_data_dft),
+        },
+        /*.shared =*/ true,
+    });
+
+    return &states.back();
 }

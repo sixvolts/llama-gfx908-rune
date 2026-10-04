@@ -598,6 +598,11 @@ struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
 
+    // shared prefix snapshot (LLAMA_PREFIX_SHARE): the exact state after prompt.tokens (no checkpoints needed), loaded by
+    // copy into any slot whose new prompt starts with it, kept in the cache (not consumed by load, not removed as a
+    // prefix of a longer saved prompt)
+    bool shared = false;
+
     size_t size() const {
         size_t res = data.size();
 
@@ -635,6 +640,15 @@ struct server_prompt_cache {
 
     // true if an entry already holds all of `tokens` (alloc() skips such prompts)
     bool contains(const server_tokens & tokens) const;
+
+    // LLAMA_PREFIX_SHARE: allocate a shared prefix snapshot for `tokens` (nullptr if one exists / does not fit)
+    server_prompt_cache_state * alloc_shared(const server_tokens & tokens, size_t state_size_tgt, size_t state_size_dft);
+
+    // length of the longest shared snapshot that is a prefix of `tokens` (0 = none)
+    size_t shared_prefix_len(const server_tokens & tokens) const;
+
+    // evict the oldest entry, preferring non-shared ones; false if empty
+    bool evict_one();
 };
 
 // used exclusively by router mode
