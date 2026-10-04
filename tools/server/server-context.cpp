@@ -298,6 +298,7 @@ struct server_slot {
 
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
+    int64_t t_task_arrival_us = 0;   // when the current task was assigned (LLAMA_PROMPT_SJF)
 
     // generation props
     int32_t n_ctx   = 0;  // context size per slot
@@ -1894,6 +1895,7 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        slot.t_task_arrival_us = ggml_time_us();   // LLAMA_PROMPT_SJF ordering
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -3443,7 +3445,35 @@ private:
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
-            iterate(slots, [&](server_slot & slot) {
+            // LLAMA_PROMPT_SJF=<tokens per second> (0/unset = off): fill prompt batches in order of estimated finish
+            // time (arrival + remaining prompt tokens / rate) instead of slot index, so a short agentic turn is not
+            // queued behind another session's long prefill (earliest-deadline-first: favours short prompts, cannot
+            // starve a long one). Default upstream order = slot index.
+            static const double prompt_sjf = getenv("LLAMA_PROMPT_SJF") ? atof(getenv("LLAMA_PROMPT_SJF")) : 0.0;
+            std::vector<server_slot *> fill_order;
+            fill_order.reserve(slots.size());
+            for (auto & s : slots) {
+                fill_order.push_back(&s);
+            }
+            if (prompt_sjf > 0.0) {
+                std::vector<double> key(slots.size(), 0.0);
+                for (auto & s : slots) {
+                    if (!s.is_processing() || !s.task ||
+                        (s.state != SLOT_STATE_PROCESSING_PROMPT && s.state != SLOT_STATE_STARTED)) {
+                        key[s.id] = -1e300;   // generating / idle slots keep their place in front (no prompt to add)
+                        continue;
+                    }
+                    const size_t done = s.state == SLOT_STATE_STARTED
+                        ? (size_t) s.prompt.tokens.get_common_prefix(s.task->tokens)
+                        : (size_t) s.prompt.n_tokens();
+                    const double remaining = (double) s.task->n_tokens() - (double) done;
+                    key[s.id] = s.t_task_arrival_us / 1e6 + remaining / prompt_sjf;
+                }
+                std::stable_sort(fill_order.begin(), fill_order.end(),
+                        [&](const server_slot * a, const server_slot * b) { return key[a->id] < key[b->id]; });
+            }
+
+            iterate(fill_order, [&](server_slot & slot) {
                 if (!add_ok || batch.size() >= n_batch_prompt) {
                     return; // batch is full, skip remaining slots
                 }
