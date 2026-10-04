@@ -483,6 +483,28 @@ llama_context::llama_context(
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
         }
 
+        // LLAMA_SCHED_COPIES_SINGLE=1: a fully offloaded single-GPU context (rune: the MTP drafter on its own GPU) also
+        // gets the scheduler's input copies + events. Without them every prompt ubatch's input copy waits on the host
+        // for the GPU to finish the previous ubatch, so the drafter's prompt pass (4 ubatches per 2048-token batch)
+        // blocks the server thread and the trunk's next batch cannot start until the drafter is done. With copies (and
+        // rotation on graph reuse) the drafter's ubatches are only enqueued and it overlaps the trunk. Nothing else of
+        // pipeline parallelism (dummy output row, multi-device split rules) is enabled.
+        static const bool single_copies = getenv("LLAMA_SCHED_COPIES_SINGLE") && atoi(getenv("LLAMA_SCHED_COPIES_SINGLE")) == 1;
+        if (!pipeline_parallel && single_copies && model.n_devices() == 1 && model.n_gpu_layers() > model.hparams.n_layer_all) {
+            bool ok = true;
+            for (auto & backend : backends) {
+                auto * dev = ggml_backend_get_device(backend.get());
+                if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    continue;
+                }
+                ggml_backend_dev_props props;
+                ggml_backend_dev_get_props(dev, &props);
+                ok = ok && props.caps.async && props.caps.events;
+            }
+            cparams.sched_copies = ok;
+            LLAMA_LOG_INFO("%s: LLAMA_SCHED_COPIES_SINGLE=1: single-device scheduler input copies %s\n", __func__, ok ? "enabled" : "unavailable (no async/events)");
+        }
+
         sched_reserve();
 
         if (!cparams.flash_attn) {
