@@ -649,6 +649,13 @@ struct server_prompt_cache {
 
     // evict the oldest entry, preferring non-shared ones; false if empty
     bool evict_one();
+
+    // longest prefix of `tokens` that load() could restore from one entry (0 = none)
+    size_t best_lcp(const server_tokens & tokens) const;
+
+    // LLAMA_SLOT_CACHE_LCP (default 1): load() picks the entry reusing the most tokens; a slot chosen by LCP
+    // similarity still loads from the cache when an entry there reuses more
+    static bool slot_cache_lcp();
 };
 
 // used exclusively by router mode

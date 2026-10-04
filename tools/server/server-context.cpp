@@ -1805,6 +1805,18 @@ private:
             }
         }
 
+        // the chosen live slot may reuse less than a conversation parked in the host cache (e.g. after a compaction
+        // move evicted it): then go through the cache update, whose load() takes the better entry
+        if (ret && !update_cache && prompt_cache && server_prompt_cache::slot_cache_lcp() &&
+            task.type == SERVER_TASK_TYPE_COMPLETION) {
+            const size_t lcp_slot  = ret->prompt.tokens.get_common_prefix(task.tokens);
+            const size_t lcp_cache = prompt_cache->best_lcp(task.tokens);
+            if (lcp_cache > lcp_slot) {
+                SLT_INF(*ret, "host prompt cache reuses more than this slot (%zu vs %zu tokens) - loading from it\n", lcp_cache, lcp_slot);
+                update_cache = true;
+            }
+        }
+
         if (ret) {
             update_cache = update_cache && prompt_cache;
 

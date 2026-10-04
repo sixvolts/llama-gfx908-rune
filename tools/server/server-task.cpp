@@ -1798,6 +1798,26 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     return &states.back();
 }
 
+bool server_prompt_cache::slot_cache_lcp() {
+    static const bool on = !(getenv("LLAMA_SLOT_CACHE_LCP") && atoi(getenv("LLAMA_SLOT_CACHE_LCP")) == 0);
+    return on;
+}
+
+size_t server_prompt_cache::best_lcp(const server_tokens & tokens) const {
+    size_t best = 0;
+    for (const auto & st : states) {
+        const size_t lcp = st.prompt.tokens.get_common_prefix(tokens);
+        if (lcp == 0 || 4*lcp < st.prompt.tokens.size()) {
+            continue;   // load() skips entries it would keep < 25 % of
+        }
+        if (st.shared && lcp != st.prompt.tokens.size()) {
+            continue;
+        }
+        best = std::max(best, lcp);
+    }
+    return best;
+}
+
 bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
@@ -1807,6 +1827,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
     auto it_best = states.end();
+    int lcp_best_cur = lcp_best;   // LLAMA_SLOT_CACHE_LCP: tokens reused by the current choice (the slot's own content)
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
@@ -1827,9 +1848,16 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             continue;
         }
 
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+        // LLAMA_SLOT_CACHE_LCP (default on): pick the entry that reuses the most tokens; the slot's own content was
+        // saved to the cache before this load, so nothing is lost by replacing it (the upstream rule also demands a
+        // higher kept fraction, which rejects e.g. a parked 16k conversation in favour of a slot's 8.8k system prompt)
+        const bool better = slot_cache_lcp()
+            ? lcp_cur > lcp_best_cur
+            : (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur);
+        if (better) {
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
+            lcp_best_cur = lcp_cur;
 
             it_best = it;
         }
