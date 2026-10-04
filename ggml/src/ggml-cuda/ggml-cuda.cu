@@ -2636,7 +2636,7 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
 // event, slot reuse gated by an event recorded after its H2D. Both streams stay asynchronous (pipeline parallelism keeps
 // overlapping); the host only waits if a slot is still in flight N copies later.
 struct ggml_cuda_stage_ring {
-    static constexpr int N = 4;
+    static constexpr int N = 16;   // capacity; GGML_CUDA_STAGE_RING=<n> slots are used (default 4)
     void *      buf[N]      = {};
     size_t      size[N]     = {};
     cudaEvent_t d2h_done[N] = {};   // created on the src device
@@ -2651,9 +2651,11 @@ static void ggml_cuda_cpy_host_staged(ggml_backend_cuda_context * ctx_src, ggml_
     static ggml_cuda_stage_ring rings[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES];
     std::lock_guard<std::mutex> lock(mtx);
 
+    // more slots let a source GPU run further ahead of its destination (rotating pipeline copies) before the host waits
+    static const int n_slots = getenv("GGML_CUDA_STAGE_RING") ? std::max(1, std::min(ggml_cuda_stage_ring::N, atoi(getenv("GGML_CUDA_STAGE_RING")))) : 4;
     ggml_cuda_stage_ring & r = rings[ctx_src->device][ctx_dst->device];
     const int i = r.next;
-    r.next = (r.next + 1) % ggml_cuda_stage_ring::N;
+    r.next = (r.next + 1) % n_slots;
     if (r.used[i]) {
         CUDA_CHECK(cudaEventSynchronize(r.h2d_done[i]));   // slot i's previous H2D has consumed the buffer
     }
