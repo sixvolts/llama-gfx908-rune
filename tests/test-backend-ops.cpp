@@ -11606,6 +11606,28 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         }
     }
 
+    // row-contiguous permute copies (cpy.cu ggml_cuda_cpy_rows): GLM-5.3 DSA absorbed q [512, tokens, 64] -> [512, 64,
+    // tokens], f16, an unaligned (4-byte) row width, a 4D permute keeping dim 0, the view-slice form
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {512, 37, 64, 1}, false, {0, 2, 1, 3}));
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F16, {512, 37, 64, 1}, false, {0, 2, 1, 3}));
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {67, 33, 5, 2}, false, {0, 2, 1, 3}));
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {64, 9, 7, 3}, false, {0, 3, 1, 2}));
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {256, 5, 4, 3}, true));
+
+    // gfx908 thin Q8_0 projections at prefill widths (mm-thin-f16.cu): GLM-5.3 hc_*_fn K=16384 M=24, ssm_f_a/g_a and
+    // indexer k / compressor gate M=128, ssm_beta M=64, kv_a M=512, ssm_f_b/g_b K=128 M=8192; edge shapes: partial
+    // token tiles (n 129/200/300), partial row tiles (m 40/100/200), K at one chunk (64/192), split-K remainders
+    for (auto mnk : std::vector<std::array<int64_t, 3>>{
+            {24, 512, 16384}, {128, 512, 4096}, {64, 512, 4096}, {512, 512, 4096}, {8192, 512, 128},
+            {24, 129, 16384}, {24, 300, 4096}, {40, 200, 4160}, {100, 512, 4096}, {200, 257, 2048},
+            {128, 512, 64}, {64, 160, 192}, {512, 1024, 4096}, {4096, 300, 128}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mnk[0], mnk[1], mnk[2], {1, 1}, {1, 1}));
+    }
+    // equal-batch thin projections (GLM-5.3 DSA k_b: K=256 M=512 x 64 heads, v_b: K=512 M=256), incl. a permuted src1
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 160, 256, {64, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 129, 512, {8, 1}, {1, 1}));
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 200, 256, {16, 1}, {1, 1}, {0, 2, 1, 3}));
+
     return test_cases;
 }
 #ifdef _MSC_VER
@@ -11625,6 +11647,13 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     test_cases.emplace_back(new test_gated_delta_net(GGML_TYPE_F32, 32, 128, 512, 1, 1, false, true, 3));
     test_cases.emplace_back(new test_sparse_attn(512, 512, 64, 32768, 2051, 512, 1));
     test_cases.emplace_back(new test_dsv4_hc_post(4096, 512));
+    test_cases.emplace_back(new test_cont(GGML_TYPE_F32, {512, 512, 64, 1}, false, {0, 2, 1, 3})); // DSA absorbed q
+    // thin Q8_0 projections at prefill (mm-thin-f16.cu): hc_fn, ssm_f_a/indexer k, ssm_beta, kv_a, ssm_f_b
+    for (auto mk : std::vector<std::array<int64_t, 2>>{{24, 16384}, {128, 4096}, {64, 4096}, {512, 4096}, {8192, 128}}) {
+        test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, mk[0], 512, mk[1], {1, 1}, {1, 1}));
+    }
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 512, 512, 256, {64, 1}, {1, 1})); // DSA k_b
+    test_cases.emplace_back(new test_mul_mat(GGML_TYPE_Q8_0, GGML_TYPE_F32, 256, 512, 512, {64, 1}, {1, 1})); // DSA v_b
 
     // GLM-5.3 745B sparse DSA attention at decode, verify and prefill widths (32k cache, 2048 selected cells)
     for (int64_t nq : { 1, 3, 256, 1024 }) {
