@@ -836,6 +836,7 @@ struct ggml_backend_sched {
     uint64_t * rot_uids;          // [n_splits][n_copies], 0 = not assigned yet
     int        rot_uids_capacity;
     bool       rotating;          // the current graph has been rotated at least once (prompt ubatches of a reused graph)
+    bool       rot_wait_pending;  // rotate_copy moved onto a copy: compute_splits host-waits every backend's last use of it
 
     // staged user inputs (GGML_SCHED_STAGE_INPUTS, rotating graphs only): one pinned snapshot per (input name, copy),
     // uploaded with async H2Ds on each consuming split's stream instead of one synchronous H2D per split
@@ -1616,6 +1617,7 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     }
     sched->rot_valid = false;
     sched->rotating  = false;
+    sched->rot_wait_pending = false;
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
@@ -1744,6 +1746,22 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     int prev_backend_id = -1;
 
     sched->compute_gen++;
+
+    // see ggml_backend_sched_rotate_copy: no backend may still use the copy this ubatch is about to overwrite. In steady
+    // state this waits on the same events the staged-input refill waits on, so it is free.
+    if (sched->rot_wait_pending) {
+        sched->rot_wait_pending = false;
+        static const bool rotate_wait = !(getenv("GGML_SCHED_ROTATE_WAIT") && atoi(getenv("GGML_SCHED_ROTATE_WAIT")) == 0);
+        if (rotate_wait) {
+            for (int b = 0; b < sched->n_backends; b++) {
+                if (sched->events[b][sched->cur_copy] != NULL) {
+                    ggml_backend_event_synchronize(sched->events[b][sched->cur_copy]);
+                } else {
+                    ggml_backend_synchronize(sched->backends[b]);
+                }
+            }
+        }
+    }
     static const bool stage_inputs = !(getenv("GGML_SCHED_STAGE_INPUTS") && atoi(getenv("GGML_SCHED_STAGE_INPUTS")) == 0);
 
     // GGML_SCHED_TIMING=1: host time per backend spent on split inputs vs graph launch (multi-split graphs only),
@@ -2306,19 +2324,10 @@ void ggml_backend_sched_rotate_copy(ggml_backend_sched_t sched) {
     // own stream, but a peer device-to-device copy into a split input runs on the SOURCE backend's stream, and nothing
     // else orders it after the destination's last use of this copy (n_copies ubatches ago) unless the source-stream
     // wait or a staged-input refill happens to cover it (not on the first wrap after start-up, nor for a new input).
-    // Make it an invariant here: host-wait every backend's last use of this copy. In steady state this is free (the
-    // staged-input refill already waits on the same events, and the GPUs are never n_copies ubatches behind the host).
-    // GGML_SCHED_ROTATE_WAIT=0 disables (A/B only).
-    static const bool rotate_wait = !(getenv("GGML_SCHED_ROTATE_WAIT") && atoi(getenv("GGML_SCHED_ROTATE_WAIT")) == 0);
-    if (rotate_wait) {
-        for (int b = 0; b < sched->n_backends; b++) {
-            if (sched->events[b][sched->cur_copy] != NULL) {
-                ggml_backend_event_synchronize(sched->events[b][sched->cur_copy]);
-            } else {
-                ggml_backend_synchronize(sched->backends[b]);
-            }
-        }
-    }
+    // compute_splits makes it an invariant: before it writes any copy of this ubatch it host-waits every backend's
+    // last use of cur_copy. The wait is deferred to compute_splits (not done here) so the caller's set_inputs still
+    // overlaps the GPUs. GGML_SCHED_ROTATE_WAIT=0 disables (A/B only).
+    sched->rot_wait_pending = true;
 
     for (int p = 0; p < sched->n_rot_patches; p++) {
         const auto & rp = sched->rot_patches[p];
