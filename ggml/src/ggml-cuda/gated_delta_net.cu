@@ -398,6 +398,198 @@ static __global__ void gdn_expg_f32(const float * __restrict__ g, float * __rest
     }
 }
 
+// rune gfx908 KDA prefill, LDS-shared token ring (GGML_GDN_LDS, default on; =0 restores the lpc kernel).
+// Same lane-per-column arithmetic as gated_delta_net_lpc_cuda<S_v, true, keep_rs_t, true> (16 lanes per state column,
+// S_v/16 rows each, identical per-token operation order and DPP reductions -> bit-exact), different data flow: a block
+// is 4 waves = 16 columns of ONE head, and the head's per-token k / q / exp(g) rows, the 16 columns' v and beta are
+// staged once per block in an LDS ring of TB tokens (double-buffered, one barrier per TB tokens) instead of every
+// 4-column wave holding its own D-token register ring. That removes the 4x-per-block (32x-per-head) re-reads of k/q/g
+// through L2 and the >128-VGPR register ring, so the 1024 waves of a GLM-5.3 KDA layer fit in one round (the lpc kernel
+// runs 1 wave/SIMD: 3 rounds of 480/480/64 waves) and the per-token chain reads LDS instead of waiting on global loads.
+template <int S_v, bool keep_rs_t, int TB>
+__global__ void __launch_bounds__(256, 2)
+gated_delta_net_lds_cuda(const float * q, const float * k, const float * v, const float * eg, const float * beta,
+                         const float * curr_state, float * dst, float * state,
+                         int64_t H, int64_t n_tokens, int64_t sq1, int64_t sq2, int64_t sq3,
+                         int64_t sv1, int64_t sv2, int64_t sv3, int64_t sb1, int64_t sb2, int64_t sb3,
+                         const uint3 neqk1_magic, const uint3 rq3_magic, float scale, int64_t state_slot_stride, int K) {
+    constexpr int LPC  = 16;          // lanes per column (as lpc)
+    constexpr int NT   = 256;         // 4 waves
+    constexpr int COLS = NT / LPC;    // 16 columns per block
+    constexpr int RPL  = S_v / LPC;   // rows per lane
+    constexpr int V4   = S_v / 4;     // float4 per k/q/eg row
+    // stage layout (floats): k[TB][S_v] q[TB][S_v] eg[TB][S_v] v[TB][COLS] beta[TB]
+    constexpr int OFF_Q = TB*S_v, OFF_G = 2*TB*S_v, OFF_V = 3*TB*S_v, OFF_B = 3*TB*S_v + TB*COLS;
+    constexpr int STAGE = OFF_B + 4*((TB + 3)/4);
+    constexpr int NLD4  = 3*TB*V4 + TB*COLS/4; // float4 slots per stage (k, q, eg, v); beta separately
+    constexpr int NSLOT = (NLD4 + NT - 1) / NT;
+    static_assert(S_v % LPC == 0 && RPL % 4 == 0 && COLS % 4 == 0, "unsupported S_v");
+
+    __shared__ __align__(16) float ring[2][STAGE];
+
+    const uint32_t h_idx    = blockIdx.x;
+    const uint32_t sequence = blockIdx.y;
+    const int      tid      = threadIdx.x;
+    const int      sub      = tid % LPC;
+    const int      colb     = blockIdx.z * COLS;
+    const int      cl       = tid / LPC;           // column inside the block
+    const int      col      = colb + cl;
+    const int      row0     = sub * RPL;
+
+    const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
+    const uint32_t iq3 = fastdiv(sequence, rq3_magic);
+
+    const int64_t state_in_offset  = sequence * H * S_v * S_v + h_idx * S_v * S_v;
+    const int64_t state_out_offset = (sequence * H + h_idx) * S_v * S_v;
+    state      += state_out_offset;
+    curr_state += state_in_offset + col * S_v;
+    float * attn_data = dst + (sequence * n_tokens * H + h_idx) * S_v;
+
+    float s[RPL];
+#pragma unroll
+    for (int r = 0; r < RPL; r++) {
+        s[r] = curr_state[row0 + r];
+    }
+
+    const float * kbase = k + iq3 * sq3 + iq1 * sq1;
+    const float * qbase = q + iq3 * sq3 + iq1 * sq1;
+    const float * vbase = v + sequence * sv3 + h_idx * sv1 + colb;
+    const float * bbase = beta + sequence * sb3 + h_idx * sb1;
+    const float * gbase = eg + (sequence * sb3 + h_idx * sb1) * S_v;
+
+    // per-thread load slots of a stage (2 per thread at S_v = 128, TB = 4): source at token 0, per-token source stride,
+    // token slot (-1: idle), LDS offset. Built branch-free and held in scalars: arrays assigned in branches went to scratch.
+    static_assert(NSLOT <= 2, "more than 2 load slots per thread");
+    struct slot { const float * src; int64_t str; int tok; int dst; };
+    auto make_slot = [&](const int i) -> slot {
+        const int seg = i < TB*V4 ? 0 : i < 2*TB*V4 ? 1 : i < 3*TB*V4 ? 2 : i < NLD4 ? 3 : 4;
+        const int j   = i - (seg < 3 ? seg : 3)*TB*V4;
+        const int per = seg < 3 ? V4 : COLS/4;          // float4 per token in this array
+        const int tok = seg < 4 ? j / per : -1;
+        const int f4  = seg < 4 ? j % per : 0;
+        slot sl;
+        sl.src = seg == 0 ? kbase + 4*f4 : seg == 1 ? qbase + 4*f4 : seg == 2 ? gbase + 4*f4 : seg == 3 ? vbase + 4*f4 : kbase;
+        sl.str = seg < 2 ? sq2 : seg == 2 ? sb2*S_v : seg == 3 ? sv2 : 0;
+        sl.tok = tok;
+        sl.dst = seg < 3 ? seg*TB*S_v + tok*S_v + 4*f4 : seg == 3 ? OFF_V + tok*COLS + 4*f4 : 0;
+        return sl;
+    };
+    const slot sl0 = make_slot(tid);
+    const slot sl1 = make_slot(NT + tid);
+    float4 lr0 = make_float4(0.0f, 0.0f, 0.0f, 0.0f), lr1 = lr0;
+    float  breg = 0.0f;
+    // stage c covers tokens c*TB .. c*TB + TB - 1 (clamped to n_tokens - 1: past-the-end slots load valid data, unused);
+    // loads are unconditional (idle slots re-read k), only the LDS stores are masked
+    auto load_stage = [&](const int c) {
+        lr0 = *(const float4 *) (sl0.src + min(c*TB + max(sl0.tok, 0), (int) n_tokens - 1)*sl0.str);
+        if (NSLOT > 1) {
+            lr1 = *(const float4 *) (sl1.src + min(c*TB + max(sl1.tok, 0), (int) n_tokens - 1)*sl1.str);
+        }
+        if (tid < TB) {
+            const int t = min(c*TB + tid, (int) n_tokens - 1);
+            breg = bbase[t * sb2];
+        }
+    };
+    auto store_stage = [&](const int buf) {
+        if (sl0.tok >= 0) {
+            *(float4 *) &ring[buf][sl0.dst] = lr0;
+        }
+        if (NSLOT > 1 && sl1.tok >= 0) {
+            *(float4 *) &ring[buf][sl1.dst] = lr1;
+        }
+        if (tid < TB) {
+            ring[buf][OFF_B + tid] = breg;
+        }
+    };
+
+    // one token step: the arithmetic of the lpc kernel's step() with G_EXP (ge = exp(g) read from the ring)
+    // st: the stage buffer, d: token slot inside the stage
+    auto step = [&](const int t, const float * st, const int d, const bool do_store) {
+        float kr[RPL], qr[RPL], ge[RPL];
+#pragma unroll
+        for (int r = 0; r < RPL; r += 4) {
+            const float4 k4 = *(const float4 *) (st +         d*S_v + row0 + r);
+            const float4 q4 = *(const float4 *) (st + OFF_Q + d*S_v + row0 + r);
+            const float4 g4 = *(const float4 *) (st + OFF_G + d*S_v + row0 + r);
+            kr[r+0] = k4.x; kr[r+1] = k4.y; kr[r+2] = k4.z; kr[r+3] = k4.w;
+            qr[r+0] = q4.x; qr[r+1] = q4.y; qr[r+2] = q4.z; qr[r+3] = q4.w;
+            ge[r+0] = g4.x; ge[r+1] = g4.y; ge[r+2] = g4.z; ge[r+3] = g4.w;
+        }
+        const float v_col    = st[OFF_V + d*COLS + cl];
+        const float beta_val = st[OFF_B + d];
+
+        float kv = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPL; r++) {
+            kv += ge[r] * s[r] * kr[r];
+        }
+        kv = gdn_sum16(kv);
+
+        const float delta_col = (v_col - kv) * beta_val;
+
+        float attn = 0.0f;
+#pragma unroll
+        for (int r = 0; r < RPL; r++) {
+            s[r] = ge[r] * s[r] + kr[r] * delta_col;
+            attn += s[r] * qr[r];
+        }
+        attn = gdn_sum16(attn);
+        attn_data[(int64_t) t * S_v * H + col] = attn * scale;
+
+        if (keep_rs_t && do_store) {
+            const int target_slot = (int) n_tokens - 1 - t;
+            if (target_slot >= 0 && target_slot < K) {
+                float * sp = state + target_slot * state_slot_stride + col * S_v + row0;
+#pragma unroll
+                for (int r = 0; r < RPL; r++) {
+                    sp[r] = s[r];
+                }
+            }
+        }
+    };
+
+    const int nstage = ((int) n_tokens + TB - 1) / TB;
+    load_stage(0);
+    store_stage(0);
+    __syncthreads();
+
+    // stages whose tokens never store a snapshot run branch-free (as the lpc kernel's main loop)
+    const int n_main = keep_rs_t ? (int) n_tokens - K : (int) n_tokens;
+    for (int c = 0; c < nstage; ++c) {
+        const int buf = c & 1;
+        const bool next = c + 1 < nstage;
+        if (next) {
+            load_stage(c + 1);
+        }
+        const float * st0 = ring[buf];
+        const int t0 = c*TB;
+        if (t0 + TB <= n_main) {
+#pragma unroll
+            for (int d = 0; d < TB; d++) {
+                step(t0 + d, st0, d, false);
+            }
+        } else {
+#pragma unroll
+            for (int d = 0; d < TB; d++) {
+                if (t0 + d < n_tokens) {
+                    step(t0 + d, st0, d, true);
+                }
+            }
+        }
+        if (next) {
+            store_stage(buf ^ 1);
+        }
+        __syncthreads();
+    }
+
+    if constexpr (!keep_rs_t) {
+#pragma unroll
+        for (int r = 0; r < RPL; r++) {
+            state[col * S_v + row0 + r] = s[r];
+        }
+    }
+}
+
 static bool gated_delta_net_use_expg() {
     const char * e = getenv("GGML_GDN_EXPG");
     return e == nullptr || atoi(e) != 0;
@@ -417,6 +609,18 @@ static void launch_gated_delta_net_lpc(
             const int64_t n = S_v * H * n_tokens * n_seqs;
             ggml_cuda_pool_alloc<float> eg(*pool, n);
             gdn_expg_f32<<<(n + 255) / 256, 256, 0, stream>>>(g_d, eg.get(), n);
+            static const bool lds = [] { const char * e = getenv("GGML_GDN_LDS"); return e == nullptr || atoi(e) != 0; }();
+            if constexpr (S_v == 128) if (lds) {
+                // LDS-shared token ring, 4 waves = 16 columns of one head per block (bit-exact with the lpc kernel)
+                const dim3 grid_lds(H, n_seqs, S_v / 16);
+                const uint3 neqk1_m = init_fastdiv_values(neqk1);
+                const uint3 rq3_m   = init_fastdiv_values(rq3);
+                gated_delta_net_lds_cuda<S_v, keep_rs_t, 4><<<grid_lds, 256, 0, stream>>>(
+                    q_d, k_d, v_d, (const float *) eg.get(), b_d, s_d, dst_d, state_d, H, n_tokens, sq1, sq2, sq3,
+                    sv1, sv2, sv3, sb1, sb2, sb3, neqk1_m, rq3_m, scale, state_slot_stride, K);
+                CUDA_CHECK(cudaGetLastError());
+                return;
+            }
             const dim3 grid_dims(H, n_seqs, S_v / 4);
             const dim3 block_dims(64, 1, 1);
             const uint3 neqk1_magic = init_fastdiv_values(neqk1);

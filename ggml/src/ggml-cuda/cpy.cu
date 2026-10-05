@@ -429,6 +429,64 @@ static void ggml_cpy_f32_iq4_nl_cuda(
         (cx, cdst, ne, ne00, ne01, ne02, nb00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb13);
 }
 
+// Same-type copy whose rows (dim 0) are contiguous on both sides and whose destination is contiguous, e.g.
+// cont(permute(x, 0, 2, 1, 3)) (GLM-5.3 DSA absorbed q: 512-float rows, 64 MB per layer and ubatch). cpy_scalar does
+// six 64-bit divisions per element there and runs at ~1/4 of HBM speed; here one wave moves one row with 16-byte
+// accesses (4-byte when unaligned). Pure copy (bit-exact). GGML_CUDA_CPY_ROWS=0 disables.
+static __global__ void cpy_rows_kernel(const char * __restrict__ src, char * __restrict__ dst, const int64_t nrows,
+        const int64_t ne1, const int64_t ne2, const int64_t nb01, const int64_t nb02, const int64_t nb03,
+        const int64_t row_bytes, const bool vec) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    const int lane = threadIdx.x % warp_size;
+    const int64_t wpb  = blockDim.x / warp_size;
+    for (int64_t row = (int64_t) blockIdx.x*wpb + threadIdx.x/warp_size; row < nrows; row += (int64_t) gridDim.x*wpb) {
+        const int64_t i1 = row % ne1;
+        const int64_t i2 = (row / ne1) % ne2;
+        const int64_t i3 = row / (ne1*ne2);
+        const char * s = src + i1*nb01 + i2*nb02 + i3*nb03;
+        char       * d = dst + row*row_bytes;
+        if (vec) {
+            for (int64_t b = 16*lane; b < row_bytes; b += 16*warp_size) {
+                *(int4 *) (d + b) = *(const int4 *) (s + b);
+            }
+        } else {
+            for (int64_t b = 4*lane; b < row_bytes; b += 4*warp_size) {
+                *(int *) (d + b) = *(const int *) (s + b);
+            }
+        }
+    }
+}
+
+static bool ggml_cuda_cpy_rows(const ggml_tensor * src0, ggml_tensor * src1, cudaStream_t stream) {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_CPY_ROWS"); return e ? atoi(e) != 0 : true; }();
+    const size_t ts = ggml_type_size(src0->type);
+    if (!on || src0->type != src1->type || (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_F16)
+            || !ggml_are_same_shape(src0, src1) || src0->nb[0] != ts || !ggml_is_contiguous(src1)) {
+        return false;
+    }
+    const int64_t row_bytes = src0->ne[0]*ts;
+    if (row_bytes < 256 || row_bytes % 4 != 0) {
+        return false;
+    }
+    for (int i = 1; i < GGML_MAX_DIMS; ++i) {
+        if (src0->nb[i] % 4 != 0) {
+            return false;
+        }
+    }
+    const bool vec = row_bytes % 16 == 0 && src0->nb[1] % 16 == 0 && src0->nb[2] % 16 == 0 && src0->nb[3] % 16 == 0
+        && (uintptr_t) src0->data % 16 == 0 && (uintptr_t) src1->data % 16 == 0;
+    const int64_t nrows = ggml_nrows(src0);
+    const int wpb = 4;
+    // grid capped at 960 blocks (8 per CU on gfx908) and strided: a short copy kernel with exactly 1024/2048 blocks
+    // of 256 threads hits the gfx908 launch cliff
+    const int64_t nblocks = std::min<int64_t>((nrows + wpb - 1)/wpb, 960);
+    const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
+    cpy_rows_kernel<<<nblocks, wpb*warp_size, 0, stream>>>((const char *) src0->data, (char *) src1->data, nrows,
+        src0->ne[1], src0->ne[2], src0->nb[1], src0->nb[2], src0->nb[3], row_bytes, vec);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 // check if a same-type copy reduces to a 2D strided copy (height rows of width
 // contiguous bytes), so it can use cudaMemcpy2DAsync instead of the scalar kernel
 static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tensor * src1,
@@ -524,6 +582,8 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
     } else if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
         CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,
                                      mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream));
+    } else if (ggml_cuda_cpy_rows(src0, src1, main_stream)) {
+        // row-contiguous permute copy (see ggml_cuda_cpy_rows)
     } else if (src0->type == GGML_TYPE_F32 && src1->type == GGML_TYPE_F32) {
         if (can_be_transposed) {
             ggml_cpy_scalar_cuda<float, float, true>
