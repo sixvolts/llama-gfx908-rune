@@ -30,6 +30,7 @@
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
+#include "ggml-cuda/mm-thin-f16.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
@@ -2013,6 +2014,14 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
         mm_path("mmq");
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
+        return;
+    }
+    // gfx908 prefill: thin Q8_0 projections (M <= 512) and short-K ones (K <= 128) on f16 MFMA with the rocBLAS path's
+    // f16 inputs (same dequant/convert rounding) and f32 accumulation, without the separate dequant/convert passes
+    // (mm-thin-f16.cu; tolerance class: summation order only). GGML_CUDA_MM_THIN_F16=0 restores rocBLAS.
+    if (ggml_cuda_mm_thin_f16_supported(src0, src1, dst, cc)) {
+        mm_path("thin-f16");
+        ggml_cuda_mm_thin_f16(ctx, src0, src1, dst);
         return;
     }
     // gfx908: rocBLAS/Tensile picks a 64x32 macro-tile for the tall Q8_0 projections at prefill (K=2560, M>=6144,
