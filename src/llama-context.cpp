@@ -1015,15 +1015,15 @@ float * llama_context::nextn_region(uint64_t seq) const {
     if (!embd_nextn.data || !cparams.embeddings_nextn || cparams.embeddings_nextn_masked) {
         return embd_nextn.data;
     }
-    return embd_nextn.data + (seq % 2) * (embd_nextn.size / 2);
+    return embd_nextn.data + (seq % nextn_ring) * (embd_nextn.size / nextn_ring);
 }
 
 void llama_context::synchronize_nextn(uint64_t seq) {
-    if (seq == 0 || seq + 1 < nextn_seq || seq > nextn_seq || nextn_events[seq % 2] == nullptr) {
+    if (seq == 0 || seq + (nextn_ring - 1) < nextn_seq || seq > nextn_seq || nextn_events[seq % nextn_ring] == nullptr) {
         synchronize();
         return;
     }
-    ggml_backend_event_synchronize(nextn_events[seq % 2]);
+    ggml_backend_event_synchronize(nextn_events[seq % nextn_ring]);
 }
 
 const float * llama_context::get_embeddings_nextn_seq(uint64_t seq) {
@@ -2181,7 +2181,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // nextn rows exported: publish the region and record the event that guards it (exporting backend only)
     if (nextn_backend_cur != nullptr) {
-        ggml_backend_event_t & ev = nextn_events[nextn_cur % 2];
+        ggml_backend_event_t & ev = nextn_events[nextn_cur % nextn_ring];
         if (ev == nullptr || nextn_event_backend != nextn_backend_cur) {
             if (ev != nullptr) {
                 ggml_backend_event_free(ev);
@@ -2287,7 +2287,12 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
         // unmasked: nextn row exists for every token in the batch, not just
         // those flagged via batch.logits[i] -> size by token count instead.
-        embd_nextn.size = (size_t) 2 * n_embd_out * n_batch;   // two regions, see nextn_region()
+        static const uint32_t ring = [] {
+            const char * e = getenv("LLAMA_NEXTN_RING");
+            return e ? (uint32_t) std::max(2, std::min(8, atoi(e))) : 2u;
+        }();
+        nextn_ring = ring;
+        embd_nextn.size = (size_t) nextn_ring * n_embd_out * n_batch;   // nextn_ring regions, see nextn_region()
     }
 
     for (bool enabled : cparams.embeddings_layer_inp) {

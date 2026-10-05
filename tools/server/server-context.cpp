@@ -21,6 +21,7 @@
 
 #include <algorithm>
 #include <cstddef>
+#include <deque>
 #include <cinttypes>
 #include <thread>
 #include <exception>
@@ -1034,6 +1035,51 @@ private:
         uint64_t    seq   = 0;
     } spec_pending;
 
+    // LLAMA_SPEC_DEFER=<d> (default 1 = the behaviour above): keep up to d prompt views pending, as deep copies, so the
+    // draft's catch-up lags the target by d views and never waits for an export that is still in flight; pending views
+    // also survive the end of a server batch (no drain there). The target context must keep d + 1 export regions
+    // (LLAMA_NEXTN_RING >= d + 1, clamped here). Everything pending is processed before outputs, before any task is
+    // handled, and before anything reads or edits a slot's draft state (checkpoints, snapshots, context shift, new prompt).
+    struct spec_view_copy {
+        llama_batch batch = {};
+        uint64_t    seq   = 0;
+    };
+    std::deque<spec_view_copy> spec_q;
+
+    static int spec_defer_depth() {
+        static const int d = [] {
+            const char * e  = getenv("LLAMA_SPEC_DEFER");
+            const char * er = getenv("LLAMA_NEXTN_RING");
+            const int ring  = er ? std::max(2, std::min(8, atoi(er))) : 2;
+            const int v     = e ? atoi(e) : 1;
+            return std::max(1, std::min(v, ring - 1));
+        }();
+        return d;
+    }
+
+    bool spec_busy() {
+        return spec_pending.valid || !spec_q.empty();
+    }
+
+    static spec_view_copy spec_copy_view(const llama_batch & v, uint64_t seq) {
+        spec_view_copy c;
+        c.seq   = seq;
+        c.batch = llama_batch_init(v.n_tokens, 0, 1);
+        c.batch.n_tokens = v.n_tokens;
+        for (int i = 0; i < v.n_tokens; ++i) {
+            c.batch.token[i]     = v.token ? v.token[i] : 0;
+            c.batch.pos[i]       = v.pos[i];
+            c.batch.n_seq_id[i]  = std::min(v.n_seq_id[i], 1);
+            c.batch.seq_id[i][0] = v.seq_id[i][0];
+            c.batch.logits[i]    = v.logits ? v.logits[i] : 0;
+        }
+        if (!v.token) {
+            llama_batch_free(c.batch);
+            throw std::runtime_error("deferred draft views need token batches");
+        }
+        return c;
+    }
+
     void spec_run(const llama_batch & view, uint64_t seq) {
         bool ok = true;
         if (ggml_host_trace_on()) { ggml_host_trace("spec_b", view.n_tokens, 0); }
@@ -1052,6 +1098,38 @@ private:
         if (spec_pending.valid) {
             spec_pending.valid = false;
             spec_run(spec_pending.view, spec_pending.seq);
+        }
+        while (!spec_q.empty()) {
+            spec_view_copy c = spec_q.front();
+            spec_q.pop_front();
+            try {
+                spec_run(c.batch, c.seq);
+            } catch (...) {
+                llama_batch_free(c.batch);
+                throw;
+            }
+            llama_batch_free(c.batch);
+        }
+    }
+
+    // a decoded target view joins the draft's queue; the oldest views run once more than d are pending
+    void spec_push(const llama_batch & view, uint64_t seq) {
+        if (spec_defer_depth() <= 1) {
+            spec_flush();                         // previous view: waits for its export only, overlaps this decode
+            spec_pending = { true, view, seq };
+            return;
+        }
+        spec_q.push_back(spec_copy_view(view, seq));
+        while ((int) spec_q.size() > spec_defer_depth()) {
+            spec_view_copy c = spec_q.front();
+            spec_q.pop_front();
+            try {
+                spec_run(c.batch, c.seq);
+            } catch (...) {
+                llama_batch_free(c.batch);
+                throw;
+            }
+            llama_batch_free(c.batch);
         }
     }
 
@@ -2658,6 +2736,20 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
+        // LLAMA_SPEC_DEFER: the checkpoint stores the draft's partial state - catch it up first, unless it has none
+        // (draft-mtp: the NextN block keeps no recurrent / SWA state, only the KV the deferred views fill)
+        if (!spec_q.empty() && ctx_dft) {
+            const size_t dsz = llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            static bool logged = false;
+            if (!logged) {
+                logged = true;
+                SLT_INF(slot, "draft partial state for checkpoints: %zu bytes\n", dsz);
+            }
+            if (dsz > 4096) {
+                spec_flush();
+            }
+        }
+
         // evict checkpoints within min-step of a previous checkpoint, unless they were
         // created by the current task
         // only when the list is full, otherwise short prompts keep just the oldest checkpoint
@@ -2762,6 +2854,9 @@ private:
         if (is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
             return false;
+        }
+        if (!is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
+            spec_flush();   // LLAMA_SPEC_DEFER: the task may read or edit slot / draft state
         }
 
         switch (task.type) {
@@ -3218,6 +3313,7 @@ private:
     }
 
     void update_slots() {
+        if (ggml_host_trace_on()) { ggml_host_trace("us_b", 0, 0); }
 #ifdef DEBUG_TIMINGS
         static int64_t t_prev = 0;
         int64_t t_start = ggml_time_us();
@@ -3357,8 +3453,8 @@ private:
 
             try {
                 scoped_timer t(t_post_decode, n_post_decode);
-                if (off_next >= batch.size()) {
-                    spec_flush();                 // last view of this batch
+                if (off_next >= batch.size() && spec_defer_depth() <= 1) {
+                    spec_flush();                 // last view of this batch (deeper deferral keeps deep copies)
                 }
                 post_decode(n_tokens, off, batch_view);
             } catch (const std::exception & e) {
@@ -3410,6 +3506,7 @@ private:
                 n_discard = std::clamp(n_discard, 0, std::max(0, n_left - 1));
 
                 SLT_WRN(slot, "slot context shift, n_keep = %d, n_left = %d, n_discard = %d\n", n_keep, n_left, n_discard);
+                spec_flush();   // LLAMA_SPEC_DEFER: the shift edits draft state
 
                 slot.mem.seq_rm (slot.id, n_keep            , n_keep + n_discard);
                 slot.mem.seq_add(slot.id, n_keep + n_discard, slot.prompt.tokens.pos_next(), -n_discard);
@@ -3688,6 +3785,7 @@ private:
 
                     // TODO: maybe move branch to outside of this loop in the future
                     if (slot.state == SLOT_STATE_STARTED) {
+                        spec_flush();   // LLAMA_SPEC_DEFER: prompt reuse / restore / seq_rm below edit draft state
                         slot.stats.update_prompt_start();
 
                         slot.state = SLOT_STATE_PROCESSING_PROMPT;
@@ -4194,13 +4292,19 @@ private:
                     // note: we create the checkpoint before calling llama_decode(), so the current batch is not
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
+                        if (ggml_host_trace_on()) { ggml_host_trace("ckpt_b", n_tokens_cur, 0); }
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        if (ggml_host_trace_on()) { ggml_host_trace("ckpt_e", n_tokens_cur, 0); }
                     }
 
                     // LLAMA_PREFIX_SHARE=<min tokens>: when a batch starts at the first user message, the slot holds
                     // exactly the shared prefix (system prompt + tool definitions); keep a copy of that state in the
                     // host prompt cache so a new conversation with the same prefix starts from it in any slot instead
                     // of prefilling it again (or evicting another live conversation's slot through LCP similarity).
+                    if (prefix_share > 0 && prompt_cache && !has_mtmd && pos_min >= 0 && spec_busy() &&
+                        n_tokens_start >= prefix_share && n_tokens_start == first_user_pos(spans)) {
+                        spec_flush();   // LLAMA_SPEC_DEFER: the snapshot below reads the draft state
+                    }
                     if (prefix_share > 0 && prompt_cache && !has_mtmd && pos_min >= 0 &&
                         n_tokens_start >= prefix_share && n_tokens_start == first_user_pos(spans)) {
                         server_tokens pref = slot.prompt.tokens.clone();
@@ -4348,8 +4452,7 @@ private:
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
         if (spec) {
             const uint64_t seq = llama_nextn_seq(ctx_tgt);
-            spec_flush();                         // previous view: waits for its export only, overlaps this decode
-            spec_pending = { true, batch_view, seq };
+            spec_push(batch_view, seq);
             if (has_output) {
                 spec_flush();                     // outputs follow: the draft must be caught up before drafting
                 spec_tm(SPEC_TM_PROC1);

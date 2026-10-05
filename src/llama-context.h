@@ -319,8 +319,10 @@ private:
     // Unmasked nextn rows are double-buffered per decode call: a consumer (the MTP draft) can read the rows of the
     // previous call while the next call is already in flight on the devices. nextn_seq counts decode calls that
     // exported rows; nextn_events[seq % 2] is recorded on the exporting backend at the end of that call.
+    // LLAMA_NEXTN_RING=<n> (2..8, default 2) regions/events: a consumer may then lag n-1 decode calls behind
     uint64_t             nextn_seq = 0;
-    ggml_backend_event_t nextn_events[2] = { nullptr, nullptr };
+    ggml_backend_event_t nextn_events[8] = {};
+    uint32_t             nextn_ring = 2;
     ggml_backend_t       nextn_event_backend = nullptr;
 
     float * nextn_region(uint64_t seq) const;
