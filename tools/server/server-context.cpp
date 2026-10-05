@@ -11,6 +11,7 @@
 #include "common.h"
 #include "fit.h"
 #include "llama.h"
+#include "ggml-backend.h"
 #include "../../src/llama-ext.h" // staging API: nextn sequence/event helpers (MTP catch-up overlap)
 #include "log.h"
 #include "sampling.h"
@@ -953,9 +954,11 @@ private:
 
     void spec_run(const llama_batch & view, uint64_t seq) {
         bool ok = true;
+        if (ggml_host_trace_on()) { ggml_host_trace("spec_b", view.n_tokens, 0); }
         queue_tasks.yield_to_queue([&]() {
             ok = common_speculative_process_seq(spec.get(), view, seq);
         });
+        if (ggml_host_trace_on()) { ggml_host_trace("spec_e", view.n_tokens, 0); }
         if (!ok) {
             SRV_ERR("%s", "failed to process speculative batch\n");
             // TODO: handle error
@@ -4156,12 +4159,16 @@ private:
         if (has_output) {
             spec_tm(SPEC_TM_DEC0);
         }
+        const bool ht = ggml_host_trace_on();
+        if (ht) { ggml_host_trace("srv_dec_b", batch_view.n_tokens, has_output ? 1 : 0); }
         queue_tasks.yield_to_queue([&]() {
             ret = llama_decode(ctx_tgt, batch_view);
+            if (ht) { ggml_host_trace("srv_dec_r", batch_view.n_tokens, ret); }
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
         });
+        if (ht) { ggml_host_trace("srv_dec_e", batch_view.n_tokens, 0); }
         if (has_output) {
             spec_tm(SPEC_TM_DEC1);
         }

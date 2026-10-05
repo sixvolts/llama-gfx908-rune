@@ -1,6 +1,7 @@
 #include "llama-context.h"
 
 #include "ggml.h"
+#include "ggml-backend.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
 #include "llama-impl.h"
@@ -1435,11 +1436,14 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     static double  ap_sum = 0, gap_sum = 0;
     static int64_t ap_n = 0;
     const int64_t t_ap0 = graph_timing_ap ? ggml_time_us() : 0;
+    const bool ht = ggml_host_trace_on();
+    if (ht) { ggml_host_trace("ub_b", ubatch.n_tokens, (int64_t) gtype); }
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
     }
+    if (ht) { ggml_host_trace("ub_apply", ubatch.n_tokens, 0); }
 
     auto * res = gf_res_prev.get();
     auto * gf  = res->get_gf();
@@ -1529,6 +1533,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
     }
     if (graph_timing) { gt_t[2] = ggml_time_us(); if (reused) { gt_t[1] = gt_t[2]; } }
+    if (ht) { ggml_host_trace("ub_graph", ubatch.n_tokens, reused ? 1 : 0); }
 
     // set the input data for the input tensors
     {
@@ -1540,8 +1545,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         //LLAMA_LOG_INFO("graph set inputs time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
     }
     if (graph_timing) { gt_t[3] = ggml_time_us(); }
+    if (ht) { ggml_host_trace("ub_set", ubatch.n_tokens, 0); }
 
     const auto status = graph_compute(res->get_gf(), ubatch.n_tokens > 1);
+    if (ht) { ggml_host_trace("ub_enq", ubatch.n_tokens, 0); }
     if (status != GGML_STATUS_SUCCESS) {
         LLAMA_LOG_ERROR("%s: failed to compute graph, compute status: %d\n", __func__, status);
         ret = status;

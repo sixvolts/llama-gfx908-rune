@@ -434,6 +434,11 @@ extern "C" {
     GGML_API ggml_backend_buffer_t      ggml_backend_cpu_buffer_from_ptr(void * ptr, size_t size);
     GGML_API ggml_backend_buffer_type_t ggml_backend_cpu_buffer_type(void);
 
+    // Host timeline trace (diagnostics, rune): GGML_HOST_TRACE=<path> appends one "t_us tid tag a b" line per event.
+    // Off (a single branch on a cached flag) unless the env var is set.
+    GGML_API bool ggml_host_trace_on(void);
+    GGML_API void ggml_host_trace(const char * tag, int64_t a, int64_t b);
+
 #ifdef  __cplusplus
 }
 #endif

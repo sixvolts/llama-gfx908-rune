@@ -23,6 +23,49 @@
 #include <algorithm>
 #include <unordered_map>
 #include <vector>
+#include <mutex>
+#if defined(__linux__)
+#include <sys/syscall.h>
+#include <unistd.h>
+#endif
+
+// ---- host timeline trace (GGML_HOST_TRACE=<path>) --------------------------------------------------------------
+static FILE * ggml_host_trace_open(void) {
+    static FILE * f = [] () -> FILE * {
+        const char * p = getenv("GGML_HOST_TRACE");
+        if (!p || !*p) {
+            return nullptr;
+        }
+        FILE * fp = fopen(p, "a");
+        if (fp) {
+            static char buf[1 << 22];
+            setvbuf(fp, buf, _IOFBF, sizeof(buf));
+            atexit([] { FILE * g = ggml_host_trace_open(); if (g) { fflush(g); } });
+        }
+        return fp;
+    }();
+    return f;
+}
+
+bool ggml_host_trace_on(void) {
+    return ggml_host_trace_open() != nullptr;
+}
+
+void ggml_host_trace(const char * tag, int64_t a, int64_t b) {
+    FILE * f = ggml_host_trace_open();
+    if (!f) {
+        return;
+    }
+#if defined(__linux__)
+    static thread_local long tid = (long) syscall(SYS_gettid);
+#else
+    static thread_local long tid = 0;
+#endif
+    static std::mutex mtx;
+    const int64_t t = ggml_time_us();
+    std::lock_guard<std::mutex> lock(mtx);
+    fprintf(f, "%lld %ld %s %lld %lld\n", (long long) t, tid, tag, (long long) a, (long long) b);
+}
 
 #ifdef __APPLE__
 #include <sys/types.h>
@@ -1749,10 +1792,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     // see ggml_backend_sched_rotate_copy: no backend may still use the copy this ubatch is about to overwrite. In steady
     // state this waits on the same events the staged-input refill waits on, so it is free.
+    const bool ht = ggml_host_trace_on();
+    if (ht) { ggml_host_trace("cs_b", sched->n_splits, sched->cur_copy); }
     if (sched->rot_wait_pending) {
         sched->rot_wait_pending = false;
         static const bool rotate_wait = !(getenv("GGML_SCHED_ROTATE_WAIT") && atoi(getenv("GGML_SCHED_ROTATE_WAIT")) == 0);
         if (rotate_wait) {
+            if (ht) { ggml_host_trace("rot_b", sched->cur_copy, 0); }
             for (int b = 0; b < sched->n_backends; b++) {
                 if (sched->events[b][sched->cur_copy] != NULL) {
                     ggml_backend_event_synchronize(sched->events[b][sched->cur_copy]);
@@ -1760,6 +1806,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_synchronize(sched->backends[b]);
                 }
             }
+            if (ht) { ggml_host_trace("rot_e", sched->cur_copy, 0); }
         }
     }
     static const bool stage_inputs = !(getenv("GGML_SCHED_STAGE_INPUTS") && atoi(getenv("GGML_SCHED_STAGE_INPUTS")) == 0);
@@ -1777,6 +1824,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
         if (timing) { t_split0 = ggml_time_us(); }
+        if (ht) { ggml_host_trace("sp_b", split_id, split_backend_id); }
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1786,6 +1834,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             } else {
                 ggml_backend_synchronize(sched->backends[prev_backend_id]);
             }
+            if (ht) { ggml_host_trace("sp_w0", split_id, prev_backend_id); }
         }
 
         // copy the input tensors to the split backend
@@ -1804,6 +1853,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         static const bool async_inputs = getenv("GGML_SCHED_ASYNC_INPUTS") != NULL && atoi(getenv("GGML_SCHED_ASYNC_INPUTS")) != 0;
         bool waited_for_split = false;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
+            if (ht) { ggml_host_trace("in_b", split_id, input_id); }
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
@@ -1960,11 +2010,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         }
 
         const int64_t t_split1 = timing ? ggml_time_us() : 0;
+        if (ht) { ggml_host_trace("sp_in", split_id, split->n_inputs); }
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
             }
+            if (ht) { ggml_host_trace("sp_l", split_id, split_backend_id); }
             if (timing) {
                 st_in[split_backend_id] += t_split1 - t_split0;
                 st_cp[split_backend_id] += ggml_time_us() - t_split1;
@@ -2011,6 +2063,7 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         prev_backend_id = split_backend_id;
     }
 
+    if (ht) { ggml_host_trace("cs_e", sched->n_splits, sched->cur_copy); }
     if (timing && ++st_calls % 200 == 0) {
         char buf[1024]; int o = 0;
         for (int b = 0; b < sched->n_backends && o < (int) sizeof(buf) - 40; b++) {
