@@ -772,6 +772,11 @@ static bool ggml_is_view_op(enum ggml_op op) {
 #ifndef GGML_SCHED_MAX_COPIES
 #define GGML_SCHED_MAX_COPIES 4
 #endif
+// runtime override of the number of pipeline copies (GGML_SCHED_COPIES=<n>, 2..GGML_SCHED_COPIES_CAP; default: the
+// compile-time GGML_SCHED_MAX_COPIES): changing the cmake value recompiles every ggml target incl. all HIP kernels
+#ifndef GGML_SCHED_COPIES_CAP
+#define GGML_SCHED_COPIES_CAP (GGML_SCHED_MAX_COPIES > 16 ? GGML_SCHED_MAX_COPIES : 16)
+#endif
 
 struct ggml_backend_sched_split {
     int backend_id;
@@ -817,10 +822,33 @@ struct ggml_backend_sched {
     int n_copies;
     int cur_copy;
     int next_copy;
-    ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_MAX_COPIES];
+    ggml_backend_event_t events[GGML_SCHED_MAX_BACKENDS][GGML_SCHED_COPIES_CAP];
     struct ggml_tensor ** graph_inputs;
     int n_graph_inputs;
     int graph_inputs_capacity;
+
+    // copy rotation on a reused graph (ggml_backend_sched_rotate_copy): the node sources that point at a split-input
+    // copy, rebuilt lazily after each split_graph, and one graph uid per (split, copy)
+    struct ggml_sched_rot_patch { struct ggml_tensor * node; int j; size_t id; int backend_id; } * rot_patches;
+    int        n_rot_patches;
+    int        rot_patches_capacity;
+    bool       rot_valid;
+    uint64_t * rot_uids;          // [n_splits][n_copies], 0 = not assigned yet
+    int        rot_uids_capacity;
+    bool       rotating;          // the current graph has been rotated at least once (prompt ubatches of a reused graph)
+    bool       rot_wait_pending;  // rotate_copy moved onto a copy: compute_splits host-waits every backend's last use of it
+
+    // staged user inputs (GGML_SCHED_STAGE_INPUTS, rotating graphs only): one pinned snapshot per (input name, copy),
+    // uploaded with async H2Ds on each consuming split's stream instead of one synchronous H2D per split
+    struct ggml_sched_stage {
+        char                  name[GGML_MAX_NAME];
+        const ggml_tensor *   input[GGML_SCHED_COPIES_CAP];
+        ggml_backend_buffer_t buf[GGML_SCHED_COPIES_CAP];
+        uint64_t              gen[GGML_SCHED_COPIES_CAP];
+        uint64_t              used[GGML_SCHED_COPIES_CAP];   // bitmask of backends that read this slot
+    } * stages;
+    int      n_stages;
+    uint64_t compute_gen;
 
     struct ggml_context * ctx;
 
@@ -1587,6 +1615,9 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     for (int i = 0; i < sched->n_splits; ++i) {
         sched->splits[i].graph.uid = ggml_graph_next_uid();
     }
+    sched->rot_valid = false;
+    sched->rotating  = false;
+    sched->rot_wait_pending = false;
 }
 
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
@@ -1641,6 +1672,69 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     return true;
 }
 
+// Pinned snapshot of a host user input for the current copy, filled once per compute (the first consuming split) and
+// reused by every other split that reads it: the H2Ds then run asynchronously on the consuming streams, ordered after
+// that stream's previous use of its input copy (n_copies ubatches ago), so the host neither waits for the GPU nor
+// copies the same n_kv x n_ubatch mask 9 times synchronously. The caller may overwrite `input` as soon as the snapshot
+// is taken. Before a slot is refilled, the host waits for the splits that read it last (events of that copy).
+// Returns NULL when staging is not possible (the caller falls back to the synchronous copy).
+static const void * ggml_backend_sched_stage_input(ggml_backend_sched_t sched, const ggml_tensor * input, int split_backend_id) {
+    const int c = sched->cur_copy;
+    const size_t nbytes = ggml_nbytes(input);
+    ggml_backend_sched::ggml_sched_stage * st = nullptr;
+    for (int i = 0; i < sched->n_stages; i++) {
+        if (strncmp(sched->stages[i].name, input->name, GGML_MAX_NAME) == 0) {
+            st = &sched->stages[i];
+            break;
+        }
+    }
+    if (st == nullptr) {
+        if (sched->n_stages >= 64) {
+            return nullptr;
+        }
+        sched->stages = (ggml_backend_sched::ggml_sched_stage *) realloc(sched->stages, (sched->n_stages + 1) * sizeof(sched->stages[0]));
+        st = &sched->stages[sched->n_stages++];
+        memset(st, 0, sizeof(*st));
+        strncpy(st->name, input->name, GGML_MAX_NAME - 1);
+    }
+    if (st->gen[c] == sched->compute_gen) {
+        if (st->input[c] != input) {
+            return nullptr;   // two inputs with the same name in one graph: do not share the slot
+        }
+    } else {
+        // the previous readers of this slot must be done with it before it is overwritten
+        for (int b = 0; b < sched->n_backends; b++) {
+            if (st->used[c] & (1ull << b)) {
+                if (sched->events[b][c] != NULL) {
+                    ggml_backend_event_synchronize(sched->events[b][c]);
+                } else {
+                    ggml_backend_synchronize(sched->backends[b]);
+                }
+            }
+        }
+        if (st->buf[c] == NULL || ggml_backend_buffer_get_size(st->buf[c]) < nbytes) {
+            if (st->buf[c] != NULL) {
+                ggml_backend_buffer_free(st->buf[c]);
+                st->buf[c] = NULL;
+            }
+            ggml_backend_buffer_type_t host_buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(sched->backends[split_backend_id]));
+            if (host_buft == NULL) {
+                return nullptr;
+            }
+            st->buf[c] = ggml_backend_buft_alloc_buffer(host_buft, nbytes);
+            if (st->buf[c] == NULL) {
+                return nullptr;
+            }
+        }
+        memcpy(ggml_backend_buffer_get_base(st->buf[c]), input->data, nbytes);
+        st->gen[c]   = sched->compute_gen;
+        st->input[c] = input;
+        st->used[c]  = 0;
+    }
+    st->used[c] |= 1ull << split_backend_id;
+    return ggml_backend_buffer_get_base(st->buf[c]);
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
@@ -1651,10 +1745,38 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
     int prev_backend_id = -1;
 
+    sched->compute_gen++;
+
+    // see ggml_backend_sched_rotate_copy: no backend may still use the copy this ubatch is about to overwrite. In steady
+    // state this waits on the same events the staged-input refill waits on, so it is free.
+    if (sched->rot_wait_pending) {
+        sched->rot_wait_pending = false;
+        static const bool rotate_wait = !(getenv("GGML_SCHED_ROTATE_WAIT") && atoi(getenv("GGML_SCHED_ROTATE_WAIT")) == 0);
+        if (rotate_wait) {
+            for (int b = 0; b < sched->n_backends; b++) {
+                if (sched->events[b][sched->cur_copy] != NULL) {
+                    ggml_backend_event_synchronize(sched->events[b][sched->cur_copy]);
+                } else {
+                    ggml_backend_synchronize(sched->backends[b]);
+                }
+            }
+        }
+    }
+    static const bool stage_inputs = !(getenv("GGML_SCHED_STAGE_INPUTS") && atoi(getenv("GGML_SCHED_STAGE_INPUTS")) == 0);
+
+    // GGML_SCHED_TIMING=1: host time per backend spent on split inputs vs graph launch (multi-split graphs only),
+    // logged every 200 computes. Diagnostics only.
+    static const bool sched_timing = getenv("GGML_SCHED_TIMING") && atoi(getenv("GGML_SCHED_TIMING")) != 0;
+    static double  st_in[GGML_SCHED_MAX_BACKENDS] = {}, st_cp[GGML_SCHED_MAX_BACKENDS] = {};
+    static int64_t st_calls = 0;
+    const bool timing = sched_timing && sched->n_splits > 2;
+    int64_t t_split0 = timing ? ggml_time_us() : 0;
+
     for (int split_id = 0; split_id < sched->n_splits; split_id++) {
         struct ggml_backend_sched_split * split = &splits[split_id];
         int split_backend_id = split->backend_id;
         ggml_backend_t split_backend = sched->backends[split_backend_id];
+        if (timing) { t_split0 = ggml_time_us(); }
 
         // ensure the previous split's async work has completed before we start
         // this split, the allocator may have reused buffer regions across splits
@@ -1687,6 +1809,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
+                if (stage_inputs && sched->rotating && !sync_inputs && ggml_backend_buffer_is_host(input->buffer) &&
+                    split_backend->iface.set_tensor_async != NULL && ggml_is_contiguous(input) && ggml_is_contiguous(input_cpy) &&
+                    ggml_backend_dev_type(ggml_backend_get_device(split_backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    const void * staged = ggml_backend_sched_stage_input(sched, input, split_backend_id);
+                    if (staged != nullptr) {
+                        ggml_backend_tensor_set_async(split_backend, input_cpy, staged, 0, ggml_nbytes(input));
+                        continue;
+                    }
+                }
                 // inputs from the user must be copied immediately to prevent the user overwriting the data before the copy is done
                 if (sync_inputs || !waited_for_split) {
                     if (sched->events[split_backend_id][sched->cur_copy] != NULL) {
@@ -1800,6 +1931,19 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     }
                     copy_experts(first_id, last_id);
                 } else {
+                    // a device-to-device async copy runs on the SOURCE backend's stream, which is not ordered after the
+                    // split backend's last use of this copy (the event_wait above only orders the split backend): with
+                    // rotating copies the source may run up to n_copies ubatches ahead, so make the source stream wait
+                    // for that use too. Not needed when the user inputs are staged: refilling a staged slot already
+                    // waits (host) for every consumer's use of this copy n_copies ubatches ago, so no source can be
+                    // that far ahead; and the cross-device wait is expensive where the GPUs are not peers (rune: the
+                    // gpu9 -> gpu6 crossing cost ~180 ms of host time per ubatch). GGML_SCHED_NO_SRC_WAIT=1 disables.
+                    static const bool no_src_wait = getenv("GGML_SCHED_NO_SRC_WAIT") != NULL && atoi(getenv("GGML_SCHED_NO_SRC_WAIT")) != 0;
+                    if (!no_src_wait && sched->rotating && !stage_inputs && input_backend != split_backend && input_backend->iface.event_wait != NULL &&
+                        sched->events[split_backend_id][sched->cur_copy] != NULL && split_backend->iface.cpy_tensor_async &&
+                        ggml_backend_dev_type(ggml_backend_get_device(input_backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                        ggml_backend_event_wait(input_backend, sched->events[split_backend_id][sched->cur_copy]);
+                    }
                     // try async copy, but if not possible, we can still use a sync copy without synchronizing the dst backend, since we handle the synchronization here with multiple copies and events
                     // TODO: add public function to facilitate this, since applications do not have direct access to the backend interface
                     if (!split_backend->iface.cpy_tensor_async || !split_backend->iface.cpy_tensor_async(input_backend, split_backend, input, input_cpy)) {
@@ -1815,10 +1959,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
             }
         }
 
+        const int64_t t_split1 = timing ? ggml_time_us() : 0;
         if (!sched->callback_eval) {
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
+            }
+            if (timing) {
+                st_in[split_backend_id] += t_split1 - t_split0;
+                st_cp[split_backend_id] += ggml_time_us() - t_split1;
             }
         } else {
             // similar to ggml_backend_compare_graph_backend
@@ -1862,6 +2011,14 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         prev_backend_id = split_backend_id;
     }
 
+    if (timing && ++st_calls % 200 == 0) {
+        char buf[1024]; int o = 0;
+        for (int b = 0; b < sched->n_backends && o < (int) sizeof(buf) - 40; b++) {
+            o += snprintf(buf + o, sizeof(buf) - o, " %d:%.1f/%.1f", b, st_in[b]/st_calls/1e3, st_cp[b]/st_calls/1e3);
+        }
+        GGML_LOG_WARN("sched timing (n=%lld, ms per compute, inputs/launch per backend):%s\n", (long long) st_calls, buf);
+    }
+
     return GGML_STATUS_SUCCESS;
 }
 
@@ -1889,7 +2046,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
     sched->debug_realloc = GGML_SCHED_DEBUG_REALLOC ? atoi(GGML_SCHED_DEBUG_REALLOC) : sched->debug_realloc;
 
     sched->n_backends = n_backends;
-    sched->n_copies = parallel ? GGML_SCHED_MAX_COPIES : 1;
+    int n_copies_rt = GGML_SCHED_MAX_COPIES;
+    if (getenv("GGML_SCHED_COPIES")) {
+        n_copies_rt = std::max(2, std::min((int) GGML_SCHED_COPIES_CAP, atoi(getenv("GGML_SCHED_COPIES"))));
+    }
+    sched->n_copies = parallel ? n_copies_rt : 1;
 
     // initialize hash table
     // FIXME: needs to be size*2 to account for leafs (do it in graph_split instead)
@@ -1954,6 +2115,18 @@ void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     }
     free(sched->splits);
     free(sched->graph_inputs);
+    free(sched->rot_patches);
+    free(sched->rot_uids);
+    // staged input snapshots: the owner synchronizes before freeing the scheduler (llama_context does; the backends may
+    // already be gone here, so no synchronize of our own)
+    for (int i = 0; i < sched->n_stages; i++) {
+        for (int c = 0; c < GGML_SCHED_COPIES_CAP; c++) {
+            if (sched->stages[i].buf[c]) {
+                ggml_backend_buffer_free(sched->stages[i].buf[c]);
+            }
+        }
+    }
+    free(sched->stages);
     free(sched->hv_tensor_backend_ids);
     free(sched->hv_tensor_copies);
     free(sched->node_backend_ids);
@@ -2083,6 +2256,90 @@ void ggml_backend_sched_set_eval_callback(ggml_backend_sched_t sched, ggml_backe
 int ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     return sched->n_splits;
+}
+
+// Pipeline parallelism with a REUSED graph (llama graph reuse skips sched_alloc_graph, the only place cur_copy advances):
+// without this every prompt ubatch of a llama_decode used the same copy, so each split's input wait
+// (events[backend][cur_copy]) waited for the previous ubatch on that GPU and the stages never overlapped. This advances
+// to the next copy and repoints every node source that reads a split-input copy at that copy (the copies of all
+// n_copies are allocated by alloc_graph as separate leafs, so their buffers are already valid). User inputs that are
+// consumed on their own backend (graph_inputs) are NOT repointed: the caller writes the original tensor every ubatch.
+// Each (split, copy) keeps its own graph uid, so backend graph caches (CUDA graphs) see a stable graph per copy.
+void ggml_backend_sched_rotate_copy(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    if (sched->n_copies <= 1 || !sched->is_alloc) {
+        return;
+    }
+    if (!sched->rot_valid) {
+        // map split-input copy tensors -> (input hash id, backend)
+        std::unordered_map<const ggml_tensor *, std::pair<size_t, int>> copies;
+        for (int i = 0; i < sched->n_splits; i++) {
+            const struct ggml_backend_sched_split * split = &sched->splits[i];
+            for (int k = 0; k < split->n_inputs; k++) {
+                const size_t id = hash_id(split->inputs[k]);
+                for (int c = 0; c < sched->n_copies; c++) {
+                    const ggml_tensor * t = tensor_id_copy(id, split->backend_id, c);
+                    if (t) {
+                        copies[t] = { id, split->backend_id };
+                    }
+                }
+            }
+        }
+        sched->n_rot_patches = 0;
+        for (int i = 0; i < sched->graph.n_nodes; i++) {
+            struct ggml_tensor * node = sched->graph.nodes[i];
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                if (node->src[j] == NULL) {
+                    continue;
+                }
+                auto it = copies.find(node->src[j]);
+                if (it == copies.end()) {
+                    continue;
+                }
+                if (sched->n_rot_patches >= sched->rot_patches_capacity) {
+                    sched->rot_patches_capacity = std::max(256, 2*sched->rot_patches_capacity);
+                    sched->rot_patches = (struct ggml_backend_sched::ggml_sched_rot_patch *) realloc(sched->rot_patches,
+                        sched->rot_patches_capacity * sizeof(sched->rot_patches[0]));
+                }
+                sched->rot_patches[sched->n_rot_patches++] = { node, j, it->second.first, it->second.second };
+            }
+        }
+        const int n_uids = sched->n_splits * sched->n_copies;
+        if (n_uids > sched->rot_uids_capacity) {
+            sched->rot_uids_capacity = n_uids;
+            sched->rot_uids = (uint64_t *) realloc(sched->rot_uids, n_uids * sizeof(uint64_t));
+        }
+        memset(sched->rot_uids, 0, n_uids * sizeof(uint64_t));
+        for (int i = 0; i < sched->n_splits; i++) {
+            sched->rot_uids[i*sched->n_copies + sched->cur_copy] = sched->splits[i].graph.uid;
+        }
+        sched->rot_valid = true;
+    }
+
+    sched->cur_copy  = sched->next_copy;
+    sched->next_copy = (sched->next_copy + 1) % sched->n_copies;
+    sched->rotating  = true;
+
+    // No backend may still be using the copy we rotate onto. The per-split input wait only orders the split backend's
+    // own stream, but a peer device-to-device copy into a split input runs on the SOURCE backend's stream, and nothing
+    // else orders it after the destination's last use of this copy (n_copies ubatches ago) unless the source-stream
+    // wait or a staged-input refill happens to cover it (not on the first wrap after start-up, nor for a new input).
+    // compute_splits makes it an invariant: before it writes any copy of this ubatch it host-waits every backend's
+    // last use of cur_copy. The wait is deferred to compute_splits (not done here) so the caller's set_inputs still
+    // overlaps the GPUs. GGML_SCHED_ROTATE_WAIT=0 disables (A/B only).
+    sched->rot_wait_pending = true;
+
+    for (int p = 0; p < sched->n_rot_patches; p++) {
+        const auto & rp = sched->rot_patches[p];
+        rp.node->src[rp.j] = tensor_id_copy(rp.id, rp.backend_id, sched->cur_copy);
+    }
+    for (int i = 0; i < sched->n_splits; i++) {
+        uint64_t & uid = sched->rot_uids[i*sched->n_copies + sched->cur_copy];
+        if (uid == 0) {
+            uid = ggml_graph_next_uid();
+        }
+        sched->splits[i].graph.uid = uid;
+    }
 }
 
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {

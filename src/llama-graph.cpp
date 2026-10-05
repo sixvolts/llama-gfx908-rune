@@ -37,8 +37,11 @@ static ggml_tensor * build_attn_inp_kq_mask(
     const auto n_tokens = ubatch.n_tokens;
     const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
 
-    // flash attention requires an f16 mask
-    const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
+    // flash attention requires an f16 mask. LLAMA_KQ_MASK_F16=1 also uses f16 without flash attention: the mask only
+    // holds 0 / -INF (exact in f16) and the consumers (soft_max_ext, the sparse-gather get_rows -> f32) accept f16; it
+    // halves the n_kv x n_ubatch input that is uploaded to every pipeline stage for every ubatch and per pipeline copy
+    static const bool f16_mask = getenv("LLAMA_KQ_MASK_F16") && atoi(getenv("LLAMA_KQ_MASK_F16")) == 1;
+    const auto type = (cparams.flash_attn || f16_mask) ? GGML_TYPE_F16 : GGML_TYPE_F32;
 
     ggml_tensor * res = ggml_new_tensor_4d(ctx, type, n_kv, n_tokens/n_stream, 1, n_stream);
     ggml_set_input(res);
@@ -3889,8 +3892,14 @@ ggml_tensor * llm_graph_context::build_attn_sparse_gather(
     // load bearing as in build_attn_sparse: the KQ mask at every listed cell keeps an empty, future or
     // foreign-sequence cell masked whatever the lists say
     {
-        ggml_tensor * kqm = ggml_view_4d(ctx0, kq_mask, 1, n_kv, n_tps, n_stream,
-                ggml_element_size(kq_mask), kq_mask->nb[1], kq_mask->nb[3], 0);
+        // LLAMA_GRAPH_VIEW_CACHE=0: a fresh view per layer (each one is a separate split input of the stage)
+        static const bool view_cache = !(getenv("LLAMA_GRAPH_VIEW_CACHE") && atoi(getenv("LLAMA_GRAPH_VIEW_CACHE")) == 0);
+        ggml_tensor * kqm = view_cache ? inp->kq_mask_rows : nullptr;
+        if (kqm == nullptr) {
+            kqm = ggml_view_4d(ctx0, kq_mask, 1, n_kv, n_tps, n_stream,
+                    ggml_element_size(kq_mask), kq_mask->nb[1], kq_mask->nb[3], 0);
+            inp->kq_mask_rows = kqm;
+        }
         kqm = ggml_get_rows(ctx0, kqm, idx); // F32 [1, n_sel, n_tps, n_stream]
         mask = ggml_add(ctx0, mask, ggml_reshape_3d(ctx0, kqm, n_sel, n_tps, n_stream));
     }

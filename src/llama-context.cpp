@@ -291,6 +291,7 @@ llama_context::llama_context(
 
     // initialized later
     cparams.pipeline_parallel = false;
+    cparams.sched_copies      = false;
 
     {
         const char * LLAMA_GRAPH_REUSE_DISABLE = getenv("LLAMA_GRAPH_REUSE_DISABLE");
@@ -476,9 +477,32 @@ llama_context::llama_context(
         }
 
         cparams.pipeline_parallel = pipeline_parallel;
+        cparams.sched_copies      = pipeline_parallel;
 
         if (cparams.pipeline_parallel) {
             LLAMA_LOG_INFO("%s: pipeline parallelism enabled\n", __func__);
+        }
+
+        // LLAMA_SCHED_COPIES_SINGLE=1: a fully offloaded single-GPU context (rune: the MTP drafter on its own GPU) also
+        // gets the scheduler's input copies + events. Without them every prompt ubatch's input copy waits on the host
+        // for the GPU to finish the previous ubatch, so the drafter's prompt pass (4 ubatches per 2048-token batch)
+        // blocks the server thread and the trunk's next batch cannot start until the drafter is done. With copies (and
+        // rotation on graph reuse) the drafter's ubatches are only enqueued and it overlaps the trunk. Nothing else of
+        // pipeline parallelism (dummy output row, multi-device split rules) is enabled.
+        static const bool single_copies = getenv("LLAMA_SCHED_COPIES_SINGLE") && atoi(getenv("LLAMA_SCHED_COPIES_SINGLE")) == 1;
+        if (!pipeline_parallel && single_copies && model.n_devices() == 1 && model.n_gpu_layers() > model.hparams.n_layer_all) {
+            bool ok = true;
+            for (auto & backend : backends) {
+                auto * dev = ggml_backend_get_device(backend.get());
+                if (ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                    continue;
+                }
+                ggml_backend_dev_props props;
+                ggml_backend_dev_get_props(dev, &props);
+                ok = ok && props.caps.async && props.caps.events;
+            }
+            cparams.sched_copies = ok;
+            LLAMA_LOG_INFO("%s: LLAMA_SCHED_COPIES_SINGLE=1: single-device scheduler input copies %s\n", __func__, ok ? "enabled" : "unavailable (no async/events)");
         }
 
         sched_reserve();
@@ -632,7 +656,7 @@ void llama_context::sched_reserve() {
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
-    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+    sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.sched_copies, cparams.op_offload));
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -664,9 +688,10 @@ void llama_context::sched_reserve() {
         auto * gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get(),
                 model.hparams.no_alloc, model.hparams.no_alloc ? backend_buf_exp_size.data() : nullptr);
         if (!gf) {
-            if (cparams.pipeline_parallel) {
+            if (cparams.sched_copies) {
                 LLAMA_LOG_WARN("%s: compute buffer allocation failed, retrying without pipeline parallelism\n", __func__);
                 cparams.pipeline_parallel = false;
+                cparams.sched_copies      = false;
                 sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, false, cparams.op_offload));
                 gf = graph_reserve(n_tokens, n_seqs, n_outputs_pp, mctx.get());
             }
@@ -1404,6 +1429,12 @@ bool llama_context::set_adapter_cvec(
 }
 
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
+    // LLAMA_GRAPH_TIMING=1 (below) also reports the memory apply and the host time between consecutive process_ubatch calls
+    static const bool graph_timing_ap = getenv("LLAMA_GRAPH_TIMING") && atoi(getenv("LLAMA_GRAPH_TIMING")) != 0;
+    static int64_t t_prev_end = 0;
+    static double  ap_sum = 0, gap_sum = 0;
+    static int64_t ap_n = 0;
+    const int64_t t_ap0 = graph_timing_ap ? ggml_time_us() : 0;
     if (mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
@@ -1430,7 +1461,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         // with pipeline parallelism, the previous graph_compute_async may still be running
         // on the GPU. we must synchronize before set_inputs to avoid overwriting input tensors
         // that the previous compute is still reading.
-        if (cparams.pipeline_parallel) {
+        if (cparams.sched_copies) {
             // Only device-resident inputs can race with the previous compute: the scheduler copies host-resident
             // inputs into its rotating per-split device copies SYNCHRONOUSLY at enqueue time, so overwriting them here
             // is safe and the synchronize would serialize the ubatches (rune: 0% cross-GPU overlap, no prefill gain
@@ -1458,6 +1489,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             }
             if (need_sync) {
                 ggml_backend_sched_synchronize(sched.get());
+            }
+
+            // A reused graph keeps the scheduler on one input copy (cur_copy only advances in sched_alloc_graph), so
+            // every split's input wait blocked on the previous ubatch of that GPU: GGML_SCHED_MAX_COPIES ubatches in
+            // flight was effectively 1 for prompts. Rotate to the next copy for prompt-sized ubatches (decode and
+            // speculative verify graphs keep their single copy and their captured CUDA graphs).
+            // LLAMA_PP_ROTATE_MIN=<rows> (default 64) is the smallest ubatch that rotates; 0 disables.
+            static const int rotate_min = getenv("LLAMA_PP_ROTATE_MIN") ? atoi(getenv("LLAMA_PP_ROTATE_MIN")) : 64;
+            if (rotate_min > 0 && (int) ubatch.n_tokens >= rotate_min) {
+                ggml_backend_sched_rotate_copy(sched.get());
             }
         }
 
@@ -1515,6 +1556,17 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
                 __func__, reused ? "REUSED " : "REBUILT", (long long) gt_n[r], ubatch.n_tokens,
                 gt_sum[r][0]/gt_n[r]/1e3, gt_sum[r][1]/gt_n[r]/1e3, gt_sum[r][2]/gt_n[r]/1e3, gt_sum[r][3]/gt_n[r]/1e3);
         }
+    }
+
+    if (graph_timing_ap && ubatch.n_tokens >= 64) {
+        const int64_t t_end = ggml_time_us();
+        ap_sum += (double) (gt_t[0] ? gt_t[0] : t_end) - t_ap0;
+        if (t_prev_end) { gap_sum += t_ap0 - t_prev_end; }
+        if (++ap_n % 200 == 0) {
+            LLAMA_LOG_WARN("%s: graph timing prompt ubatches (n=%lld): memory apply %.2f | host outside process_ubatch %.2f ms\n",
+                __func__, (long long) ap_n, ap_sum/ap_n/1e3, gap_sum/ap_n/1e3);
+        }
+        t_prev_end = t_end;
     }
 
     ret = GGML_STATUS_SUCCESS;

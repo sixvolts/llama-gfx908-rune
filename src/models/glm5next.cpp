@@ -234,6 +234,18 @@ ggml_tensor * llama_model_glm5next::graph::build_kda_layer(
 
     const auto * mctx_cur = inp_rs->mctx;
 
+    // build_rs() below expands the conv/ssm state gathers into gf right away. They do not depend on the layer input,
+    // so without this expand they land BEFORE the previous layer's (still unexpanded) FFN tail. At a pipeline stage
+    // boundary that tail lives on the previous GPU, which splits the graph into prev | next(state gather) | prev(0
+    // inputs: the whole FFN tail) | next, and the 0-input split makes the scheduler block the host on the next GPU's
+    // previous ubatch (ggml_backend_sched_compute_splits) -> the prompt pipeline never overlaps. Expanding the layer
+    // input first keeps the previous layer contiguous; it only moves the state gathers after hc_pre/attn_norm (no
+    // fusion spans them), the ops and their inputs are unchanged. LLAMA_GLM5_KDA_ORDER=0 restores the old order.
+    static const bool kda_order = !(getenv("LLAMA_GLM5_KDA_ORDER") && atoi(getenv("LLAMA_GLM5_KDA_ORDER")) == 0);
+    if (kda_order) {
+        ggml_build_forward_expand(gf, cur);
+    }
+
     // f, g and beta read the layer input, NOT the convolved q/k/v
     ggml_tensor * inp = cur;
 
@@ -452,7 +464,13 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
     ggml_tensor * sel = ggml_cont(ctx0, ggml_top_k(ctx0, pool_score, (int) select_k));
     cb(sel, "indexer_top_k_pools", il);
 
-    ggml_tensor * pc3      = ggml_reshape_3d(ctx0, inp_kp->pool_cells, r, n_pools, n_stream);
+    // one view per graph, not per layer (LLAMA_GRAPH_VIEW_CACHE=0: per layer): each view is a separate split input
+    static const bool view_cache = !(getenv("LLAMA_GRAPH_VIEW_CACHE") && atoi(getenv("LLAMA_GRAPH_VIEW_CACHE")) == 0);
+    ggml_tensor * pc3 = view_cache ? inp_kp->pool_cells_3d : nullptr;
+    if (pc3 == nullptr) {
+        pc3 = ggml_reshape_3d(ctx0, inp_kp->pool_cells, r, n_pools, n_stream);
+        inp_kp->pool_cells_3d = pc3;
+    }
     ggml_tensor * sel_flat = ggml_reshape_2d(ctx0, sel, select_k*n_tps, n_stream);
 
     ggml_tensor * top_k = ggml_get_rows(ctx0, pc3, sel_flat);
@@ -464,8 +482,12 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
         // a selected pool is usable iff its bias is 0 (complete and visible); top-k picks an unusable one only while
         // fewer than select_k usable pools exist. The bias is per pool, so gather it at the picks and spread it over
         // the pool's r members (the layout of top_k)
-        ggml_tensor * pb = ggml_view_4d(ctx0, inp_kp->pool_bias, 1, n_pools, n_tps, n_stream,
-                ggml_element_size(inp_kp->pool_bias), inp_kp->pool_bias->nb[1], inp_kp->pool_bias->nb[2], 0);
+        ggml_tensor * pb = view_cache ? inp_kp->pool_bias_4d : nullptr;
+        if (pb == nullptr) {
+            pb = ggml_view_4d(ctx0, inp_kp->pool_bias, 1, n_pools, n_tps, n_stream,
+                    ggml_element_size(inp_kp->pool_bias), inp_kp->pool_bias->nb[1], inp_kp->pool_bias->nb[2], 0);
+            inp_kp->pool_bias_4d = pb;
+        }
         ggml_tensor * pv = ggml_get_rows(ctx0, pb, sel); // F32 [1, select_k, n_tps, n_stream]
         pv = ggml_repeat_4d(ctx0, pv, r, select_k, n_tps, n_stream);
         *top_k_mask = ggml_reshape_3d(ctx0, pv, r*select_k, n_tps, n_stream);

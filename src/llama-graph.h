@@ -391,6 +391,10 @@ public:
     ggml_tensor * self_kq_mask     = nullptr; // F32/F16 [n_kv, n_batch/n_stream, 1, n_stream]
     ggml_tensor * self_kq_mask_cnv = nullptr; //         [n_kv, n_batch/n_stream, 1, n_stream]
 
+    // per-graph cache of the [1, n_kv, n_tps, n_stream] row view the sparse gather reads: one view tensor per graph
+    // instead of one per DSA layer, so a pipeline stage with two DSA layers receives the n_kv x n_ubatch mask once
+    ggml_tensor * kq_mask_rows = nullptr;
+
     const llama_hparams hparams;
     const llama_cparams cparams;
 
