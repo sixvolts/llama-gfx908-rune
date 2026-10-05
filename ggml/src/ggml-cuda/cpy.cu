@@ -473,6 +473,9 @@ static bool ggml_cuda_cpy_rows(const ggml_tensor * src0, ggml_tensor * src1, cud
             return false;
         }
     }
+    if ((uintptr_t) src0->data % 4 != 0 || (uintptr_t) src1->data % 4 != 0) {
+        return false;   // the narrow path still moves 4-byte words (an F16 view at an odd element offset)
+    }
     const bool vec = row_bytes % 16 == 0 && src0->nb[1] % 16 == 0 && src0->nb[2] % 16 == 0 && src0->nb[3] % 16 == 0
         && (uintptr_t) src0->data % 16 == 0 && (uintptr_t) src1->data % 16 == 0;
     const int64_t nrows = ggml_nrows(src0);

@@ -1037,7 +1037,9 @@ private:
 
     // LLAMA_SPEC_DEFER=<d> (default 1 = the behaviour above): keep up to d prompt views pending, as deep copies, so the
     // draft's catch-up lags the target by d views and never waits for an export that is still in flight; pending views
-    // also survive the end of a server batch (no drain there). The target context must keep d + 1 export regions
+    // also survive the end of a server batch (no drain there; the per-iteration NEXT_RESPONSE task does not flush). The
+    // target's export ring has its own fixed buffer, so a region stays valid across later decodes until it is reused.
+    // The target context must keep d + 1 export regions
     // (LLAMA_NEXTN_RING >= d + 1, clamped here). Everything pending is processed before outputs, before any task is
     // handled, and before anything reads or edits a slot's draft state (checkpoints, snapshots, context shift, new prompt).
     struct spec_view_copy {
@@ -1069,7 +1071,8 @@ private:
         for (int i = 0; i < v.n_tokens; ++i) {
             c.batch.token[i]     = v.token ? v.token[i] : 0;
             c.batch.pos[i]       = v.pos[i];
-            c.batch.n_seq_id[i]  = std::min(v.n_seq_id[i], 1);
+            GGML_ASSERT(v.n_seq_id[i] == 1 && "deferred draft views carry one sequence per token");
+            c.batch.n_seq_id[i]  = 1;
             c.batch.seq_id[i][0] = v.seq_id[i][0];
             c.batch.logits[i]    = v.logits ? v.logits[i] : 0;
         }
@@ -1094,21 +1097,35 @@ private:
         }
     }
 
+    void spec_clear() {
+        spec_pending.valid = false;
+        for (auto & c : spec_q) {
+            llama_batch_free(c.batch);
+        }
+        spec_q.clear();
+    }
+
+    // on a draft decode failure the remaining views are dropped (the caller aborts the slots; the draft only lags)
+    void spec_run_front() {
+        spec_view_copy c = spec_q.front();
+        spec_q.pop_front();
+        try {
+            spec_run(c.batch, c.seq);
+        } catch (...) {
+            llama_batch_free(c.batch);
+            spec_clear();
+            throw;
+        }
+        llama_batch_free(c.batch);
+    }
+
     void spec_flush() {
         if (spec_pending.valid) {
             spec_pending.valid = false;
             spec_run(spec_pending.view, spec_pending.seq);
         }
         while (!spec_q.empty()) {
-            spec_view_copy c = spec_q.front();
-            spec_q.pop_front();
-            try {
-                spec_run(c.batch, c.seq);
-            } catch (...) {
-                llama_batch_free(c.batch);
-                throw;
-            }
-            llama_batch_free(c.batch);
+            spec_run_front();
         }
     }
 
@@ -1121,15 +1138,7 @@ private:
         }
         spec_q.push_back(spec_copy_view(view, seq));
         while ((int) spec_q.size() > spec_defer_depth()) {
-            spec_view_copy c = spec_q.front();
-            spec_q.pop_front();
-            try {
-                spec_run(c.batch, c.seq);
-            } catch (...) {
-                llama_batch_free(c.batch);
-                throw;
-            }
-            llama_batch_free(c.batch);
+            spec_run_front();
         }
     }
 
@@ -1174,6 +1183,7 @@ private:
     int64_t t_last_load_progress_ms = 0;
 
     void destroy() {
+        spec_clear();
         spec.reset();
         spec_init.reset();
 
@@ -2736,18 +2746,12 @@ private:
     void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
         const int id_task = slot.task->id;
 
-        // LLAMA_SPEC_DEFER: the checkpoint stores the draft's partial state - catch it up first, unless it has none
-        // (draft-mtp: the NextN block keeps no recurrent / SWA state, only the KV the deferred views fill)
-        if (!spec_q.empty() && ctx_dft) {
-            const size_t dsz = llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-            static bool logged = false;
-            if (!logged) {
-                logged = true;
-                SLT_INF(slot, "draft partial state for checkpoints: %zu bytes\n", dsz);
-            }
-            if (dsz > 4096) {
-                spec_flush();
-            }
+        // LLAMA_SPEC_DEFER: catch the draft up first. The target's state copy below waits for the target to finish
+        // anyway, so this costs no extra drain: the draft's catch-up of the batch's views overlaps the target's last
+        // ubatches instead of running after the next (tail) decode. (draft-mtp's partial state is ~20 bytes; the
+        // flush is about timing, not checkpoint contents.)
+        if (spec_busy() && ctx_dft) {
+            spec_flush();
         }
 
         // evict checkpoints within min-step of a previous checkpoint, unless they were
@@ -2855,8 +2859,16 @@ private:
             SRV_DBG("decoding, decline task, id_task = %d\n", task.id);
             return false;
         }
-        if (!is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET) {
-            spec_flush();   // LLAMA_SPEC_DEFER: the task may read or edit slot / draft state
+        // LLAMA_SPEC_DEFER: the task may read or edit slot / draft state. NEXT_RESPONSE (posted by every update_slots
+        // while a slot is busy) does nothing, so pending prompt views survive the end of a server batch.
+        if (!is_yielding && task.type != SERVER_TASK_TYPE_METRICS && task.type != SERVER_TASK_TYPE_SLOT_GET &&
+                task.type != SERVER_TASK_TYPE_NEXT_RESPONSE && spec_busy()) {
+            try {
+                spec_flush();
+            } catch (const std::exception & e) {
+                SRV_ERR("draft catch-up failed: %s\n", e.what());
+                abort_all_slots("draft catch-up failed: " + std::string(e.what()));
+            }
         }
 
         switch (task.type) {
@@ -3232,6 +3244,7 @@ private:
     }
 
     void abort_all_slots(const std::string & reason) {
+        spec_clear();   // pending draft views belong to the aborted prompts (a non-copied view would also go stale)
         for (auto & slot : slots) {
             if (slot.is_processing()) {
                 send_error(slot, reason, ERROR_TYPE_SERVER);

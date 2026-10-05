@@ -610,7 +610,9 @@ static void launch_gated_delta_net_lpc(
             ggml_cuda_pool_alloc<float> eg(*pool, n);
             gdn_expg_f32<<<(n + 255) / 256, 256, 0, stream>>>(g_d, eg.get(), n);
             static const bool lds = [] { const char * e = getenv("GGML_GDN_LDS"); return e == nullptr || atoi(e) != 0; }();
-            if constexpr (S_v == 128) if (lds) {
+            // the ring loads v with 16-byte accesses (the lpc kernel uses scalar loads): float4-aligned views only
+            const bool v_vec = sv1 % 4 == 0 && sv2 % 4 == 0 && sv3 % 4 == 0 && (uintptr_t) v_d % 16 == 0;
+            if constexpr (S_v == 128) if (lds && v_vec) {
                 // LDS-shared token ring, 4 waves = 16 columns of one head per block (bit-exact with the lpc kernel)
                 const dim3 grid_lds(H, n_seqs, S_v / 16);
                 const uint3 neqk1_m = init_fastdiv_values(neqk1);

@@ -1048,8 +1048,8 @@ float * llama_context::get_embeddings_nextn_ith(int32_t i) {
 
         if (!cparams.embeddings_nextn_masked) {
             // unmasked: nextn rows are stored densely, indexed by raw token position (current region).
-            if (i < 0 || (size_t)(i + 1) * n_embd > embd_nextn.size / 2) {
-                throw std::runtime_error(format("out of range [0, %zu)", embd_nextn.size / 2 / n_embd));
+            if (i < 0 || (size_t)(i + 1) * n_embd > embd_nextn.size / nextn_ring) {
+                throw std::runtime_error(format("out of range [0, %zu)", embd_nextn.size / nextn_ring / n_embd));
             }
             return nextn_region(nextn_seq) + (size_t) i * n_embd;
         }
@@ -2157,7 +2157,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
                 const uint32_t n_embd  = hparams.n_embd_out();
                 float * embd_nextn_out = nextn_region(nextn_cur) + offset*n_embd;
 
-                GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) (masked ? embd_nextn.size : embd_nextn.size / 2));
+                GGML_ASSERT((offset + n_rows)*n_embd <= (int64_t) (masked ? embd_nextn.size : embd_nextn.size / nextn_ring));
                 ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd*sizeof(float));
                 nextn_backend_cur = backend_h;
             }
@@ -2181,13 +2181,14 @@ int llama_context::decode(const llama_batch & batch_inp) {
 
     // nextn rows exported: publish the region and record the event that guards it (exporting backend only)
     if (nextn_backend_cur != nullptr) {
-        ggml_backend_event_t & ev = nextn_events[nextn_cur % nextn_ring];
-        if (ev == nullptr || nextn_event_backend != nextn_backend_cur) {
+        ggml_backend_event_t & ev    = nextn_events        [nextn_cur % nextn_ring];
+        ggml_backend_t       & ev_be = nextn_event_backends[nextn_cur % nextn_ring];
+        if (ev == nullptr || ev_be != nextn_backend_cur) {
             if (ev != nullptr) {
                 ggml_backend_event_free(ev);
             }
-            ev = ggml_backend_event_new(ggml_backend_get_device(nextn_backend_cur));
-            nextn_event_backend = nextn_backend_cur;
+            ev    = ggml_backend_event_new(ggml_backend_get_device(nextn_backend_cur));
+            ev_be = nextn_backend_cur;
         }
         if (ev != nullptr) {
             ggml_backend_event_record(ev, nextn_backend_cur);
@@ -2284,9 +2285,11 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     embd.size       = has_embd       ? n_embd_out*n_outputs_max  : 0;
     embd_nextn.size = has_embd_nextn ? n_embd_out*n_outputs_max  : 0;
 
-    if (has_embd_nextn && !cparams.embeddings_nextn_masked) {
-        // unmasked: nextn row exists for every token in the batch, not just
-        // those flagged via batch.logits[i] -> size by token count instead.
+    // unmasked: nextn row exists for every token in the batch, not just those flagged via batch.logits[i] -> size by
+    // token count instead, in a separate buffer that later reserves never move or free (pending ring regions are read
+    // after later decode calls)
+    const bool nextn_ring_buf = has_embd_nextn && !cparams.embeddings_nextn_masked;
+    if (nextn_ring_buf) {
         static const uint32_t ring = [] {
             const char * e = getenv("LLAMA_NEXTN_RING");
             return e ? (uint32_t) std::max(2, std::min(8, atoi(e))) : 2u;
@@ -2294,6 +2297,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         nextn_ring = ring;
         embd_nextn.size = (size_t) nextn_ring * n_embd_out * n_batch;   // nextn_ring regions, see nextn_region()
     }
+    const size_t nextn_in_output = nextn_ring_buf ? 0 : embd_nextn.size;
 
     for (bool enabled : cparams.embeddings_layer_inp) {
         if (enabled) {
@@ -2315,7 +2319,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
     const size_t new_size  =
-        (logits.size + embd.size + embd_nextn.size + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
+        (logits.size + embd.size + nextn_in_output + embd_layer_inp_float_count + backend_float_count) * sizeof(float) +
         (                                                                         backend_token_count) * sizeof(llama_token);
 
     // alloc only when more than the current capacity is required
@@ -2364,8 +2368,30 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
     embd = has_embd ? buffer_view<float>{(float *) (base + offset), embd.size} : buffer_view<float>{nullptr, 0};
     offset += embd.size * sizeof(float);
 
-    embd_nextn = has_embd_nextn ? buffer_view<float>{(float *) (base + offset), embd_nextn.size} : buffer_view<float>{nullptr, 0};
-    offset += embd_nextn.size * sizeof(float);
+    if (nextn_ring_buf) {
+        const size_t nextn_bytes = embd_nextn.size * sizeof(float);
+        if (!buf_nextn || ggml_backend_buffer_get_size(buf_nextn.get()) < nextn_bytes) {
+            if (buf_nextn) {
+                synchronize();   // in-flight exports target the old ring (n_batch / ring are fixed: not expected)
+            }
+            // pinned host memory of the output device, as for buf_output
+            auto * nextn_buft = ggml_backend_cpu_buffer_type();
+            auto * nextn_dev  = model.dev_output();
+            if (auto * hb = nextn_dev ? ggml_backend_dev_host_buffer_type(nextn_dev) : nullptr) {
+                nextn_buft = hb;
+            }
+            buf_nextn.reset(ggml_backend_buft_alloc_buffer(nextn_buft, nextn_bytes));
+            if (buf_nextn == nullptr) {
+                LLAMA_LOG_ERROR("%s: failed to allocate nextn ring buffer of size %.2f MiB\n", __func__, nextn_bytes / (1024.0 * 1024.0));
+                return 0;
+            }
+            ggml_backend_buffer_clear(buf_nextn.get(), 0);
+        }
+        embd_nextn = buffer_view<float>{(float *) ggml_backend_buffer_get_base(buf_nextn.get()), embd_nextn.size};
+    } else {
+        embd_nextn = has_embd_nextn ? buffer_view<float>{(float *) (base + offset), embd_nextn.size} : buffer_view<float>{nullptr, 0};
+        offset += embd_nextn.size * sizeof(float);
+    }
 
     for (uint32_t il = 0; il < embd_layer_inp.size(); ++il) {
         if (cparams.embeddings_layer_inp[il]) {

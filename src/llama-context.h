@@ -319,11 +319,13 @@ private:
     // Unmasked nextn rows are double-buffered per decode call: a consumer (the MTP draft) can read the rows of the
     // previous call while the next call is already in flight on the devices. nextn_seq counts decode calls that
     // exported rows; nextn_events[seq % 2] is recorded on the exporting backend at the end of that call.
-    // LLAMA_NEXTN_RING=<n> (2..8, default 2) regions/events: a consumer may then lag n-1 decode calls behind
+    // LLAMA_NEXTN_RING=<n> (2..8, default 2) regions/events: a consumer may then lag n-1 decode calls behind.
+    // The unmasked ring lives in its own buffer (buf_nextn, nextn_ring * n_embd_out * n_batch floats, allocated once):
+    // buf_output is re-laid-out by every output_reserve, so a region read after a later decode would move under it.
     uint64_t             nextn_seq = 0;
     ggml_backend_event_t nextn_events[8] = {};
+    ggml_backend_t       nextn_event_backends[8] = {};
     uint32_t             nextn_ring = 2;
-    ggml_backend_t       nextn_event_backend = nullptr;
 
     float * nextn_region(uint64_t seq) const;
 
@@ -396,6 +398,9 @@ private:
 
     // host buffer for the model output (logits and embeddings)
     ggml_backend_buffer_ptr buf_output;
+
+    // host buffer for the unmasked nextn ring (fixed size, never re-laid-out; see nextn_region)
+    ggml_backend_buffer_ptr buf_nextn;
 
     // keep copies of the per-sequence memory on the device
     std::map<llama_seq_id, llama_memory_buffers> mem_storage;
