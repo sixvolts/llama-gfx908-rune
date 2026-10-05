@@ -298,6 +298,7 @@ struct server_slot {
 
     // used to determine the slot that has been used the longest
     int64_t t_last_used = -1;
+    int64_t t_task_arrival_us = 0;   // when the current task was assigned (LLAMA_PROMPT_SJF)
 
     // generation props
     int32_t n_ctx   = 0;  // context size per slot
@@ -354,6 +355,9 @@ struct server_slot {
         if (ctx_dft) {
             llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), cur_size_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         }
+        // the drafter's carry-over state belongs with the saved state, as it does with every context checkpoint (no-op
+        // for drafters without one, e.g. draft-mtp)
+        common_speculative_get_state(spec, id, cur->data.spec);
         const int64_t t3 = ggml_time_us();
         SRV_TRC(" - prompt_save timing: alloc %.1f ms, target state %.1f ms, draft state %.1f ms\n", (t1 - t0)/1e3, (t2 - t1)/1e3, (t3 - t2)/1e3);
 
@@ -361,9 +365,13 @@ struct server_slot {
     }
 
     bool prompt_load(server_prompt_cache & prompt_cache, const server_tokens & tokens) {
-        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id);
+        std::vector<uint8_t> data_spec;
+        bool res = prompt_cache.load(prompt, tokens, ctx_tgt, ctx_dft, id, &data_spec);
         if (!res) {
             SLT_WRN(*this, "%s", "failed to load prompt from cache\n");
+        } else if (!data_spec.empty()) {
+            // the loaded state's drafter carry-over, not this slot's previous occupant's
+            common_speculative_set_state(spec, id, data_spec);
         }
 
         return res;
@@ -1611,10 +1619,33 @@ private:
         return nullptr;
     }
 
+    // LLAMA_PREFIX_SHARE=<min tokens> (0/unset = off): shared prefix snapshots in the host prompt cache (see update_slots)
+    const int32_t prefix_share = getenv("LLAMA_PREFIX_SHARE") ? atoi(getenv("LLAMA_PREFIX_SHARE")) : 0;
+
+    bool has_empty_idle_slot() const {
+        for (const server_slot & s : slots) {
+            if (!s.is_processing() && s.prompt.tokens.empty()) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    static int32_t first_user_pos(const common_chat_msg_spans & spans) {
+        for (const auto & sp : spans.spans) {
+            if (sp.role == COMMON_CHAT_ROLE_USER) {
+                return (int32_t) sp.pos;
+            }
+        }
+        return -1;
+    }
+
     server_slot * get_available_slot(const server_task & task) {
         server_slot * ret = nullptr;
 
         bool update_cache = false;
+        bool share_guard  = false;   // LLAMA_PREFIX_SHARE: an LCP match was skipped in favour of snapshot + empty slot
+        bool lcp_hook     = false;   // LLAMA_SLOT_CACHE_LCP: the cache update was requested because an entry reuses more
 
         // if a specific slot is requested, use it (still goes through cache update logic below)
         if (task.id_slot != -1) {
@@ -1650,6 +1681,19 @@ private:
                 // fraction of the Longest Common Prefix length with respect to the input prompt length
                 const size_t lcp_len = tokens.get_common_prefix(task.tokens);
                 const float f_sim_cur = float(lcp_len) / task.tokens.size();
+
+                // with a shared prefix snapshot covering the match, taking over this slot would truncate another
+                // conversation's state (f_keep >= 0.5: not even parked in the host cache) or park it, to reuse what any
+                // empty slot can load from the snapshot; the empty slot is then chosen below (if it keeps busy slots as
+                // contiguous as the best idle slot would - otherwise the selector parks an idle conversation instead)
+                const size_t n_shared = prefix_share > 0 && prompt_cache ? prompt_cache->shared_prefix_len(task.tokens) : 0;
+                if (n_shared > 0 && tokens.size() > lcp_len + server_prompt_cache::shared_margin && has_empty_idle_slot() &&
+                    n_shared + server_prompt_cache::shared_margin >= lcp_len) {   // the LCP usually runs a few tokens past the snapshot (e.g. the <|user|> token)
+                    SLT_INF(slot, " - not taking over this slot for its %zu-token shared prefix (f_keep %.3f): snapshot + empty slot\n",
+                            lcp_len, float(lcp_len) / tokens.size());
+                    share_guard = true;
+                    continue;
+                }
 
                 SLT_TRC(slot, " - checking sim = %.3f (%zu/%zu) > %.3f\n", f_sim_cur, lcp_len, task.tokens.size(), slot_prompt_similarity);
 
@@ -1747,6 +1791,41 @@ private:
             }
         }
 
+        // LLAMA_PREFIX_SHARE: the takeover guard skipped an LCP match because an empty slot can load the shared snapshot -
+        // pick that empty slot here (the LRU selector below ranks by contiguity first and would otherwise prefer a
+        // non-empty idle slot, parking its conversation: a 0.7-1.2 s prompt_save stall plus an eviction). An empty slot
+        // that would fragment the busy slots is not taken: a gap costs an extra ubatch on every decode step for the
+        // request's lifetime, more than the one-off park.
+        if (ret == nullptr && share_guard) {
+            const bool by_runs = compact && !params_base.kv_unified;
+            int best_runs_any = INT_MAX;
+            for (const server_slot & slot : slots) {
+                if (!slot.is_processing()) {
+                    best_runs_any = std::min(best_runs_any, by_runs ? n_runs_with(slot) : 0);
+                }
+            }
+            server_slot * best_empty = nullptr;
+            int best_empty_runs = INT_MAX;
+            for (server_slot & slot : slots) {
+                if (slot.is_processing() || !slot.prompt.tokens.empty()) {
+                    continue;
+                }
+                const int runs = by_runs ? n_runs_with(slot) : 0;
+                if (!best_empty || runs < best_empty_runs || (runs == best_empty_runs && slot.t_last_used <= best_empty->t_last_used)) {
+                    best_empty      = &slot;
+                    best_empty_runs = runs;
+                }
+            }
+            if (best_empty && best_empty_runs <= best_runs_any) {
+                ret = best_empty;
+                update_cache = true;
+                SLT_INF(*ret, "%s", "selected empty slot for the shared prefix snapshot\n");
+            } else if (best_empty) {
+                SLT_INF(*best_empty, "empty slot would split the busy slots (%d vs %d runs) - using the idle-slot selector\n",
+                        best_empty_runs, best_runs_any);
+            }
+        }
+
         // find the slot that has been least recently used (see above)
         if (ret == nullptr) {
             int64_t t_last = -1;
@@ -1775,6 +1854,19 @@ private:
             }
         }
 
+        // the chosen live slot may reuse less than a conversation parked in the host cache (e.g. after a compaction
+        // move evicted it): then go through the cache update, whose load() takes the better entry
+        if (ret && !update_cache && prompt_cache && server_prompt_cache::slot_cache_lcp() &&
+            task.type == SERVER_TASK_TYPE_COMPLETION) {
+            const size_t lcp_slot  = ret->prompt.tokens.get_common_prefix(task.tokens);
+            const size_t lcp_cache = prompt_cache->best_lcp(task.tokens);
+            if (lcp_cache > lcp_slot) {
+                SLT_INF(*ret, "host prompt cache reuses more than this slot (%zu vs %zu tokens) - loading from it\n", lcp_cache, lcp_slot);
+                update_cache = true;
+                lcp_hook     = true;
+            }
+        }
+
         if (ret) {
             update_cache = update_cache && prompt_cache;
 
@@ -1786,10 +1878,25 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                const size_t lcp_before = ret->prompt.tokens.get_common_prefix(task.tokens);
+                bool         saved      = ret->prompt_save(*prompt_cache);
+                if (lcp_hook && !saved) {
+                    saved = prompt_cache->contains(ret->prompt.tokens);   // prompt_save skips a prompt the cache already holds
+                }
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                if (lcp_hook && !saved) {
+                    // LLAMA_SLOT_CACHE_LCP: this slot's own conversation could not be parked (e.g. over the cache limit);
+                    // loading over it would lose it, so keep it and reuse what it has
+                    SLT_WRN(*ret, "%s", "host cache could not hold this slot's state - not loading over it\n");
+                } else if (!ret->prompt_load(*prompt_cache, task.tokens)) {
                     ret->prompt_clear();
+                } else if (lcp_hook) {
+                    const size_t lcp_after = ret->prompt.tokens.get_common_prefix(task.tokens);
+                    if (lcp_after <= lcp_before) {
+                        // the better entry was evicted while making room for this slot's own state: the save was wasted
+                        SLT_WRN(*ret, "host cache entry was evicted while parking this slot (reuse %zu -> %zu tokens)\n",
+                                lcp_before, lcp_after);
+                    }
                 }
 
                 prompt_cache->update();
@@ -1852,6 +1959,7 @@ private:
     }
 
     bool launch_slot_with_task(server_slot & slot, server_task && task) {
+        slot.t_task_arrival_us = ggml_time_us();   // LLAMA_PROMPT_SJF ordering
         // process per-request lora adapters
         if (!task.params.lora.empty()) {
             auto task_loras = construct_lora_list(task.params.lora);
@@ -2514,10 +2622,19 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
+        const int64_t t_ckpts = ggml_time_us();
+        llama_synchronize(ctx_tgt);   // update_tgt syncs anyway; done here only to time the wait apart from the copy
+        const int64_t t_ckpt0 = ggml_time_us();
         cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        const int64_t t_ckpt1 = ggml_time_us();
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+        const int64_t t_ckpt2 = ggml_time_us();
+        if (t_ckpt2 - t_ckpts > 50000) {
+            SLT_INF(slot, "context checkpoint at n_tokens = %" PRId64 " took %.1f ms (target %.1f ms, %.1f MiB; sync wait before it %.1f ms)\n",
+                    cur.n_tokens, (t_ckpt2 - t_ckpt0)/1e3, (t_ckpt1 - t_ckpt0)/1e3, (float) cur.size() / 1024 / 1024, (t_ckpt0 - t_ckpts)/1e3);
+        }
 
         SLT_TRC(slot,
                 "created context checkpoint %d of %d (pos_min = %d, pos_max = %d, n_tokens = %" PRId64 ", size = %.3f MiB)\n",
@@ -3375,6 +3492,10 @@ private:
         int32_t n_batch  = llama_n_batch(ctx_tgt);
         int32_t n_ubatch = llama_n_ubatch(ctx_tgt);
 
+        // LLAMA_CKPT_TAIL_ALIGN=1: take the far end-of-prompt context checkpoint at a natural batch boundary instead of
+        // splitting the prompt at n - (4 + n_ubatch) (default 0 = upstream behaviour)
+        static const bool ckpt_tail_align = getenv("LLAMA_CKPT_TAIL_ALIGN") && atoi(getenv("LLAMA_CKPT_TAIL_ALIGN")) != 0;
+
         auto & alora_scale       = batch.alora_scale;
         auto & alora_disabled_id = batch.alora_disabled_id;
 
@@ -3388,9 +3509,45 @@ private:
         if (params_base.cont_batching || batch.size() == 0) {
             bool add_ok = true; // false means the batch is full, skip remaining slots
 
-            iterate(slots, [&](server_slot & slot) {
+            // LLAMA_PROMPT_SJF=<tokens per second> (0/unset = off): fill prompt batches in order of estimated finish
+            // time (arrival + remaining prompt tokens / rate) instead of slot index, so a short agentic turn is not
+            // queued behind another session's long prefill (earliest-deadline-first: favours short prompts, cannot
+            // starve a long one). Default upstream order = slot index.
+            static const double prompt_sjf = getenv("LLAMA_PROMPT_SJF") ? atof(getenv("LLAMA_PROMPT_SJF")) : 0.0;
+            std::vector<server_slot *> fill_order;
+            fill_order.reserve(slots.size());
+            for (auto & s : slots) {
+                fill_order.push_back(&s);
+            }
+            if (prompt_sjf > 0.0) {
+                std::vector<double> key(slots.size(), 0.0);
+                for (auto & s : slots) {
+                    if (!s.is_processing() || !s.task ||
+                        (s.state != SLOT_STATE_PROCESSING_PROMPT && s.state != SLOT_STATE_STARTED)) {
+                        key[s.id] = -1e300;   // generating / idle slots keep their place in front (no prompt to add)
+                        continue;
+                    }
+                    const size_t done = s.state == SLOT_STATE_STARTED
+                        ? (size_t) s.prompt.tokens.get_common_prefix(s.task->tokens)
+                        : (size_t) s.prompt.n_tokens();
+                    const double remaining = (double) s.task->n_tokens() - (double) done;
+                    key[s.id] = s.t_task_arrival_us / 1e6 + remaining / prompt_sjf;
+                }
+                std::stable_sort(fill_order.begin(), fill_order.end(),
+                        [&](const server_slot * a, const server_slot * b) { return key[a->id] < key[b->id]; });
+            }
+
+            // with LLAMA_PROMPT_SJF, a batch in which a prompt completes is not topped up with another slot's prompt
+            // tokens: the finishing request would otherwise wait for up to n_batch tokens of someone else's prefill
+            // before its first token (the other prompt continues in the next batch)
+            bool prompt_done_in_batch = false;
+
+            iterate(fill_order, [&](server_slot & slot) {
                 if (!add_ok || batch.size() >= n_batch_prompt) {
                     return; // batch is full, skip remaining slots
+                }
+                if (prompt_sjf > 0.0 && prompt_done_in_batch) {
+                    return;
                 }
 
                 if (!slot.is_processing()) {
@@ -3843,6 +4000,10 @@ private:
 
                             bool should_break = false;
                             for (int offset : checkpoint_offsets) {
+                                // tail-align mode: no forced split at n - (4 + n_ubatch) (see ckpt_tail_align)
+                                if (ckpt_tail_align && offset != 4) {
+                                    continue;
+                                }
                                 const int n_last = std::min(n_batch, offset);
                                 if (slot.task->n_tokens() == slot.prompt.n_tokens() + n_last) {
                                     should_break = true;
@@ -3860,7 +4021,16 @@ private:
 
                     const auto n_tokens_start = slot.prompt.n_tokens() - n_tokens_cur;
 
-                    const bool near_prompt_end = slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
+                    // tail-align mode: the "far" end-of-prompt checkpoint (upstream: a forced split at n - (4 + n_ubatch))
+                    // is taken at the natural batch boundary at or before that point, i.e. before the batch that spans
+                    // it, so the last n_ubatch tokens stay in a full pipelined batch instead of an isolated ubatch that
+                    // drains the 9-stage pipeline (~1.6 s per request on rune). The checkpoint ends up 4 + n_ubatch ..
+                    // 4 + n_ubatch + n_batch tokens before the end instead of exactly 4 + n_ubatch.
+                    const int32_t n_far = slot.task->n_tokens() - (4 + n_ubatch);
+                    const bool near_prompt_end = ckpt_tail_align
+                        ? (n_tokens_start <= n_far && slot.prompt.n_tokens() > n_far) ||
+                          slot.prompt.n_tokens() == slot.task->n_tokens()
+                        : slot.task->n_tokens() < slot.prompt.n_tokens() + n_ubatch;
 
                     const bool is_user_start = spans.is_user_start(n_tokens_start);
                     const bool is_last_user_message = n_tokens_start == last_user_pos;
@@ -3868,6 +4038,7 @@ private:
                     // entire prompt has been processed
                     if (slot.prompt.n_tokens() == slot.task->n_tokens()) {
                         slot.state = SLOT_STATE_DONE_PROMPT;
+                        prompt_done_in_batch = true;
 
                         GGML_ASSERT(batch.size() > 0);
 
@@ -3909,6 +4080,33 @@ private:
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
                         create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                    }
+
+                    // LLAMA_PREFIX_SHARE=<min tokens>: when a batch starts at the first user message, the slot holds
+                    // exactly the shared prefix (system prompt + tool definitions); keep a copy of that state in the
+                    // host prompt cache so a new conversation with the same prefix starts from it in any slot instead
+                    // of prefilling it again (or evicting another live conversation's slot through LCP similarity).
+                    if (prefix_share > 0 && prompt_cache && !has_mtmd && pos_min >= 0 &&
+                        n_tokens_start >= prefix_share && n_tokens_start == first_user_pos(spans)) {
+                        server_tokens pref = slot.prompt.tokens.clone();
+                        pref.keep_first(n_tokens_start);
+                        if (prompt_cache->shared_prefix_len(pref) < (size_t) n_tokens_start) {
+                            const int64_t t0 = ggml_time_us();
+                            const size_t sz_tgt =           llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                            const size_t sz_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
+                            auto * cur = prompt_cache->alloc_shared(pref, sz_tgt, sz_dft);
+                            if (cur) {
+                                llama_state_seq_get_data_ext(ctx_tgt, cur->data.main.data(), sz_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                                if (ctx_dft) {
+                                    llama_state_seq_get_data_ext(ctx_dft, cur->data.drft.data(), sz_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_NONE);
+                                }
+                                // drafter carry-over at the snapshot point (restored by prompt_load; empty for draft-mtp)
+                                common_speculative_get_state(spec.get(), slot.id, cur->data.spec);
+                                prompt_cache->update();
+                                SLT_INF(slot, "saved shared prefix snapshot of %d tokens (%.1f MiB) in %.1f ms\n",
+                                        n_tokens_start, (sz_tgt + sz_dft) / 1048576.0, (ggml_time_us() - t0) / 1e3);
+                            }
+                        }
                     }
                 }
 

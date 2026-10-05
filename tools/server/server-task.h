@@ -588,15 +588,21 @@ struct server_prompt {
 struct server_prompt_data {
     std::vector<uint8_t> main;
     std::vector<uint8_t> drft;
+    std::vector<uint8_t> spec; // the drafter's per-sequence carry-over state (common_speculative_get_state), if any
 
     size_t size() const {
-        return main.size() + drft.size();
+        return main.size() + drft.size() + spec.size();
     }
 };
 
 struct server_prompt_cache_state {
     server_prompt prompt;
     server_prompt_data data;
+
+    // shared prefix snapshot (LLAMA_PREFIX_SHARE): the exact state after prompt.tokens (no checkpoints needed), loaded by
+    // copy into any slot whose new prompt starts with it, kept in the cache (not consumed by load, not removed as a
+    // prefix of a longer saved prompt)
+    bool shared = false;
 
     size_t size() const {
         size_t res = data.size();
@@ -629,12 +635,37 @@ struct server_prompt_cache {
 
     server_prompt_cache_state * alloc(const server_prompt & prompt, size_t state_size_main, size_t state_size_drft);
 
-    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot);
+    // spec_out (optional): receives the loaded entry's drafter carry-over state (empty if no entry was loaded or it has none)
+    bool load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+              std::vector<uint8_t> * spec_out = nullptr);
 
     void update();
 
     // true if an entry already holds all of `tokens` (alloc() skips such prompts)
     bool contains(const server_tokens & tokens) const;
+
+    // LLAMA_PREFIX_SHARE: allocate a shared prefix snapshot for `tokens` (nullptr if one exists / does not fit)
+    server_prompt_cache_state * alloc_shared(const server_tokens & tokens, size_t state_size_tgt, size_t state_size_dft);
+
+    // length of the longest shared snapshot that is a prefix of `tokens` (0 = none)
+    size_t shared_prefix_len(const server_tokens & tokens) const;
+
+    // evict the oldest entry, preferring non-shared ones; false if empty
+    bool evict_one();
+
+    // longest prefix of `tokens` that load() could restore from one entry (0 = none)
+    size_t best_lcp(const server_tokens & tokens) const;
+
+    // LLAMA_SLOT_CACHE_LCP (default 0 = upstream rule): load() picks the entry reusing the most tokens; a slot chosen
+    // by LCP similarity still loads from the cache when an entry there reuses more
+    static bool slot_cache_lcp();
+
+    // LLAMA_PREFIX_SHARE: a non-shared entry (another parked conversation, consumed by load) is not taken when it reuses
+    // at most this many tokens more than a shared snapshot that covers the new prompt
+    static constexpr size_t shared_margin = 512;
+
+    // LLAMA_PREFIX_SHARE_MAX (default 4): at most this many shared snapshots; the least recently used one is dropped
+    static size_t prefix_share_max();
 };
 
 // used exclusively by router mode

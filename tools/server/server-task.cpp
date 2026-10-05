@@ -1747,7 +1747,7 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     for (auto it = states.begin(); it != states.end();) {
         const int len = it->prompt.tokens.get_common_prefix(prompt.tokens);
 
-        if (len == (int) it->prompt.tokens.size()) {
+        if (len == (int) it->prompt.tokens.size() && !it->shared) {
             SRV_TRC(" - removing obsolete cached prompt with length %d\n", len);
 
             it = states.erase(it);
@@ -1759,10 +1759,9 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
     if (limit_size > 0) {
         // make room before allocating the new vectors to avoid breaching the limit
         while (!states.empty() && size() + state_size_new > limit_size) {
-            SRV_WRN(" - making room for prompt cache entry, removing oldest entry (size = %.3f MiB)\n",
-                    states.front().size() / (1024.0 * 1024.0));
+            SRV_WRN("%s", " - making room for prompt cache entry, removing oldest entry\n");
 
-            states.pop_front();
+            evict_one();
         }
     }
 
@@ -1793,13 +1792,52 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         /*.data   =*/ {
             /*.main =*/ std::move(state_data_tgt),
             /*.drft =*/ std::move(state_data_dft),
+            /*.spec =*/ {},
         },
     });
 
     return &states.back();
 }
 
-bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot) {
+bool server_prompt_cache::slot_cache_lcp() {
+    static const bool on = getenv("LLAMA_SLOT_CACHE_LCP") && atoi(getenv("LLAMA_SLOT_CACHE_LCP")) != 0;
+    return on;
+}
+
+size_t server_prompt_cache::prefix_share_max() {
+    static const size_t n = getenv("LLAMA_PREFIX_SHARE_MAX") ? (size_t) std::max(1, atoi(getenv("LLAMA_PREFIX_SHARE_MAX"))) : 4;
+    return n;
+}
+
+size_t server_prompt_cache::best_lcp(const server_tokens & tokens) const {
+    size_t best_own    = 0;   // best non-shared entry (consumed by load)
+    size_t best_shared = 0;   // longest shared snapshot fully contained in `tokens`
+    for (const auto & st : states) {
+        const size_t lcp = st.prompt.tokens.get_common_prefix(tokens);
+        if (lcp == 0 || 4*lcp < st.prompt.tokens.size()) {
+            continue;   // load() skips entries it would keep < 25 % of
+        }
+        if (st.shared) {
+            if (lcp == st.prompt.tokens.size()) {
+                best_shared = std::max(best_shared, lcp);
+            }
+            continue;
+        }
+        best_own = std::max(best_own, lcp);
+    }
+    // mirror load(): a parked conversation is not consumed for <= shared_margin tokens more than a shared snapshot
+    if (best_shared > 0 && best_own <= best_shared + shared_margin) {
+        return best_shared;
+    }
+    return std::max(best_own, best_shared);
+}
+
+bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tokens_new, llama_context * ctx_tgt, llama_context * ctx_dft, int32_t id_slot,
+                               std::vector<uint8_t> * spec_out) {
+    if (spec_out) {
+        spec_out->clear();
+    }
+
     const int lcp_best = prompt.tokens.get_common_prefix(tokens_new);
 
     float f_keep_best = prompt.tokens.size() > 0 ? float(lcp_best) / prompt.tokens.size() : -1.0f; // empty slot: any cache entry wins
@@ -1808,6 +1846,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
     SRV_TRC(" - looking for better prompt, base f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
 
     auto it_best = states.end();
+    int lcp_best_cur = lcp_best;   // LLAMA_SLOT_CACHE_LCP: tokens reused by the current choice (the slot's own content)
 
     // find the most similar cached prompt, that would also preserve the most context
     for (auto it = states.begin(); it != states.end(); ++it) {
@@ -1823,16 +1862,55 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             continue;
         }
 
-        if (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur) {
+        // a shared snapshot has no checkpoints: only useful when the new prompt contains all of it
+        if (it->shared && lcp_cur != (int) it->prompt.tokens.size()) {
+            continue;
+        }
+
+        // LLAMA_SLOT_CACHE_LCP=1: pick the entry that reuses the most tokens; the slot's own content was
+        // saved to the cache before this load, so nothing is lost by replacing it (the upstream rule also demands a
+        // higher kept fraction, which rejects e.g. a parked 16k conversation in favour of a slot's 8.8k system prompt)
+        const bool better = slot_cache_lcp()
+            ? lcp_cur > lcp_best_cur
+            : (f_keep_best < f_keep_cur && f_sim_best < f_sim_cur);
+        if (better) {
             f_keep_best = f_keep_cur;
             f_sim_best  = f_sim_cur;
+            lcp_best_cur = lcp_cur;
 
             it_best = it;
         }
     }
 
+    // LLAMA_PREFIX_SHARE: loading a non-shared entry consumes it (it is another parked conversation, or this one's own
+    // earlier state). When a shared snapshot covering the new prompt reuses nearly as much (the LCP of a conversation
+    // with the same system prompt usually runs only a few tokens past the snapshot, e.g. the <|user|> token), prefer the
+    // snapshot - or the slot's own content if that already covers it - so the parked conversation survives for its own
+    // next turn. Without shared entries (LLAMA_PREFIX_SHARE unset) nothing changes here.
+    if (it_best != states.end() && !it_best->shared) {
+        auto it_sh = states.end();
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            if (it->shared && (it_sh == states.end() || it->prompt.tokens.size() > it_sh->prompt.tokens.size()) &&
+                it->prompt.tokens.get_common_prefix(tokens_new) == (int) it->prompt.tokens.size()) {
+                it_sh = it;
+            }
+        }
+        if (it_sh != states.end() && (size_t) lcp_best_cur <= it_sh->prompt.tokens.size() + shared_margin) {
+            const int n_sh = it_sh->prompt.n_tokens();
+            SRV_INF(" - not consuming a cached prompt (%d tokens, lcp %d) for %d tokens past the %d-token shared snapshot: %s\n",
+                    it_best->prompt.n_tokens(), lcp_best_cur, lcp_best_cur - n_sh, n_sh,
+                    n_sh > lcp_best ? "using the snapshot" : "keeping the slot's own content");
+            it_best = n_sh > lcp_best ? it_sh : states.end();
+        }
+    }
+
     if (it_best != states.end()) {
         SRV_TRC(" - found better prompt with f_keep = %.3f, f_sim = %.3f\n", f_keep_best, f_sim_best);
+
+        const bool shared = it_best->shared;
+        if (shared) {
+            SRV_INF(" - loading shared prefix snapshot (%d tokens) by copy\n", it_best->prompt.n_tokens());
+        }
 
         {
             auto & data = it_best->data.main;
@@ -1845,8 +1923,10 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 return false;
             }
 
-            data.clear();
-            data.shrink_to_fit();
+            if (!shared) {
+                data.clear();
+                data.shrink_to_fit();
+            }
         }
 
         {
@@ -1863,14 +1943,26 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                     return false;
                 }
 
-                data.clear();
-                data.shrink_to_fit();
+                if (!shared) {
+                    data.clear();
+                    data.shrink_to_fit();
+                }
             }
         }
 
-        prompt = std::move(it_best->prompt);
+        if (spec_out) {
+            *spec_out = it_best->data.spec;   // copy: a shared entry keeps its own
+        }
 
-        states.erase(it_best);
+        if (shared) {
+            prompt = it_best->prompt.clone();
+            // keep it warm: most recently used shared entries are evicted last
+            states.splice(states.end(), states, it_best);
+        } else {
+            prompt = std::move(it_best->prompt);
+
+            states.erase(it_best);
+        }
     }
 
     return true;
@@ -1879,9 +1971,9 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
 void server_prompt_cache::update() {
     if (limit_size > 0) {
         while (!states.empty() && size() > limit_size) {
-            SRV_WRN(" - cache size limit reached, removing oldest entry (size = %.3f MiB)\n", states.front().size() / (1024.0 * 1024.0));
+            SRV_WRN("%s", " - cache size limit reached, removing oldest entry\n");
 
-            states.pop_front();
+            evict_one();
         }
     }
 
@@ -1893,10 +1985,10 @@ void server_prompt_cache::update() {
 
     if (limit_tokens > 0) {
         while (!states.empty() && n_tokens() > limit_tokens_cur) {
-            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry (size = %.3f MiB)\n",
-                    limit_tokens, limit_tokens_cur, states.front().size() / (1024.0 * 1024.0));
+            SRV_WRN(" - cache token limit (%zu, est: %zu) reached, removing oldest entry\n",
+                    limit_tokens, limit_tokens_cur);
 
-            states.pop_front();
+            evict_one();
         }
     }
 
@@ -1907,4 +1999,102 @@ void server_prompt_cache::update() {
         SRV_TRC("   - prompt %p: %7d tokens, checkpoints: %2zu, %9.3f MiB\n",
                 (const void *)&state, state.prompt.n_tokens(), state.prompt.checkpoints.size(), state.size() / (1024.0 * 1024.0));
     }
+}
+
+bool server_prompt_cache::evict_one() {
+    if (states.empty()) {
+        return false;
+    }
+    auto it = states.begin();
+    while (it != states.end() && it->shared) {
+        ++it;
+    }
+    if (it == states.end()) {
+        it = states.begin();   // only shared snapshots left: drop the least recently used one
+    }
+    SRV_WRN(" - evicting cached prompt (%d tokens, shared = %d, size = %.3f MiB)\n",
+            it->prompt.n_tokens(), (int) it->shared, it->size() / (1024.0 * 1024.0));
+    states.erase(it);
+    return true;
+}
+
+size_t server_prompt_cache::shared_prefix_len(const server_tokens & tokens) const {
+    size_t best = 0;
+    for (const auto & st : states) {
+        if (!st.shared) {
+            continue;
+        }
+        const size_t n = st.prompt.tokens.size();
+        if (n > best && (size_t) st.prompt.tokens.get_common_prefix(tokens) == n) {
+            best = n;
+        }
+    }
+    return best;
+}
+
+server_prompt_cache_state * server_prompt_cache::alloc_shared(const server_tokens & tokens, size_t state_size_tgt, size_t state_size_dft) {
+    for (const auto & st : states) {
+        if (st.shared && st.prompt.tokens.size() == tokens.size() &&
+            (size_t) st.prompt.tokens.get_common_prefix(tokens) == tokens.size()) {
+            return nullptr;   // already have it
+        }
+    }
+
+    const size_t state_size_new = state_size_tgt + state_size_dft;
+    if (limit_size > 0 && state_size_new > limit_size) {
+        return nullptr;
+    }
+
+    // bounded number of snapshots (LLAMA_PREFIX_SHARE_MAX): a client with a per-conversation system prompt would
+    // otherwise fill --cache-ram with snapshots that are evicted after every parked conversation; drop the least
+    // recently used snapshot (shared entries are moved to the back of the list on every use)
+    for (;;) {
+        size_t n_shared = 0;
+        auto it_lru = states.end();
+        for (auto it = states.begin(); it != states.end(); ++it) {
+            if (it->shared) {
+                n_shared++;
+                if (it_lru == states.end()) {
+                    it_lru = it;
+                }
+            }
+        }
+        if (n_shared < prefix_share_max()) {
+            break;
+        }
+        SRV_WRN(" - dropping the least recently used shared prefix snapshot (%d tokens, %zu snapshots, max %zu)\n",
+                it_lru->prompt.n_tokens(), n_shared, prefix_share_max());
+        states.erase(it_lru);
+    }
+
+    if (limit_size > 0) {
+        while (!states.empty() && size() + state_size_new > limit_size) {
+            evict_one();
+        }
+    }
+
+    std::vector<uint8_t> state_data_tgt;
+    std::vector<uint8_t> state_data_dft;
+    try {
+        state_data_tgt.resize(state_size_tgt);
+        state_data_dft.resize(state_size_dft);
+    } catch (const std::bad_alloc & e) {
+        SRV_ERR("failed to allocate memory for a shared prefix snapshot: %s\n", e.what());
+        return nullptr;
+    }
+
+    states.push_back({
+        /*.prompt =*/ {
+            /*.tokens      =*/ tokens.clone(),
+            /*.checkpoints =*/ {},
+        },
+        /*.data   =*/ {
+            /*.main =*/ std::move(state_data_tgt),
+            /*.drft =*/ std::move(state_data_dft),
+            /*.spec =*/ {},
+        },
+        /*.shared =*/ true,
+    });
+
+    return &states.back();
 }
