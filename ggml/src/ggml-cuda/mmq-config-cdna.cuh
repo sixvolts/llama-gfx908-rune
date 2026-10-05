@@ -1,3 +1,15 @@
+#ifndef GGML_MMQ_Q4K_I128
+#define GGML_MMQ_Q4K_I128 0
+#endif
+#ifndef GGML_MMQ_Q4K_F32DM
+#define GGML_MMQ_Q4K_F32DM 1
+#endif
+#if GGML_MMQ_Q4K_F32DM
+#define GGML_CUDA_MMQ_SRAM_LAYOUT_Q4K_CDNA GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1F
+#else
+#define GGML_CUDA_MMQ_SRAM_LAYOUT_Q4K_CDNA GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1
+#endif
+
 static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_config_cdna(ggml_type type, int J, bool fallback) {
     CASE(GGML_TYPE_Q1_0, 512, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, true);
     CASE(GGML_TYPE_Q1_0, 512, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0, MMQ_ITER_K, true, true);
@@ -73,13 +85,23 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     CASE(GGML_TYPE_Q3_K, 512, 1, 128,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K_PS, MMQ_ITER_K, true, false);
     CASE(GGML_TYPE_Q3_K, 512, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K_PS, MMQ_ITER_K, true, false);
 
-    CASE(GGML_TYPE_Q4_K, 512, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, true);
-    CASE(GGML_TYPE_Q4_K, 512, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, true);
-    CASE(GGML_TYPE_Q4_K, 512, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, true);
-    CASE(GGML_TYPE_Q4_K, 512, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q4_K, 512, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q4_K, 512, 1, 128,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
-    CASE(GGML_TYPE_Q4_K, 512, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
+    // Q4_K on CDNA: 64-row tiles, 256 threads, 2 blocks per CU (J <= 32 so x + y tiles fit in 32 KB of LDS): two
+    // independent blocks per CU overlap their load/store/barrier phases; per-element accumulation order unchanged
+    // (bit-exact). MoE at ub 512 -10..12%. GGML_MMQ_Q4K_I128=1 (compile time) restores the 128-row/512-thread tiles.
+#if !GGML_MMQ_Q4K_I128
+    CASE(GGML_TYPE_Q4_K, 256, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q4K_CDNA, MMQ_ITER_K, true, true);
+    CASE(GGML_TYPE_Q4_K, 256, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q4K_CDNA, MMQ_ITER_K, true, true);
+    CASE(GGML_TYPE_Q4_K, 256, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q4K_CDNA, MMQ_ITER_K, true, false);
+    CASE(GGML_TYPE_Q4_K, 256, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q4K_CDNA, MMQ_ITER_K, true, false);
+#else
+    CASE(GGML_TYPE_Q4_K, 512, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q4K_CDNA, MMQ_ITER_K, true, true);
+    CASE(GGML_TYPE_Q4_K, 512, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q4K_CDNA, MMQ_ITER_K, true, true);
+    CASE(GGML_TYPE_Q4_K, 512, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q4K_CDNA, MMQ_ITER_K, true, true);
+    CASE(GGML_TYPE_Q4_K, 512, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q4K_CDNA, MMQ_ITER_K, true, false);
+    CASE(GGML_TYPE_Q4_K, 512, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q4K_CDNA, MMQ_ITER_K, true, false);
+    CASE(GGML_TYPE_Q4_K, 512, 1, 128,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q4K_CDNA, MMQ_ITER_K, true, false);
+    CASE(GGML_TYPE_Q4_K, 512, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q4K_CDNA, MMQ_ITER_K, true, false);
+#endif
 
     CASE(GGML_TYPE_Q5_K, 512, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, true);
     CASE(GGML_TYPE_Q5_K, 512, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, true);

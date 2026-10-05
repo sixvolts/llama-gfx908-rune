@@ -1938,6 +1938,15 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
+    // Diagnostics: GGML_CUDA_DUMP_MM_ALL=1 logs every dense MUL_MAT with the path it takes (type K M N batch path name).
+    static const bool dump_all = getenv("GGML_CUDA_DUMP_MM_ALL") != nullptr;
+    auto mm_path = [&](const char * path) {
+        if (dump_all) {
+            fprintf(stderr, "[mm path] %s K=%lld M=%lld N=%lld ne02=%lld ne12=%lld %s %s\n", ggml_type_name(src0->type),
+                (long long) ne00, (long long) ne01, (long long) ne11, (long long) ne02, (long long) ne12, path, src0->name);
+        }
+    };
+
     const int32_t hint = ggml_get_op_params_i32(dst, 1);
     if (hint == GGML_HINT_SRC0_IS_HADAMARD && ggml_cuda_op_fwht(ctx, src1, dst)) {
         return;
@@ -1949,6 +1958,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     const bool bad_padding_clear = ggml_backend_buffer_get_usage(src0->buffer) == GGML_BACKEND_BUFFER_USAGE_COMPUTE
         && ggml_nbytes(src0) != ggml_backend_buffer_get_alloc_size(src0->buffer, src0) && src0->view_src;
     if (bad_padding_clear || src1->type != GGML_TYPE_F32 || dst->type != GGML_TYPE_F32) {
+        mm_path("cublas-badpad");
         ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
         return;
     }
@@ -1959,6 +1969,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     if (ggml_cuda_should_use_mmvf(src0->type, cc, src0->ne, src0->nb, ne11)) {
         // The custom F16 vector kernel can be used over batched cuBLAS GEMM.
         // But this is only faster for GPUs without tensor cores or with a thin src0 matrix (particularly KQV in attention)
+        mm_path("mmvf");
         ggml_cuda_mul_mat_vec_f(ctx, src0, src1, nullptr, dst);
         return;
     }
@@ -1973,6 +1984,7 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         dst_vec.nb[1] = dst_vec.nb[0]*ne11;
         dst_vec.nb[2] = dst_vec.nb[1];
         dst_vec.nb[3] = dst_vec.nb[1];
+        mm_path("mmvf-T");
         ggml_cuda_mul_mat_vec_f(ctx, src1, src0, nullptr, &dst_vec);
         return;
     }
@@ -1983,19 +1995,23 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
         if (small_m > 0 && GGML_CUDA_CC_IS_CDNA1(cc) && src0->type == GGML_TYPE_F32 && ne01 <= small_m && ne01 > 1
                 && ne11 > MMVF_MAX_BATCH_SIZE && ne2 == 1 && ne3 == 1 && ne00 % 64 == 0
                 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1) && ggml_is_contiguous(dst)) {
+            mm_path("mmvf-small-m");
             ggml_cuda_mul_mat_vec_f_small_m(ctx, src0, src1, dst);
             return;
         }
     }
     if (ggml_cuda_should_use_mmf(src0->type, cc, warp_size, src0->ne, src0->nb, ne11, /*mul_mat_id =*/ false)) {
+        mm_path("mmf");
         ggml_cuda_mul_mat_f(ctx, src0, src1, nullptr, dst);
         return;
     }
     if (ggml_cuda_should_use_mmvq(src0->type, cc, ne11)) {
+        mm_path("mmvq");
         ggml_cuda_mul_mat_vec_q(ctx, src0, src1, nullptr, dst);
         return;
     }
     if (ggml_cuda_should_use_mmq(src0->type, cc, ne11, /*n_experts =*/ 0)) {
+        mm_path("mmq");
         ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
         return;
     }
@@ -2005,12 +2021,22 @@ static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor
     // GGML_MMQ_DENSE_MIN_M=<rows> sets the threshold (0 disables).
     {
         static const int64_t min_m = [] { const char * e = getenv("GGML_MMQ_DENSE_MIN_M"); return e ? atoll(e) : 6144; }();
-        if (min_m > 0 && GGML_CUDA_CC_IS_CDNA1(cc) && src0->type == GGML_TYPE_Q8_0 && ne11 > 128 && ne01 >= min_m
+        // thin Q8_0 projections (M <= GGML_MMQ_DENSE_THIN_M; OPT-IN, default 0 = off) can also go to MMQ at prefill:
+        // rocBLAS pays a per-call Q8_0->f16 weight dequant + f32->f16 activation convert and runs M=24..512 tiles at 1-8
+        // TFLOPS (GLM-5.3: hc_*_fn M=24, ssm_f_a/g_a M=128, ssm_beta M=64, indexer k / compressor gate M=128, kv_a M=512).
+        // Off by default (gemm review): MMQ quantizes the activations to q8_1, which is 200-1000x the rocBLAS path's
+        // error vs a double reference (NMSE 1.4e-5 vs 6.7e-8 uniform, 7.6e-5 vs 7.6e-8 heavy-tailed) and costs +0.006
+        // mean KLD at 8k (0.0131 vs 0.0069) for ~1.7% of trunk GPU time; GGML_MMQ_DENSE_THIN_M=1024 re-enables it.
+        static const int64_t thin_m = [] { const char * e = getenv("GGML_MMQ_DENSE_THIN_M"); return e ? atoll(e) : 0; }();
+        if (GGML_CUDA_CC_IS_CDNA1(cc) && src0->type == GGML_TYPE_Q8_0 && ne11 > 128
+                && ((min_m > 0 && ne01 >= min_m) || (thin_m > 0 && ne01 <= thin_m))
                 && ne00 % 256 == 0 && ne02 == 1 && ne03 == 1 && ggml_is_contiguous(src0) && ggml_is_contiguous(src1)) {
+            mm_path("mmq-dense-rule");
             ggml_cuda_mul_mat_q(ctx, src0, src1, nullptr, dst);
             return;
         }
     }
+    mm_path("cublas");
     ggml_cuda_mul_mat_cublas(ctx, src0, src1, dst);
 }
 

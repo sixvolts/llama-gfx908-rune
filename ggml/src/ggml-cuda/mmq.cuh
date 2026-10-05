@@ -135,6 +135,10 @@ enum ggml_cuda_mmq_sram_layout {
     GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K,
     GGML_CUDA_MMQ_SRAM_LAYOUT_FP4,   // MXFP4 and NVFP4 on Blackwell.
     GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4, // Generic NVFP4
+    // Q8_1 layout with the per-(row, 32-block) (d, m) factors stored as float2 instead of half2 (CDNA Q4_K): the
+    // MFMA epilogue then skips one f16->f32 conversion per output element and 32-K step (values identical: exact
+    // conversion of the same half products).
+    GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1F,
 };
 
 static constexpr __host__ __device__ int ggml_cuda_mmq_get_sram_stride(ggml_cuda_mmq_sram_layout sram_layout) {
@@ -157,6 +161,8 @@ static constexpr __host__ __device__ int ggml_cuda_mmq_get_sram_stride(ggml_cuda
             return 2*MMQ_TILE_NE_K + 8                     + 4;
         case GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4:
             return 2*MMQ_TILE_NE_K + MMQ_TILE_NE_K/2       + 4;
+        case GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1F:
+            return 2*MMQ_TILE_NE_K + 2*(2*MMQ_TILE_NE_K/QI8_1) + 4;
         default:
             return -1;
     }
@@ -164,6 +170,7 @@ static constexpr __host__ __device__ int ggml_cuda_mmq_get_sram_stride(ggml_cuda
 
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0)  % 8 == 4, "Wrong padding.");
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1)  % 8 == 4, "Wrong padding.");
+static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1F) % 8 == 4, "Wrong padding.");
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q2_K)  % 8 == 4, "Wrong padding.");
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K)  % 8 == 4, "Wrong padding.");
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q2_K_PS) % 8 == 4, "Wrong padding.");
@@ -1346,6 +1353,101 @@ static __global__ void mul_mat_q(
          tile_x_max_i, tile_y_max_j, kb0_start, kb0_stop);
 }
 
+// MoE (ids) tiled schedule for CDNA (GGML_MMQ_MOE_TILED, default on; =0 restores stream-k).
+// Stream-k splits the (row tile, expert, column tile, k) space evenly across the CUs, but at prefill most (expert, column
+// tile) slots of a MoE call are empty (~14 rows per expert in 64-wide tiles), so the static slices carry very different
+// amounts of real work (skewed routing), and an expert's row tiles are visited far apart in time (its activation tile
+// is re-read from HBM once per row tile). Here a compact list of the non-empty (expert, column tile) pairs is built on
+// the device and the grid is (row tile, list entry) with the row tile fastest: the hardware dispatcher balances the
+// load dynamically, the row tiles of one expert run concurrently (activation tile shared in L2), and no tile is split
+// along K (no fixup pass). Numerics: every tile is the full-K sum in the same order as an unsplit stream-k tile; only
+// the tiles that stream-k happened to split at a CU boundary (fixup = partial + partial) round differently.
+static __global__ void mmq_moe_build_tile_list(
+        const int32_t * __restrict__ expert_bounds, int2 * __restrict__ tile_list, const int n_experts, const int J, const int ntiles_max) {
+    __shared__ int s[1024];
+    int carry = 0;
+    for (int e0 = 0; e0 < n_experts; e0 += blockDim.x) {
+        const int e = e0 + threadIdx.x;
+        const int n = e < n_experts ? (expert_bounds[e + 1] - expert_bounds[e] + J - 1) / J : 0;
+        s[threadIdx.x] = n;
+        __syncthreads();
+        for (int off = 1; off < (int) blockDim.x; off <<= 1) {
+            const int v = (int) threadIdx.x >= off ? s[threadIdx.x - off] : 0;
+            __syncthreads();
+            s[threadIdx.x] += v;
+            __syncthreads();
+        }
+        const int start = carry + s[threadIdx.x] - n;
+        for (int i = 0; i < n && start + i < ntiles_max; ++i) {
+            tile_list[start + i] = make_int2(e, i);
+        }
+        carry += s[blockDim.x - 1];
+        __syncthreads();
+    }
+    for (int i = carry + threadIdx.x; i < ntiles_max; i += blockDim.x) {
+        tile_list[i] = make_int2(-1, 0);
+    }
+}
+
+template <ggml_type type, int J, bool fallback>
+__launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback), ggml_cuda_mmq_get_occupancy(type, J, fallback))
+static __global__ void mul_mat_q_moe_tiled(
+        const char * __restrict__ x, const int * __restrict__ y, const int32_t * __restrict__ ids_dst,
+        const int32_t * __restrict__ expert_bounds, const int2 * __restrict__ tile_list, float * __restrict__ dst,
+        const uint3 blocks_per_ne00, const int nrows_x, const int stride_row_x, const int ncols_y, const int stride_col_dst,
+        const uint3 channel_ratio, const int stride_channel_x) {
+
+    // Skip unused template specializations for faster compilation:
+    if (ggml_cuda_mmq_get_config(type, J, fallback).type == GGML_TYPE_COUNT || type == GGML_TYPE_NVFP4) {
+        NO_DEVICE_CODE;
+        return;
+    }
+
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
+
+    const int2 t = tile_list[blockIdx.y];
+    if (t.x < 0) {
+        return;
+    }
+    const int zt = t.x;
+    const int jt = t.y;
+    const int it = blockIdx.x;
+
+    extern __shared__ int ids_dst_shared[]; // Stored at beginning of shared memory.
+
+    const int col_low  = expert_bounds[zt + 0];
+    const int col_high = expert_bounds[zt + 1];
+    const int col_diff = col_high - col_low;
+
+#pragma unroll
+    for (int j0 = 0; j0 < J; j0 += nwarps*warp_size) {
+        const int j = j0 + threadIdx.y*warp_size + threadIdx.x;
+
+        if (j0 + nwarps*warp_size > J && j >= J) {
+            break;
+        }
+
+        ids_dst_shared[j] = ids_dst[col_low + jt*J + j];
+    }
+    __syncthreads();
+
+    const int offset_y   = (col_low + jt*J)*(sizeof(block_q8_1_mmq)/sizeof(int));
+    const int offset_dst = it*I;
+
+    const int tile_x_max_i = nrows_x  - it*I - 1;
+    const int tile_y_max_j = col_diff - jt*J - 1;
+
+    const int offset_x = fastdiv(zt, channel_ratio)*stride_channel_x + it*I*stride_row_x;
+
+    constexpr bool fixup = false;
+    mul_mat_q_process_tile<type, J, fallback, fixup>
+        (x, offset_x, y + offset_y, ids_dst_shared, dst + offset_dst, nullptr, nullptr,
+         stride_row_x, ncols_y, stride_col_dst,
+         tile_x_max_i, tile_y_max_j, 0, blocks_per_ne00.z);
+}
+
 template <ggml_type type, int J, bool fallback>
 __launch_bounds__(ggml_cuda_mmq_get_nthreads(type, J, fallback)/2, 1)
 static __global__ void mul_mat_q_stream_k_fixup(
@@ -1518,6 +1620,7 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
 
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J, false>), nbytes_shared);
     CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q<type, J,  true>), nbytes_shared);
+    CUDA_SET_SHARED_MEMORY_LIMIT((mul_mat_q_moe_tiled<type, J, fallback>), nbytes_shared);
 
     const int nty  = (args.nrows_x   + config.I - 1) / config.I;
     const int ntx  = (args.ncols_max + config.J - 1) / config.J;
@@ -1546,6 +1649,22 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
                 (int) ggml_cuda_mmq_get_stream_k(type, J, fallback, cc), args.ids_dst != nullptr);
         }
     }
+    // MoE on CDNA: tiled schedule over a compact device-built list of non-empty (expert, column tile) pairs.
+    static const bool moe_tiled = [] { const char * e = getenv("GGML_MMQ_MOE_TILED"); return e ? atoi(e) != 0 : true; }();
+    if (moe_tiled && args.ids_dst && GGML_CUDA_CC_IS_CDNA(cc) && args.nsamples_y == 1 && type != GGML_TYPE_NVFP4) {
+        // sum_e ceil(rows_e/J) <= total_rows/J + n_experts
+        const int ntiles_max = (int) (args.ncols_dst / config.J + args.nchannels_y);
+        ggml_cuda_pool_alloc<int2> tile_list(ctx.pool(id), ntiles_max);
+        mmq_moe_build_tile_list<<<1, 1024, 0, stream>>>(args.expert_bounds, tile_list.ptr, (int) args.nchannels_y, config.J, ntiles_max);
+        CUDA_CHECK(cudaGetLastError());
+        const dim3 block_nums_moe(nty, ntiles_max, 1);
+        mul_mat_q_moe_tiled<type, J, fallback><<<block_nums_moe, block_dims, nbytes_shared, stream>>>
+            (args.x, args.y, args.ids_dst, args.expert_bounds, tile_list.ptr, args.dst,
+             blocks_per_ne00_fd, args.nrows_x, args.stride_row_x, args.ncols_y, args.nrows_dst,
+             channel_ratio_fd, args.stride_channel_x);
+        return;
+    }
+
     if (!ggml_cuda_mmq_get_stream_k(type, J, fallback, cc)) {
         mul_mat_q<type, J, fallback><<<block_nums_xy_tiling, block_dims, nbytes_shared, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, args.dst, nullptr, args.y_scale,

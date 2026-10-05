@@ -698,6 +698,18 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #endif // !(defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)) || defined(AMD_WMMA_AVAILABLE)
 }
 
+// Same result as unpack_scales_q45_K on the three scale ints held in registers: the runtime index is resolved with
+// selects instead of an indexed array, which would force the array (and the whole prefetch register set holding it)
+// into scratch memory and make every prefetched global load wait before its scratch store (gfx908 codegen).
+static __device__ __forceinline__ int unpack_scales_q45_K_reg(const int s0, const int s1, const int s2, const int ksc) {
+    const int ilo = (ksc%2) + (ksc!=0);
+    const int ihi = ksc/2;
+    const int lo  = ilo == 0 ? s0 : (ilo == 1 ? s1 : s2);
+    const int hi  = ihi == 0 ? s0 : (ihi == 1 ? s1 : s2);
+    return ((lo >> (4 * (ksc & (ksc/2)))) & 0x0F0F0F0F) | // lower 4 bits
+           ((hi >> (2 * (ksc % 2)))       & 0x30303030);  // upper 2 bits
+}
+
 static __device__ __forceinline__ int unpack_scales_q45_K(const int * scales, const int ksc) {
     // scale arrangement after the following two lines:
     //   - ksc == 0: sc0, sc1, sc2, sc3
@@ -911,7 +923,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
     #pragma unroll
             for (int l = 0; l < sizeof(int); ++l) {
-                x_dm[i*sram_stride + sizeof(int)*ksc + l] = dm*make_half2(sc8[l], m8[l]);
+                if constexpr (ggml_cuda_mmq_get_sram_layout(type, J, fallback) == GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1F) {
+                    ((float2 *) x_dm)[(i*sram_stride)/2 + sizeof(int)*ksc + l] = __half22float2(dm*make_half2(sc8[l], m8[l]));
+                } else {
+                    x_dm[i*sram_stride + sizeof(int)*ksc + l] = dm*make_half2(sc8[l], m8[l]);
+                }
             }
         }
     }
@@ -1034,7 +1050,11 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 #pragma unroll
             for (int l = 0; l < int(sizeof(int)); ++l) {
-                x_dm[i*sram_stride + sizeof(int)*ksc + l] = dm*make_half2(sc8[l], m8[l]);
+                if constexpr (ggml_cuda_mmq_get_sram_layout(type, J, fallback) == GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1F) {
+                    ((float2 *) x_dm)[(i*sram_stride)/2 + sizeof(int)*ksc + l] = __half22float2(dm*make_half2(sc8[l], m8[l]));
+                } else {
+                    x_dm[i*sram_stride + sizeof(int)*ksc + l] = dm*make_half2(sc8[l], m8[l]);
+                }
             }
         }
     }
@@ -1905,6 +1925,10 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 // step's vec_dot, so the HBM latency overlaps the matrix ops. The LDS contents and the store indices are exactly
 // those of the fused loader (bit-exact); only the timing changes.
 
+#ifndef GGML_MMQ_Q4K_VEC
+#define GGML_MMQ_Q4K_VEC 1
+#endif
+
 template <ggml_type type, int J, bool fallback> struct mmq_x_prefetch { static constexpr bool available = false; };
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
@@ -1915,12 +1939,19 @@ template <int J, bool fallback> struct mmq_x_prefetch<GGML_TYPE_Q4_K, J, fallbac
     static constexpr int nwarps          = ggml_cuda_mmq_get_nthreads(GGML_TYPE_Q4_K, J, fallback) / warp_size;
     static constexpr int I               = ggml_cuda_mmq_get_I(GGML_TYPE_Q4_K, J, fallback);
     static constexpr int sram_stride     = ggml_cuda_mmq_get_sram_stride(GGML_TYPE_Q4_K, J, fallback);
-    static constexpr int threads_per_row = MMQ_ITER_K / (4 * QR4_K);
+    // GGML_MMQ_Q4K_VEC (default 1): each thread moves 16 bytes of quants (one global_load_dwordx4, two 16-byte LDS
+    // stores of the low/high nibbles) instead of 4 bytes (dword load + 2 dword stores); same LDS contents (bit-exact).
+#if GGML_MMQ_Q4K_VEC
+    static constexpr int vec             = 4;  // ints per thread per row segment
+#else
+    static constexpr int vec             = 1;
+#endif
+    static constexpr int threads_per_row = MMQ_ITER_K / (4 * QR4_K) / vec;
     static constexpr int nrows           = warp_size / threads_per_row;
     static constexpr int NQ              = (I + nrows*nwarps - 1) / (nrows*nwarps);
     static constexpr int rows_per_warp   = warp_size / 2;
     static constexpr int NS              = (I + nwarps*rows_per_warp - 1) / (nwarps*rows_per_warp);
-    struct regs { int qs[NQ]; int sc[NS][3]; half2 dm[NS]; };
+    struct regs { int qs[NQ][vec]; int sc[NS][3]; half2 dm[NS]; };
 
     static __device__ __forceinline__ int row_q(const int n, const int i_max) {
         int i = n*nrows*nwarps + (nrows == 1 ? threadIdx.y : threadIdx.y*nrows + threadIdx.x/threads_per_row);
@@ -1932,7 +1963,12 @@ template <int J, bool fallback> struct mmq_x_prefetch<GGML_TYPE_Q4_K, J, fallbac
 #pragma unroll
         for (int n = 0; n < NQ; ++n) {
             const block_q4_K * bxi = (const block_q4_K *) x + kbx0 + row_q(n, i_max)*stride;
-            r.qs[n] = get_int_b4(bxi->qs, txi);
+#if GGML_MMQ_Q4K_VEC
+            const int4 q = *((const int4 *) bxi->qs + txi);
+            r.qs[n][0] = q.x; r.qs[n][1] = q.y; r.qs[n][2] = q.z; r.qs[n][3] = q.w;
+#else
+            r.qs[n][0] = get_int_b4(bxi->qs, txi);
+#endif
         }
 #pragma unroll
         for (int n = 0; n < NS; ++n) {
@@ -1953,8 +1989,20 @@ template <int J, bool fallback> struct mmq_x_prefetch<GGML_TYPE_Q4_K, J, fallbac
 #pragma unroll
         for (int n = 0; n < NQ; ++n) {
             const int i = row_q(n, i_max);
-            x_qs[i*sram_stride + 16*(txi/8) + txi % 8 + 0] = (r.qs[n] >> 0) & 0x0F0F0F0F;
-            x_qs[i*sram_stride + 16*(txi/8) + txi % 8 + 8] = (r.qs[n] >> 4) & 0x0F0F0F0F;
+#if GGML_MMQ_Q4K_VEC
+            // ints t = 4*txi + c (c = 0..3) go to 16*(t/8) + t%8 (+8 for the high nibbles): 4 consecutive slots
+            const int k = 16*(txi/2) + 4*(txi % 2);
+            int4 lo, hi;
+            lo.x = (r.qs[n][0] >> 0) & 0x0F0F0F0F; hi.x = (r.qs[n][0] >> 4) & 0x0F0F0F0F;
+            lo.y = (r.qs[n][1] >> 0) & 0x0F0F0F0F; hi.y = (r.qs[n][1] >> 4) & 0x0F0F0F0F;
+            lo.z = (r.qs[n][2] >> 0) & 0x0F0F0F0F; hi.z = (r.qs[n][2] >> 4) & 0x0F0F0F0F;
+            lo.w = (r.qs[n][3] >> 0) & 0x0F0F0F0F; hi.w = (r.qs[n][3] >> 4) & 0x0F0F0F0F;
+            *((int4 *) (x_qs + i*sram_stride + k + 0)) = lo;
+            *((int4 *) (x_qs + i*sram_stride + k + 8)) = hi;
+#else
+            x_qs[i*sram_stride + 16*(txi/8) + txi % 8 + 0] = (r.qs[n][0] >> 0) & 0x0F0F0F0F;
+            x_qs[i*sram_stride + 16*(txi/8) + txi % 8 + 8] = (r.qs[n][0] >> 4) & 0x0F0F0F0F;
+#endif
         }
 #pragma unroll
         for (int n = 0; n < NS; ++n) {
@@ -1962,14 +2010,19 @@ template <int J, bool fallback> struct mmq_x_prefetch<GGML_TYPE_Q4_K, J, fallbac
             if (i < I) {
                 if (fallback) { i = min(i, i_max); }
                 const int ksc = threadIdx.x % 2;
-                const int sc32 = unpack_scales_q45_K(r.sc[n], ksc + 0);
-                const int  m32 = unpack_scales_q45_K(r.sc[n], ksc + 2);
+                // register-only scale unpack (bit-exact; keeps the prefetch registers out of scratch)
+                const int sc32 = unpack_scales_q45_K_reg(r.sc[n][0], r.sc[n][1], r.sc[n][2], ksc + 0);
+                const int  m32 = unpack_scales_q45_K_reg(r.sc[n][0], r.sc[n][1], r.sc[n][2], ksc + 2);
                 const uint8_t * sc8 = (const uint8_t *) &sc32;
                 const uint8_t *  m8 = (const uint8_t *)  &m32;
                 const half2 dm = r.dm[n] * make_half2(1.0f, -1.0f);
 #pragma unroll
                 for (int l = 0; l < sizeof(int); ++l) {
+                    if constexpr (ggml_cuda_mmq_get_sram_layout(GGML_TYPE_Q4_K, J, fallback) == GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1F) {
+                    ((float2 *) x_dm)[(i*sram_stride)/2 + sizeof(int)*ksc + l] = __half22float2(dm*make_half2(sc8[l], m8[l]));
+                } else {
                     x_dm[i*sram_stride + sizeof(int)*ksc + l] = dm*make_half2(sc8[l], m8[l]);
+                }
                 }
             }
         }

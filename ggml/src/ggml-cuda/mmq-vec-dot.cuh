@@ -361,6 +361,9 @@ template <ggml_type type, int J, bool fallback, int NJ> static __device__ __forc
 
     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
 
+    // unrolled (bit-exact: same per-element operation order): lets the scheduler overlap the LDS reads and MFMAs of
+    // consecutive k01 steps (Q4_K MoE at prefill -4..7%; not done for the Q8_0 variant, where it measured slower)
+#pragma unroll
     for (int k01 = 0; k01 < MMQ_TILE_NE_K; k01 += QI8_1) {
         const int k0 = k00 + k01;
 
@@ -386,7 +389,12 @@ template <ggml_type type, int J, bool fallback, int NJ> static __device__ __forc
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
                     const int i = i0 + n*tile_A::I + tile_C::get_i(l);
-                    float2 dmA = __half22float2(x_dm[i*sram_stride + k0/QI8_1]);
+                    float2 dmA;
+                    if constexpr (ggml_cuda_mmq_get_sram_layout(type, J, fallback) == GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1F) {
+                        dmA = ((const float2 *) x_dm)[(i*sram_stride)/2 + k0/QI8_1];
+                    } else {
+                        dmA = __half22float2(x_dm[i*sram_stride + k0/QI8_1]);
+                    }
                     sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA.x*dsB.x*C.x[l];
                     sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA.y*dsB.y;
                 }
