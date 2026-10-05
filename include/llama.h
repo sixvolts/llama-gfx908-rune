@@ -915,6 +915,13 @@ extern "C" {
 // Getting the state for a seq_id with this flag invalidates all prior states gotten for that seq_id with this flag.
 #define LLAMA_STATE_SEQ_FLAGS_ON_DEVICE 2
 
+// (rune) get_data only: queue the device->host copies of the tensor data on each tensor's backend stream after the work
+// already queued there, and return without synchronizing. The data in dst is valid only after the next
+// llama_synchronize(ctx). dst should be pinned host memory (llama_host_pinned_alloc); pageable memory still works but
+// each copy then waits for its device. Lets a context checkpoint be taken between two prompt batches without draining
+// a pipeline-parallel schedule.
+#define LLAMA_STATE_SEQ_FLAGS_ASYNC 4
+
     typedef uint32_t llama_state_seq_flags;
 
     LLAMA_API size_t llama_state_seq_get_size_ext(
@@ -1025,6 +1032,11 @@ extern "C" {
     // This is automatically done when using one of the functions below to obtain the computation results
     // and is not necessary to call it explicitly in most cases
     LLAMA_API void llama_synchronize(struct llama_context * ctx);
+
+    // (rune) page-locked host memory from the context's first GPU device (plain malloc without one), for
+    // LLAMA_STATE_SEQ_FLAGS_ASYNC destinations. Free with llama_host_pinned_free on the same context.
+    LLAMA_API void * llama_host_pinned_alloc(struct llama_context * ctx, size_t size);
+    LLAMA_API void   llama_host_pinned_free (struct llama_context * ctx, void * ptr);
 
     // Token logits obtained from the last call to llama_decode()
     // The logits for which llama_batch.logits[i] != 0 are stored contiguously

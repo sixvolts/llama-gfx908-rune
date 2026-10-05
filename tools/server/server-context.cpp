@@ -262,6 +262,55 @@ struct server_batch {
     }
 };
 
+// (rune) LLAMA_CKPT_ASYNC=1: context checkpoints are taken with queued state copies into pinned staging buffers instead
+// of a full synchronize + blocking copy (which drained the 9-stage prompt pipeline for ~0.8 s per checkpoint, twice
+// per prompt). A pending checkpoint is copied into its data_tgt after the next synchronize of the target context.
+struct ckpt_staging_pool {
+    llama_context * ctx = nullptr;
+    struct buf_t { uint8_t * ptr = nullptr; size_t cap = 0; bool busy = false; };
+    std::vector<buf_t> bufs;
+    size_t max_bufs = 4;
+
+    int acquire(size_t size) {
+        for (size_t i = 0; i < bufs.size(); ++i) {
+            if (!bufs[i].busy && bufs[i].cap >= size) {
+                bufs[i].busy = true;
+                return (int) i;
+            }
+        }
+        for (size_t i = 0; i < bufs.size(); ++i) {
+            if (!bufs[i].busy) {   // too small: replace it
+                llama_host_pinned_free(ctx, bufs[i].ptr);
+                bufs[i].ptr = (uint8_t *) llama_host_pinned_alloc(ctx, size);
+                bufs[i].cap = bufs[i].ptr ? size : 0;
+                if (!bufs[i].ptr) {
+                    return -1;
+                }
+                bufs[i].busy = true;
+                return (int) i;
+            }
+        }
+        if (bufs.size() < max_bufs) {
+            buf_t b;
+            b.ptr = (uint8_t *) llama_host_pinned_alloc(ctx, size);
+            if (!b.ptr) {
+                return -1;
+            }
+            b.cap  = size;
+            b.busy = true;
+            bufs.push_back(b);
+            return (int) bufs.size() - 1;
+        }
+        return -1;
+    }
+
+    void release(int i) {
+        if (i >= 0 && (size_t) i < bufs.size()) {
+            bufs[i].busy = false;
+        }
+    }
+};
+
 struct server_slot {
     int id;
 
@@ -282,6 +331,34 @@ struct server_slot {
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
     bool spec_is_replay = false;
+
+    // LLAMA_CKPT_ASYNC: checkpoints of this slot whose state copy is still in flight
+    struct ckpt_pending_t { uint64_t id; int staging; size_t size; };
+    std::vector<ckpt_pending_t> ckpt_pending;
+    ckpt_staging_pool * ckpt_pool = nullptr;
+
+    // copy finished async checkpoint copies into their checkpoints; sync = synchronize the target context first (pass
+    // false only right after a synchronize of ctx_tgt). Checkpoints erased meanwhile are simply dropped.
+    void ckpt_finalize(bool sync) {
+        if (ckpt_pending.empty()) {
+            return;
+        }
+        if (sync) {
+            llama_synchronize(ctx_tgt);
+        }
+        for (const auto & p : ckpt_pending) {
+            for (auto & c : prompt.checkpoints) {
+                if (c.async_id == p.id) {
+                    const uint8_t * src = ckpt_pool->bufs[p.staging].ptr;
+                    c.data_tgt.assign(src, src + p.size);
+                    c.async_id = 0;
+                    break;
+                }
+            }
+            ckpt_pool->release(p.staging);
+        }
+        ckpt_pending.clear();
+    }
     std::mt19937 spec_synth_rng;
 
     // lossless speculative sampling (on by default, LLAMA_SPEC_RS=0 disables): the drafter's distribution for each
@@ -335,6 +412,7 @@ struct server_slot {
         if (prompt.tokens.size() == 0) {
             return false;
         }
+        const_cast<server_slot *>(this)->ckpt_finalize(true);   // the saved copy must carry the checkpoint data
 
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
@@ -944,6 +1022,10 @@ private:
 
     common_speculative_ptr spec;
 
+    // LLAMA_CKPT_ASYNC staging buffers (shared by all slots) and checkpoint ids
+    ckpt_staging_pool ckpt_pool;
+    uint64_t          ckpt_serial = 0;
+
     // Draft catch-up deferred by one prompt view: the draft's process() for view k runs after view k+1 has been
     // issued to the target, waiting only for the exporting device, so the target keeps pipelining meanwhile.
     struct {
@@ -1368,6 +1450,8 @@ private:
             slot.id      = i;
             slot.ctx_tgt = ctx_tgt;
             slot.ctx_dft = ctx_dft;
+            ckpt_pool.ctx  = ctx_tgt;
+            slot.ckpt_pool = &ckpt_pool;
             slot.mem.init(ctx_tgt, ctx_dft);
             slot.spec    = spec.get();
             slot.n_ctx   = n_ctx_slot();
@@ -2625,10 +2709,37 @@ private:
         //       this is not true for SWA models: https://github.com/ggml-org/llama.cpp/pull/24411#issuecomment-4677983225
         cur.update_pos(slot.prompt.n_tokens() - n_tokens_cur, pos_min, pos_max);
 
+        static const bool ckpt_async = getenv("LLAMA_CKPT_ASYNC") && atoi(getenv("LLAMA_CKPT_ASYNC")) != 0;
         const int64_t t_ckpts = ggml_time_us();
-        llama_synchronize(ctx_tgt);   // update_tgt syncs anyway; done here only to time the wait apart from the copy
-        const int64_t t_ckpt0 = ggml_time_us();
-        cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        bool queued = false;
+        int64_t t_ckpt0 = t_ckpts;
+        if (ckpt_async && slot.ckpt_pool) {
+            const size_t sz = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            int si = slot.ckpt_pool->acquire(sz);
+            if (si < 0) {
+                // every staging buffer still holds an unfinished copy: wait for them once, then reuse one
+                for (auto & s : slots) {
+                    s.ckpt_finalize(true);
+                }
+                si = slot.ckpt_pool->acquire(sz);
+            }
+            if (si >= 0) {
+                const size_t n = llama_state_seq_get_data_ext(ctx_tgt, slot.ckpt_pool->bufs[si].ptr, sz, slot.id,
+                        LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY | LLAMA_STATE_SEQ_FLAGS_ASYNC);
+                if (n == sz) {
+                    cur.async_id = ++ckpt_serial;
+                    slot.ckpt_pending.push_back({cur.async_id, si, sz});
+                    queued = true;
+                } else {
+                    slot.ckpt_pool->release(si);
+                }
+            }
+        }
+        if (!queued) {
+            llama_synchronize(ctx_tgt);   // update_tgt syncs anyway; done here only to time the wait apart from the copy
+            t_ckpt0 = ggml_time_us();
+            cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+        }
         const int64_t t_ckpt1 = ggml_time_us();
         cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         // stash the draft's speculative state with the checkpoint
@@ -3784,6 +3895,7 @@ private:
                                 }
 
                                 if (pos_min >= pos_min_thold) {
+                                    slot.ckpt_finalize(true);
                                     // search for a context checkpoint
                                     const auto it = std::find_if(
                                         slot.prompt.checkpoints.rbegin(),
@@ -4171,6 +4283,11 @@ private:
         if (ht) { ggml_host_trace("srv_dec_e", batch_view.n_tokens, 0); }
         if (has_output) {
             spec_tm(SPEC_TM_DEC1);
+            if (ret == 0) {
+                for (auto & s : slots) {
+                    s.ckpt_finalize(false);   // the decode above synchronized ctx_tgt
+                }
+            }
         }
 
         if (ret != 0) {

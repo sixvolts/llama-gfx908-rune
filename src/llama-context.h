@@ -64,6 +64,13 @@ struct llama_context {
 
     // async work (graph compute, output copies) issued since the last synchronize(); cleared by synchronize()
     bool sched_dirty = false;
+
+    // (rune) pinned host allocations handed out by llama_host_pinned_alloc
+    std::map<void *, ggml_backend_buffer_ptr> host_pinned;
+    void * host_pinned_alloc(size_t size);
+    void   host_pinned_free(void * ptr);
+    // the context backend that runs work for the device holding this buffer (nullptr for host buffers)
+    ggml_backend_t backend_for_buffer(ggml_backend_buffer_t buf) const;
     const float * get_embeddings_nextn_seq(uint64_t seq);
 
     const llama_model   & get_model()   const;

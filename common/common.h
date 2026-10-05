@@ -1178,6 +1178,9 @@ struct common_prompt_checkpoint {
     // (e.g. eagle3's deferred-boundary g_embd row)
     std::vector<uint8_t> data_spec;
 
+    // (rune) LLAMA_CKPT_ASYNC: nonzero while data_tgt is still being copied asynchronously (see server ckpt_finalize)
+    uint64_t async_id = 0;
+
     size_t size() const;
 
     bool empty() const;
