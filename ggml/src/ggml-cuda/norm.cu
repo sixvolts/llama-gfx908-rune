@@ -73,6 +73,16 @@ static __global__ void group_norm_f32(const float * x, float * dst, const int gr
     }
 }
 
+// GGML_CUDA_NORM_UNROLL (default 8): rms_norm_f32 without the fused multiply (GLM-5.3: the 16384-wide mHC row norm,
+// 15 calls per ubatch on S0) issues each thread's loads in batches instead of one global round trip per column (the
+// loops were latency-serialized: 155 us for 512 x 16384 vs a ~60 us byte floor). Each thread still accumulates its own
+// columns in the same order and computes the same expression per element: bit-exact. Rows shorter than
+// GGML_CUDA_NORM_UNROLL columns per thread, and the fused-multiply variants (measured slower), keep the plain loops.
+// -DGGML_CUDA_NORM_UNROLL=1 restores the old code.
+#ifndef GGML_CUDA_NORM_UNROLL
+#define GGML_CUDA_NORM_UNROLL 8
+#endif
+
 template <int block_size, bool do_multiply = false, bool do_add = false>
 static __global__ void rms_norm_f32(const float * x,
                                     float *       dst,
@@ -128,9 +138,18 @@ static __global__ void rms_norm_f32(const float * x,
     float tmp = 0.0f; // partial sum for thread in warp
 
     ggml_cuda_pdl_sync();
-    for (int col = tid; col < ncols; col += block_size) {
-        const float xi = x[col];
-        tmp += xi * xi;
+    constexpr int NU = do_multiply ? 1 : GGML_CUDA_NORM_UNROLL;
+    if (NU > 1 && ncols >= NU*block_size) {
+#pragma unroll 8
+        for (int col = tid; col < ncols; col += block_size) {
+            const float xi = x[col];
+            tmp += xi * xi;
+        }
+    } else {
+        for (int col = tid; col < ncols; col += block_size) {
+            const float xi = x[col];
+            tmp += xi * xi;
+        }
     }
 
     // sum up partial sums
@@ -140,6 +159,28 @@ static __global__ void rms_norm_f32(const float * x,
     const float mean = tmp / ncols;
     const float scale = rsqrtf(mean + eps);
 
+    if constexpr (NU > 1) {
+        if (ncols >= NU*block_size) {
+            // batches of NU columns: all loads first, then the stores (x and dst may alias, so the compiler would
+            // otherwise wait for every load after the previous store); same expression per element
+            for (int col0 = tid; col0 < ncols; col0 += NU*block_size) {
+                float xv[NU];
+#pragma unroll
+                for (int u = 0; u < NU; ++u) {
+                    const int col = col0 + u*block_size;
+                    xv[u] = col < ncols ? x[col] : 0.0f;
+                }
+#pragma unroll
+                for (int u = 0; u < NU; ++u) {
+                    const int col = col0 + u*block_size;
+                    if (col < ncols) {
+                        dst[col] = scale * xv[u];
+                    }
+                }
+            }
+            return;
+        }
+    }
     for (int col = tid; col < ncols; col += block_size) {
         if constexpr (do_multiply && do_add) {
             const int mul_col = fastmodulo(col, mul_ncols_packed);
