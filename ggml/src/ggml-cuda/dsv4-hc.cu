@@ -188,6 +188,41 @@ static __global__ void dsv4_hc_post_f32(
     dst[i0*sd0 + idst*sd1 + it*sd2] = sum;
 }
 
+// rune gfx908: dsv4_hc_post for hc == 4 with one thread per (element, token) producing all 4 destination streams. The
+// generic kernel has one thread per output, so each of the 4 residual values of an element is fetched by 4 threads
+// (plus 64-bit div/mod per thread): 209 us at [4096, 4, 512] (~360 GB/s). Same per-output arithmetic and order:
+// sum = x*post[idst]; sum += residual[isrc]*comb[idst][isrc] for isrc = 0..3. GGML_CUDA_HC_POST4=0 disables.
+static __global__ void dsv4_hc_post4_f32(
+        const float * __restrict__ x, const float * __restrict__ residual, const float * __restrict__ post,
+        const float * __restrict__ comb, float * __restrict__ dst,
+        const int n_embd, const int n_tokens,
+        const int64_t sx1, const int64_t sr1, const int64_t sr2, const int64_t sp0, const int64_t sp1,
+        const int64_t sc0, const int64_t sc1, const int64_t sc2, const int64_t sd1, const int64_t sd2) {
+    // the generic kernel's hc loop is not unrolled, so x*post is rounded and every residual term is an fma onto it;
+    // unrolled, clang would contract x*post + r0*c0 the other way round (fma(x, post, r0*c0)) -> spell it out
+#pragma clang fp contract(off)
+    const int i0 = blockIdx.x * blockDim.x + threadIdx.x;
+    const int it = blockIdx.y;
+    if (i0 >= n_embd) {
+        return;
+    }
+    const float xv = x[i0 + it*sx1];
+    float r[4];
+#pragma unroll
+    for (int isrc = 0; isrc < 4; ++isrc) {
+        r[isrc] = residual[i0 + isrc*sr1 + it*sr2];
+    }
+#pragma unroll
+    for (int idst = 0; idst < 4; ++idst) {
+        float sum = xv * post[idst*sp0 + it*sp1];
+#pragma unroll
+        for (int isrc = 0; isrc < 4; ++isrc) {
+            sum = fmaf(r[isrc], comb[idst*sc0 + isrc*sc1 + it*sc2], sum);
+        }
+        dst[i0 + idst*sd1 + it*sd2] = sum;
+    }
+}
+
 void ggml_cuda_op_dsv4_hc_comb(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * mixes = dst->src[0];
     const ggml_tensor * scale = dst->src[1];
@@ -282,6 +317,22 @@ void ggml_cuda_op_dsv4_hc_post(ggml_backend_cuda_context & ctx, ggml_tensor * ds
     const int64_t n_embd   = x->ne[0];
     const int64_t n_tokens = x->ne[1];
     const int64_t hc       = residual->ne[1];
+
+    const bool post4 = getenv("GGML_CUDA_HC_POST4") == nullptr || atoi(getenv("GGML_CUDA_HC_POST4")) != 0;
+    if (post4 && hc == 4 && nbx0 == sizeof(float) && nbr0 == sizeof(float) && nbd0 == sizeof(float) &&
+            n_embd < INT32_MAX && n_tokens <= 65535) {
+        const dim3 block_dims(256, 1, 1);
+        const dim3 grid_dims((n_embd + 255) / 256, n_tokens, 1);
+        dsv4_hc_post4_f32<<<grid_dims, block_dims, 0, ctx.stream()>>>(
+            (const float *) x->data, (const float *) residual->data,
+            (const float *) post->data, (const float *) comb->data, (float *) dst->data,
+            (int) n_embd, (int) n_tokens,
+            nbx1 / sizeof(float), nbr1 / sizeof(float), nbr2 / sizeof(float),
+            nbp0 / sizeof(float), nbp1 / sizeof(float),
+            nbc0 / sizeof(float), nbc1 / sizeof(float), nbc2 / sizeof(float),
+            nbd1 / sizeof(float), nbd2 / sizeof(float));
+        return;
+    }
 
     const int block_size = 256;
     const int64_t nr = n_embd * hc * n_tokens;

@@ -8,6 +8,7 @@ void ggml_cuda_op_concat(ggml_backend_cuda_context & ctx, ggml_tensor * dst);
 //     conv_input[c] = [ states[0..ns-1, c], x[c, 0..nt-1] ] with x = concat(q, k, v) along channels, plus the K
 //     rollback-slot copies dst_k[c*ns + j] = conv_input[c][s_idx_k + j]. f32 only.
 #define KDA_CONV_ROWS_MAX_DST 8
+#define KDA_CONV_ROWS_DECODE_MAX_NT 8 // larger nt: the tiled prefill kernel (GGML_CUDA_KDA_CONV_ROWS_PREFILL)
 struct ggml_cuda_kda_conv_rows_args {
     const ggml_tensor * q;
     const ggml_tensor * k;

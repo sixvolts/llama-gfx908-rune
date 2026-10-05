@@ -270,6 +270,253 @@ static __global__ void sparse_attn_mfma(
 #endif // defined(AMD_MFMA_AVAILABLE)
 }
 
+// rune gfx908: two 16-head groups per block, BIT-EXACT with sparse_attn_mfma for n_split == 1.
+// sparse_attn_mfma gives each 16-head group its own block, so every query's 2051 K rows are gathered and its V^T chunks
+// staged through LDS once per head group (4x for 64 heads). Here a block of the same 4 waves serves two head groups:
+// wave w gathers the K rows of cells 16w..16w+15 of each tile once, runs QK for both head groups and computes the PV
+// d-tiles 2w, 2w+1 of both; the V^T chunk staged in LDS serves both. Every per-head operation - the MFMA k-order over D,
+// the per-tile max/sum reductions across the 4 waves in the same order, alpha/l updates, the PV MFMA sequence per O tile
+// and the output scaling - is the one of sparse_attn_mfma. (Four head groups per block would need 256 VGPRs of Q alone;
+// gfx908 has 256 arch VGPRs per SIMD lane, so 8-wave blocks are capped at 128 and spill.)
+// GGML_CUDA_SPARSE_HG2=0 restores the per-head-group kernel.
+#define SA_HGB 2  // head groups per block
+template <int D, int DV, bool DB>
+__launch_bounds__(SA_NW*64, 1)
+static __global__ void sparse_attn_mfma_hg2(
+        const float   * __restrict__ q,
+        const char    * __restrict__ k,
+        const int32_t * __restrict__ idx,
+        const float   * __restrict__ mask,
+        float         * __restrict__ dst,
+        const int64_t nbq1, const int64_t nbq2, const int64_t nbq3,
+        const int64_t nbk2, const int64_t nbk3,
+        const int n_head, const int n_q, const int n_kv, const int n_sel,
+        const float scale) {
+#if defined(AMD_MFMA_AVAILABLE)
+    static_assert(D % 32 == 0 && DV % SA_DCH == 0 && DV <= D, "sparse_attn: unsupported head size");
+
+    constexpr int NP = D/32;
+    constexpr int NC = DV/SA_DCH;
+    constexpr int NH = SA_HGB*SA_HEADS;
+
+    const int tid  = threadIdx.x;
+    const int w    = tid / 64;
+    const int lane = tid % 64;
+    const int l16  = lane % 16;
+    const int g    = lane / 16;
+
+    const int n_bg = n_head/NH;              // blocks per query
+    const int tok  = blockIdx.x / n_bg;      // s*n_q + t
+    const int s    = tok / n_q;
+    const int t    = tok % n_q;
+    const int hb0  = (blockIdx.x % n_bg)*NH; // first head of the block
+
+    const int32_t * idx_row  = idx  + (int64_t) tok*n_sel;
+    const float   * mask_row = mask + (int64_t) tok*n_sel;
+
+    __shared__ _Float16 sP [NH][SA_TILE + SA_PAD];
+    __shared__ _Float16 sVT[DB ? 2 : 1][SA_DCH][SA_TILE + SA_PAD]; // DB: double-buffered by chunk parity
+    __shared__ float    sRed[SA_NW][NH];
+    __shared__ float    sAlpha[NH];
+    __shared__ float    sM[NH];
+    __shared__ float    sL[NH];
+
+    sa_half4 qb[SA_HGB][2*NP];
+#pragma unroll
+    for (int j = 0; j < SA_HGB; ++j) {
+        const int h0 = hb0 + j*SA_HEADS;
+        const float * qh = (const float *) ((const char *) q + (int64_t) (h0 + l16)*nbq1 + (int64_t) t*nbq2 + (int64_t) s*nbq3);
+#pragma unroll
+        for (int p = 0; p < NP; ++p) {
+            const float4 a = *(const float4 *) (qh + 32*p + 8*g);
+            const float4 b = *(const float4 *) (qh + 32*p + 8*g + 4);
+            qb[j][2*p + 0] = sa_half4{(_Float16) a.x, (_Float16) a.y, (_Float16) a.z, (_Float16) a.w};
+            qb[j][2*p + 1] = sa_half4{(_Float16) b.x, (_Float16) b.y, (_Float16) b.z, (_Float16) b.w};
+        }
+    }
+
+    sa_float4 o[SA_HGB][NC][2];
+#pragma unroll
+    for (int j = 0; j < SA_HGB; ++j) {
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+            o[j][c][0] = sa_float4{0.0f, 0.0f, 0.0f, 0.0f};
+            o[j][c][1] = sa_float4{0.0f, 0.0f, 0.0f, 0.0f};
+        }
+    }
+
+    float m_run[SA_HGB];
+    float l_run[SA_HGB];
+#pragma unroll
+    for (int j = 0; j < SA_HGB; ++j) {
+        m_run[j] = -INFINITY;
+        l_run[j] = 0.0f;
+    }
+
+    const int n_tiles = (n_sel + SA_TILE - 1)/SA_TILE;
+
+    for (int it = 0; it < n_tiles; ++it) {
+        const int  jl   = it*SA_TILE + 16*w + l16;
+        int        cell = jl < n_sel ? idx_row[jl] : 0;
+        cell = min(max(cell, 0), n_kv - 1);
+        const char * krow = k + (int64_t) cell*nbk2 + (int64_t) s*nbk3;
+
+        uint4 kr[NP];
+#pragma unroll
+        for (int p = 0; p < NP; ++p) {
+            kr[p] = *(const uint4 *) (krow + 2*(32*p + 8*g));
+        }
+
+        float sv[SA_HGB][4];
+#pragma unroll
+        for (int j = 0; j < SA_HGB; ++j) {
+            sa_float4 acc = sa_float4{0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+            for (int p = 0; p < NP; ++p) {
+                acc = __builtin_amdgcn_mfma_f32_16x16x16f16(sa_h4(kr[p].x, kr[p].y), qb[j][2*p + 0], acc, 0, 0, 0);
+                acc = __builtin_amdgcn_mfma_f32_16x16x16f16(sa_h4(kr[p].z, kr[p].w), qb[j][2*p + 1], acc, 0, 0, 0);
+            }
+            float mx = -INFINITY;
+#pragma unroll
+            for (int v = 0; v < 4; ++v) {
+                const int jc = it*SA_TILE + 16*w + 4*g + v;
+                const float mk = jc < n_sel ? mask_row[jc] : -INFINITY;
+                sv[j][v] = mk == -INFINITY ? -INFINITY : acc[v]*scale + mk;
+                mx = fmaxf(mx, sv[j][v]);
+            }
+            mx = fmaxf(mx, __shfl_xor(mx, 16, 64));
+            mx = fmaxf(mx, __shfl_xor(mx, 32, 64));
+            if (g == 0) {
+                sRed[w][j*SA_HEADS + l16] = mx;
+            }
+        }
+        __syncthreads();
+
+        float alpha[SA_HGB], m_new[SA_HGB], pv[SA_HGB][4], ps[SA_HGB];
+#pragma unroll
+        for (int j = 0; j < SA_HGB; ++j) {
+            const int hh = j*SA_HEADS + l16;
+            const float m_tile = fmaxf(fmaxf(sRed[0][hh], sRed[1][hh]), fmaxf(sRed[2][hh], sRed[3][hh]));
+            m_new[j] = fmaxf(m_run[j], m_tile);
+            alpha[j] = m_new[j] == -INFINITY ? 1.0f : expf(m_run[j] - m_new[j]);
+            ps[j] = 0.0f;
+#pragma unroll
+            for (int v = 0; v < 4; ++v) {
+                pv[j][v] = sv[j][v] == -INFINITY ? 0.0f : expf(sv[j][v] - m_new[j]);
+                ps[j] += pv[j][v];
+            }
+            ps[j] += __shfl_xor(ps[j], 16, 64);
+            ps[j] += __shfl_xor(ps[j], 32, 64);
+        }
+        __syncthreads(); // every wave has read the maxima
+
+#pragma unroll
+        for (int j = 0; j < SA_HGB; ++j) {
+            if (g == 0) {
+                sRed[w][j*SA_HEADS + l16] = ps[j];
+            }
+#pragma unroll
+            for (int v = 0; v < 4; ++v) {
+                sP[j*SA_HEADS + l16][16*w + 4*g + v] = (_Float16) pv[j][v];
+            }
+            if (w == 0 && g == 0) {
+                sAlpha[j*SA_HEADS + l16] = alpha[j];
+            }
+        }
+        __syncthreads();
+
+#pragma unroll
+        for (int j = 0; j < SA_HGB; ++j) {
+            const int hh = j*SA_HEADS + l16;
+            l_run[j] = alpha[j]*l_run[j] + (sRed[0][hh] + sRed[1][hh] + sRed[2][hh] + sRed[3][hh]);
+            m_run[j] = m_new[j];
+
+            float al[4];
+#pragma unroll
+            for (int v = 0; v < 4; ++v) {
+                al[v] = sAlpha[j*SA_HEADS + 4*g + v];
+            }
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+#pragma unroll
+                for (int i = 0; i < 2; ++i) {
+#pragma unroll
+                    for (int v = 0; v < 4; ++v) {
+                        o[j][c][i][v] *= al[v];
+                    }
+                }
+            }
+        }
+
+        // V^T chunks alternate between two LDS buffers: the barrier after staging chunk c also orders every wave's PV of
+        // chunk c-1 (the last reader of the buffer chunk c+1 overwrites) and, across tiles, the softmax barriers order
+        // the last PV reads of sP/sVT before the next tile's writes - one barrier per chunk instead of two
+#pragma unroll
+        for (int c = 0; c < NC; ++c) {
+#pragma unroll
+            for (int pp = 0; pp < SA_DCH/32; ++pp) {
+                const int p = c*(SA_DCH/32) + pp;
+                union { uint4 u; _Float16 h[8]; } kv;
+                kv.u = kr[p];
+#pragma unroll
+                for (int e = 0; e < 8; ++e) {
+                    sVT[DB ? (c & 1) : 0][32*pp + 8*g + e][16*w + l16] = kv.h[e];
+                }
+            }
+            __syncthreads();
+
+#pragma unroll
+            for (int j = 0; j < SA_HGB; ++j) {
+#pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    const int dt = 2*w + i;
+#pragma unroll
+                    for (int ks = 0; ks < SA_TILE/16; ++ks) {
+                        const sa_half4 a = *(const sa_half4 *) &sP       [j*SA_HEADS + l16][16*ks + 4*g];
+                        const sa_half4 b = *(const sa_half4 *) &sVT[DB ? (c & 1) : 0][16*dt + l16][16*ks + 4*g];
+                        o[j][c][i] = __builtin_amdgcn_mfma_f32_16x16x16f16(a, b, o[j][c][i], 0, 0, 0);
+                    }
+                }
+            }
+            if constexpr (!DB) {
+                __syncthreads(); // single buffer: before the next chunk overwrites sVT
+            }
+        }
+    }
+
+    if (w == 0 && g == 0) {
+#pragma unroll
+        for (int j = 0; j < SA_HGB; ++j) {
+            sM[j*SA_HEADS + l16] = m_run[j];
+            sL[j*SA_HEADS + l16] = l_run[j];
+        }
+    }
+    __syncthreads();
+
+#pragma unroll
+    for (int j = 0; j < SA_HGB; ++j) {
+        const int64_t row0 = (int64_t) tok*n_head + hb0 + j*SA_HEADS;
+#pragma unroll
+        for (int v = 0; v < 4; ++v) {
+            const int   hh  = 4*g + v;
+            const float l   = sL[j*SA_HEADS + hh];
+            const float inv = l > 0.0f ? 1.0f/l : 0.0f;
+            float * out = dst + (row0 + hh)*DV;
+#pragma unroll
+            for (int c = 0; c < NC; ++c) {
+#pragma unroll
+                for (int i = 0; i < 2; ++i) {
+                    out[c*SA_DCH + (2*w + i)*16 + l16] = o[j][c][i][v]*inv;
+                }
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(q, k, idx, mask, dst, nbq1, nbq2, nbq3, nbk2, nbk3, n_head, n_q, n_kv, n_sel, scale);
+    NO_DEVICE_CODE;
+#endif // defined(AMD_MFMA_AVAILABLE)
+}
+
 // merge the split partials of one (token, head) row: O = sum_s O_s e^(m_s - M) / sum_s l_s e^(m_s - M)
 template <int DV>
 static __global__ void sparse_attn_combine(
@@ -373,6 +620,22 @@ static void ggml_cuda_sparse_attn_launch(ggml_backend_cuda_context & ctx, ggml_t
 
     const dim3 grid(n_tok*n_hg, 1, n_split); // head group fastest, see the kernel
     const dim3 block(SA_NW*64, 1, 1);
+
+    if constexpr (D == 512) {
+        // GGML_CUDA_SPARSE_HG2: unset/1 = two head groups per block with double-buffered V^T, 2 = single-buffered, 0 = off
+        const char * e = getenv("GGML_CUDA_SPARSE_HG2");
+        const int mode = e != nullptr ? atoi(e) : 1;
+        if (n_split == 1 && n_head % (SA_HGB*SA_HEADS) == 0 && mode != 0) {
+            auto kern = mode == 2 ? sparse_attn_mfma_hg2<D, DV, false> : sparse_attn_mfma_hg2<D, DV, true>;
+            kern<<<n_tok*(n_head/(SA_HGB*SA_HEADS)), SA_NW*64, 0, stream>>>(
+                    (const float *) q->data, (const char *) k->data, (const int32_t *) idx->data, (const float *) mask->data,
+                    (float *) dst->data,
+                    q->nb[1], q->nb[2], q->nb[3], k->nb[2], k->nb[3],
+                    n_head, n_q, n_kv, n_sel, scale);
+            CUDA_CHECK(cudaGetLastError());
+            return;
+        }
+    }
 
     if (n_split == 1) {
         sparse_attn_mfma<D, DV><<<grid, block, 0, stream>>>(

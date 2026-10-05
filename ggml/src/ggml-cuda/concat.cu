@@ -181,6 +181,57 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE)
     *(T *)(dst + i3*nb3 + i2*nb2 + i1*nb1 + i0*nb0) = *x;
 }
 
+// rune gfx908: dim-0 concat whose src1 is a transposed view (dim 1 contiguous), e.g. the KDA/GDN conv input at
+// prefill, concat(states [3, C], transpose(qkv) [n_tokens, C], 0). concat_non_cont reads src1 down a column
+// (stride C elements per thread), ~42 GB/s on gfx908 for [515, 12288]. This kernel moves 32x32 tiles through LDS:
+// coalesced reads along src1's contiguous dim 1, coalesced writes along dst's dim 0. Pure copy: identical bytes.
+// GGML_CUDA_CONCAT_TILED=0 disables.
+template <typename T>
+static __global__ void __launch_bounds__(256) concat_dim0_tsrc1(
+        const char * __restrict__ src0, const char * __restrict__ src1, char * __restrict__ dst,
+        const int ne00, const int ne01, const int ne02,
+        const uint64_t nb00, const uint64_t nb01, const uint64_t nb02, const uint64_t nb03,
+        const uint64_t nb10, const uint64_t nb11, const uint64_t nb12, const uint64_t nb13,
+        const int ne0, const int ne1, const int ne2,
+        const uint64_t nb0, const uint64_t nb1, const uint64_t nb2, const uint64_t nb3) {
+    __shared__ T tile[32][33];
+    const int tx  = threadIdx.x;      // 0..31
+    const int ty  = threadIdx.y;      // 0..7
+    const int i0b = blockIdx.x * 32;
+    const int i1b = blockIdx.y * 32;
+    const int i2  = blockIdx.z % ne2;
+    const int i3  = blockIdx.z / ne2;
+
+#pragma unroll
+    for (int k = ty; k < 32; k += 8) {
+        const int i0 = i0b + k;
+        const int i1 = i1b + tx;
+        if (i0 < ne0 && i1 < ne1) {
+            const T * x;
+            if (i0 < ne00 && i1 < ne01 && i2 < ne02) {
+                x = (const T *) (src0 + i3*nb03 + i2*nb02 + (int64_t) i1*nb01 + (int64_t) i0*nb00);
+            } else {
+                x = (const T *) (src1 + i3*nb13 + i2*nb12 + (int64_t) i1*nb11 + (int64_t) (i0 - ne00)*nb10);
+            }
+            tile[k][tx] = *x;
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int k = ty; k < 32; k += 8) {
+        const int i1 = i1b + k;
+        const int i0 = i0b + tx;
+        if (i0 < ne0 && i1 < ne1) {
+            *(T *) (dst + i3*nb3 + i2*nb2 + (int64_t) i1*nb1 + (int64_t) i0*nb0) = tile[tx][k];
+        }
+    }
+}
+
+static bool concat_tiled_enabled() {
+    const char * e = getenv("GGML_CUDA_CONCAT_TILED");
+    return e == nullptr || atoi(e) != 0;
+}
+
 template <typename T>
 static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst, int dim, cudaStream_t stream) {
     if (dim != 3 && ggml_is_contiguous_to_3(src0) && ggml_is_contiguous_to_3(src1)) {
@@ -202,6 +253,18 @@ static void concat_cuda(const ggml_tensor * src0, const ggml_tensor * src1, ggml
 
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data,         src0->data, size0, cudaMemcpyDeviceToDevice, stream));
         CUDA_CHECK(cudaMemcpyAsync((char *) dst->data + size0, src1->data, size1, cudaMemcpyDeviceToDevice, stream));
+    } else if (dim == 0 && src1->nb[1] == sizeof(T) && src1->nb[0] > sizeof(T) && src0->ne[1] == dst->ne[1] &&
+               src0->ne[2] == dst->ne[2] && src0->ne[3] == dst->ne[3] && dst->ne[0] > 32 &&
+               dst->ne[0] < INT32_MAX && dst->ne[1] < INT32_MAX && dst->ne[2]*dst->ne[3] <= 65535 && concat_tiled_enabled()) {
+        const dim3 block(32, 8, 1);
+        const dim3 grid((dst->ne[0] + 31)/32, (dst->ne[1] + 31)/32, dst->ne[2]*dst->ne[3]);
+        concat_dim0_tsrc1<T><<<grid, block, 0, stream>>>(
+            (const char *) src0->data, (const char *) src1->data, (char *) dst->data,
+            (int) src0->ne[0], (int) src0->ne[1], (int) src0->ne[2],
+            src0->nb[0], src0->nb[1], src0->nb[2], src0->nb[3],
+            src1->nb[0], src1->nb[1], src1->nb[2], src1->nb[3],
+            (int) dst->ne[0], (int) dst->ne[1], (int) dst->ne[2],
+            dst->nb[0], dst->nb[1], dst->nb[2], dst->nb[3]);
     } else if (dst->ne[0] <= 32 && ggml_nelements(dst) < INT32_MAX) {
         GGML_ASSERT(!ggml_is_quantized(src0->type));
 
@@ -363,6 +426,61 @@ static __global__ void __launch_bounds__(CUDA_CONCAT_BLOCK_SIZE) kda_conv_state_
     }
 }
 
+// rune gfx908: the same conv-input assembly at prefill (nt > 8), 32x32 tiles through LDS: reads q/k/v rows coalesced
+// along the channel, writes conv_input rows coalesced along time, and writes each rollback slot's [ns, C] block from the
+// tile that holds its columns. Replaces concat(q,k) + concat(.,v) + concat(states, transpose) + K slot copies (2 + 1 + K
+// launches, the transpose ~1.2 ms at [515, 12288] through concat_non_cont). Pure copies: identical bytes. The slot
+// blocks are written by other blocks than the one reading the states, so the caller declines a slot that aliases the
+// states (build_rs's single-slot view path). GGML_CUDA_KDA_CONV_ROWS_PREFILL=0 disables (unfused graph).
+static __global__ void __launch_bounds__(256) kda_conv_state_rows_tiled_f32(
+        const char * __restrict__ q, const char * __restrict__ k, const char * __restrict__ v,
+        const uint64_t nbq1, const uint64_t nbk1, const uint64_t nbv1,
+        const int d0, const int d1, const int C, const int nt,
+        const char * __restrict__ st, const uint64_t nbs0, const uint64_t nbs1, const int ns,
+        float * __restrict__ ci, const int n_dst, const kda_conv_rows_dst out) {
+    __shared__ float tile[32][33];
+    const int tx  = threadIdx.x;
+    const int ty  = threadIdx.y;
+    const int j0  = blockIdx.x * 32;   // conv_input column (time, states first)
+    const int c0  = blockIdx.y * 32;   // channel
+    const int ne0 = ns + nt;
+
+#pragma unroll
+    for (int kk = ty; kk < 32; kk += 8) {
+        const int j = j0 + kk;
+        const int c = c0 + tx;
+        if (j < ne0 && c < C) {
+            float x;
+            if (j < ns) {
+                x = *(const float *) (st + (int64_t) c*nbs1 + (int64_t) j*nbs0);
+            } else if (c < d0) {
+                x = *(const float *) (q + (int64_t) c*sizeof(float) + (int64_t) (j - ns)*nbq1);
+            } else if (c < d1) {
+                x = *(const float *) (k + (int64_t) (c - d0)*sizeof(float) + (int64_t) (j - ns)*nbk1);
+            } else {
+                x = *(const float *) (v + (int64_t) (c - d1)*sizeof(float) + (int64_t) (j - ns)*nbv1);
+            }
+            tile[kk][tx] = x;
+        }
+    }
+    __syncthreads();
+#pragma unroll
+    for (int kk = ty; kk < 32; kk += 8) {
+        const int c = c0 + kk;
+        const int j = j0 + tx;
+        if (j < ne0 && c < C) {
+            const float x = tile[tx][kk];
+            ci[(int64_t) c*ne0 + j] = x;
+            for (int s = 0; s < n_dst; ++s) {
+                const int jj = j - out.s_idx[s];
+                if (jj >= 0 && jj < ns) {
+                    out.d[s][(int64_t) c*ns + jj] = x;
+                }
+            }
+        }
+    }
+}
+
 void ggml_cuda_op_kda_conv_rows(ggml_backend_cuda_context & ctx, const ggml_cuda_kda_conv_rows_args & a) {
     kda_conv_rows_dst out = {};
     for (int kk = 0; kk < a.n_dst; ++kk) {
@@ -374,6 +492,16 @@ void ggml_cuda_op_kda_conv_rows(ggml_backend_cuda_context & ctx, const ggml_cuda
     const int C  = (int) a.states->ne[1];
     const int nt = (int) a.q->ne[1];
     const int ns = (int) a.states->ne[0];
+    if (nt > KDA_CONV_ROWS_DECODE_MAX_NT) {
+        const dim3 block(32, 8, 1);
+        const dim3 grid((ns + nt + 31)/32, (C + 31)/32, 1);
+        kda_conv_state_rows_tiled_f32<<<grid, block, 0, ctx.stream()>>>(
+            (const char *) a.q->data, (const char *) a.k->data, (const char *) a.v->data,
+            a.q->nb[1], a.k->nb[1], a.v->nb[1], d0, d1, C, nt,
+            (const char *) a.states->data, a.states->nb[0], a.states->nb[1], ns,
+            (float *) a.conv_input->data, a.n_dst, out);
+        return;
+    }
     const int nblocks = (C + CUDA_CONCAT_BLOCK_SIZE - 1) / CUDA_CONCAT_BLOCK_SIZE;
     kda_conv_state_rows_f32<<<nblocks, CUDA_CONCAT_BLOCK_SIZE, 0, ctx.stream()>>>(
         (const char *) a.q->data, (const char *) a.k->data, (const char *) a.v->data,
