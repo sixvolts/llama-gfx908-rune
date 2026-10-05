@@ -5672,6 +5672,10 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     static double  gs_t[GGML_CUDA_MAX_DEVICES][3] = {};
     const int64_t gs_t0 = graph_stats ? ggml_time_us() : 0;
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    if (ggml_host_trace_on()) {
+        // 0 = replayed instance, 1 = (re)captured, 2 = eager (warmup / not graph-compatible)
+        ggml_host_trace("g_kind", cuda_ctx->device, !use_cuda_graph ? 2 : (cuda_graph_update_required ? 1 : 0));
+    }
     if (graph_stats) {
         const int kind = !use_cuda_graph ? 2 : (cuda_graph_update_required ? 1 : 0);
         const int d = cuda_ctx->device;
