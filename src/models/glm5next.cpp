@@ -19,6 +19,19 @@ static uint32_t glm5next_n_select(const llama_hparams & hparams) {
     return n_select;
 }
 
+// LLAMA_POS_MASK (default on; =0 off): with the sparse gather (LLAMA_DSA_SPARSE) every DSA layer reads the KQ mask only at
+// its listed cells, so the attention input can carry cell and query positions instead of the n_kv x n_ubatch mask (64 MB
+// per prompt ubatch at a 32k pad, filled on the host and copied to every pipeline stage). The sparse gather is used when
+// the indexer scores (n_ctx above the selection size) and there is an indexer cache.
+static bool glm5next_pos_mask(const llama_cparams & cparams, const llama_hparams & hparams, const llama_memory_context_i * mctx) {
+    static const bool on = !(getenv("LLAMA_POS_MASK") && atoi(getenv("LLAMA_POS_MASK")) == 0);
+    if (!on || !llama_kpool_sparse_attn() || hparams.indexer_kpool <= 1) {
+        return false;
+    }
+    const auto * mctx_hyb = static_cast<const llama_memory_hybrid_context *>(mctx);
+    return mctx_hyb->get_idx() != nullptr && cparams.n_ctx > glm5next_n_select(hparams);
+}
+
 void llama_model_glm5next::load_arch_hparams(llama_model_loader & ml) {
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     // indexer k_norm is a LayerNorm with bias; without this key it runs at eps 0
@@ -618,7 +631,7 @@ llama_model_glm5next::graph::graph(const llama_model & model, const llm_graph_pa
     ggml_tensor * inp         = build_inp_embd(model.tok_embd);
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    llm_graph_input_mem_hybrid_k * inp_mem = build_inp_mem_hybrid_k();
+    llm_graph_input_mem_hybrid_k * inp_mem = build_inp_mem_hybrid_k(glm5next_pos_mask(cparams, hparams, mctx));
 
     // gated on n_ctx, not n_kv, which grows and would flip the graph topology mid-run
     llm_graph_input_kpool * inp_kp = nullptr;
@@ -778,7 +791,7 @@ llama_model_glm5next::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     ggml_tensor * inp_out_ids = build_inp_out_ids();
 
-    llm_graph_input_mem_hybrid_k * inp_mem = build_inp_mem_hybrid_k();
+    llm_graph_input_mem_hybrid_k * inp_mem = build_inp_mem_hybrid_k(glm5next_pos_mask(cparams, hparams, mctx));
 
     // the NextN block is DSA: nothing consumes the recurrent half, so s_copy never enters the
     // graph while set_input would still read its buffer

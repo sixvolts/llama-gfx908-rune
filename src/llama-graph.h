@@ -395,6 +395,15 @@ public:
     // instead of one per DSA layer, so a pipeline stage with two DSA layers receives the n_kv x n_ubatch mask once
     ggml_tensor * kq_mask_rows = nullptr;
 
+    // position mode (LLAMA_POS_MASK, sparse gather only): instead of self_kq_mask, each cell's position (1e9 = empty) and
+    // each query's position; the gather masks a listed cell that is empty or after its query. nullptr in mask mode.
+    ggml_tensor * self_kv_pos = nullptr; // F32 [n_kv, 1, 1, n_stream]
+    ggml_tensor * self_q_pos  = nullptr; // F32 [1, n_batch/n_stream, n_stream]
+    ggml_tensor * kv_pos_rows = nullptr; // per-graph [1, n_kv, 1, n_stream] view of self_kv_pos
+
+    void set_input_mask_or_pos(const llama_ubatch * ubatch);
+    bool can_reuse_mask_or_pos(const llm_graph_params & params, const llama_kv_cache_context * mctx_cur) const;
+
     const llama_hparams hparams;
     const llama_cparams cparams;
 
@@ -1370,7 +1379,9 @@ struct llm_graph_context {
     //
 
     llm_graph_input_mem_hybrid * build_inp_mem_hybrid() const;
-    llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k() const;
+    // pos_mask: the attention input carries cell/query positions instead of the n_kv x n_batch KQ mask (only for graphs
+    // whose attention is the sparse gather; see build_attn_inp_k_impl)
+    llm_graph_input_mem_hybrid_k * build_inp_mem_hybrid_k(bool pos_mask = false) const;
 
     llm_graph_input_mem_hybrid_iswa * build_inp_mem_hybrid_iswa() const;
 

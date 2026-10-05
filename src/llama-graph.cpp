@@ -514,7 +514,38 @@ bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_attn_k::set_input(const llama_ubatch * ubatch) {
     mctx->set_input_k_idxs(self_k_idxs, ubatch);
 
-    mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+    set_input_mask_or_pos(ubatch);
+}
+
+void llm_graph_input_attn_k::set_input_mask_or_pos(const llama_ubatch * ubatch) {
+    if (self_kq_mask) {
+        mctx->set_input_kq_mask(self_kq_mask, ubatch, cparams.causal_attn);
+        return;
+    }
+
+    mctx->set_input_kv_pos(self_kv_pos, ubatch);
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(self_q_pos->buffer));
+    GGML_ASSERT((uint32_t) ggml_nelements(self_q_pos) == ubatch->n_tokens);
+
+    float * qp = (float *) self_q_pos->data;
+    for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
+        qp[i] = (float) ubatch->pos[i];
+    }
+}
+
+bool llm_graph_input_attn_k::can_reuse_mask_or_pos(const llm_graph_params & params, const llama_kv_cache_context * mctx_cur) const {
+    if (self_kq_mask) {
+        return can_reuse_kq_mask(self_kq_mask, mctx_cur, params.ubatch, params.cparams);
+    }
+
+    const int64_t n_stream = params.cparams.kv_unified ? 1 : params.ubatch.n_seqs_unq;
+
+    bool res = true;
+    res &= self_kv_pos->ne[0] == (int64_t) mctx_cur->get_n_kv();
+    res &= self_kv_pos->ne[3] == n_stream;
+    res &= self_q_pos->ne[2] == n_stream && self_q_pos->ne[1]*n_stream == (int64_t) params.ubatch.n_tokens;
+    return res;
 }
 
 bool llm_graph_input_attn_k::can_reuse(const llm_graph_params & params) {
@@ -528,7 +559,7 @@ bool llm_graph_input_attn_k::can_reuse_impl(const llm_graph_params & params) {
 
     res &= self_k_idxs->ne[0] == params.ubatch.n_tokens;
 
-    res &= can_reuse_kq_mask(self_kq_mask, mctx, params.ubatch, params.cparams);
+    res &= can_reuse_mask_or_pos(params, mctx);
 
     return res;
 }
@@ -1171,7 +1202,8 @@ bool llm_graph_input_mem_hybrid::can_reuse(const llm_graph_params & params) {
 void llm_graph_input_mem_hybrid_k::set_input(const llama_ubatch * ubatch) {
     mctx->get_attn()->set_input_k_idxs(inp_attn->self_k_idxs, ubatch);
 
-    mctx->get_attn()->set_input_kq_mask(inp_attn->self_kq_mask, ubatch, cparams.causal_attn);
+    inp_attn->mctx = mctx->get_attn();
+    inp_attn->set_input_mask_or_pos(ubatch);
 
     const int64_t n_rs = mctx->get_recr()->get_n_rs();
 
@@ -1195,7 +1227,7 @@ bool llm_graph_input_mem_hybrid_k::can_reuse(const llm_graph_params & params) {
 
     res &= inp_attn->self_k_idxs->ne[0] == params.ubatch.n_tokens;
 
-    res &= can_reuse_kq_mask(inp_attn->self_kq_mask, mctx->get_attn(), params.ubatch, params.cparams);
+    res &= inp_attn->can_reuse_mask_or_pos(params, mctx->get_attn());
 
     res &= inp_rs->s_copy->ne[0] == mctx->get_recr()->get_n_rs();
 
@@ -2954,7 +2986,8 @@ static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
      const llama_ubatch & ubatch,
     const llama_hparams & hparams,
     const llama_cparams & cparams,
-    const llama_kv_cache_context * mctx_cur) {
+    const llama_kv_cache_context * mctx_cur,
+    bool pos_mask = false) {
 
     auto inp = std::make_unique<llm_graph_input_attn_k>(hparams, cparams, mctx_cur);
 
@@ -2963,8 +2996,23 @@ static std::unique_ptr<llm_graph_input_attn_k> build_attn_inp_k_impl(
 
         inp->self_k_idxs = mctx_cur->build_input_k_idxs(ctx0, ubatch);
 
-        inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
-        inp->self_kq_mask_cnv = inp->self_kq_mask;
+        // position mode: one sequence per stream, causal, one position per token (the gather derives the mask at the
+        // listed cells from these, so the n_kv x n_batch mask is neither filled on the host nor copied to every stage)
+        if (pos_mask && !cparams.kv_unified && cparams.causal_attn && hparams.n_pos_per_embd() == 1) {
+            const auto n_kv     = mctx_cur->get_n_kv();
+            const auto n_stream = ubatch.n_seqs_unq;
+
+            inp->self_kv_pos = ggml_new_tensor_4d(ctx0, GGML_TYPE_F32, n_kv, 1, 1, n_stream);
+            ggml_set_input(inp->self_kv_pos);
+            ggml_set_name(inp->self_kv_pos, "attn_inp_kv_pos");
+
+            inp->self_q_pos = ggml_new_tensor_3d(ctx0, GGML_TYPE_F32, 1, ubatch.n_tokens/n_stream, n_stream);
+            ggml_set_input(inp->self_q_pos);
+            ggml_set_name(inp->self_q_pos, "attn_inp_q_pos");
+        } else {
+            inp->self_kq_mask = build_attn_inp_kq_mask(ctx0, mctx_cur, ubatch, cparams);
+            inp->self_kq_mask_cnv = inp->self_kq_mask;
+        }
     }
 
     return inp;
@@ -3645,11 +3693,11 @@ llm_graph_input_mem_hybrid * llm_graph_context::build_inp_mem_hybrid() const {
     return (llm_graph_input_mem_hybrid *) res->add_input(std::move(inp));
 }
 
-llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k() const {
+llm_graph_input_mem_hybrid_k * llm_graph_context::build_inp_mem_hybrid_k(bool pos_mask) const {
     const auto * mctx_cur = static_cast<const llama_memory_hybrid_context *>(mctx);
 
     auto inp_rs   = build_rs_inp_impl     (ctx0, ubatch, mctx_cur->get_recr());
-    auto inp_attn = build_attn_inp_k_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn());
+    auto inp_attn = build_attn_inp_k_impl(ctx0, ubatch, hparams, cparams, mctx_cur->get_attn(), pos_mask);
 
     auto inp = std::make_unique<llm_graph_input_mem_hybrid_k>(cparams, std::move(inp_attn), std::move(inp_rs), mctx_cur);
 
@@ -3688,9 +3736,9 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
 
         const int64_t n_pools = llama_kpool_n_pools(n_kv, kpool, n_ps);
 
-        GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[3] == n_stream);
+        GGML_ASSERT(!kq_mask || (kq_mask->ne[0] == n_kv && kq_mask->ne[3] == n_stream));
 
-        GGML_ASSERT(kq_mask->ne[1] == n_tps && "the pooled indexer needs an unpadded KQ mask");
+        GGML_ASSERT((!kq_mask || kq_mask->ne[1] == n_tps) && "the pooled indexer needs an unpadded KQ mask");
 
         inp->pool_cells = ggml_new_tensor_2d(ctx0, GGML_TYPE_I32, kpool*n_pools, n_stream);
         ggml_set_input(inp->pool_cells);
@@ -3862,7 +3910,7 @@ ggml_tensor * llm_graph_context::build_attn_sparse_gather(
     // the ubatch's own keys are stored first: the gather reads them back (same ordering as build_attn_sparse)
     ggml_build_forward_expand(gf, mctx_cur->cpy_k(ctx0, k_cur, inp->get_k_idxs(), il));
 
-    const auto & kq_mask = inp->get_kq_mask();
+    const auto & kq_mask = inp->get_kq_mask();   // nullptr in position mode (inp->self_kv_pos)
 
     ggml_tensor * k = mctx_cur->get_k(ctx0, il); // [D, 1, n_kv, n_stream]
 
@@ -3881,7 +3929,7 @@ ggml_tensor * llm_graph_context::build_attn_sparse_gather(
     GGML_ASSERT(top_k->ne[1] == n_tps && top_k->ne[2] == n_stream);
     GGML_ASSERT(ggml_are_same_shape(top_k, top_k_mask));
     GGML_ASSERT(ggml_are_same_shape(tail_cells, tail_mask));
-    GGML_ASSERT(kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream);
+    GGML_ASSERT(!kq_mask || (kq_mask->ne[0] == n_kv && kq_mask->ne[1] == n_tps && kq_mask->ne[3] == n_stream));
 
     // the per-query cell list and its additive mask
     ggml_tensor * idx  = ggml_concat(ctx0, top_k,      tail_cells, 0); // I32 [n_sel, n_tps, n_stream]
@@ -3891,7 +3939,21 @@ ggml_tensor * llm_graph_context::build_attn_sparse_gather(
 
     // load bearing as in build_attn_sparse: the KQ mask at every listed cell keeps an empty, future or
     // foreign-sequence cell masked whatever the lists say
-    {
+    if (inp->self_kv_pos) {
+        // position mode: a listed cell is masked when it is empty (position 1e9) or after its query (one sequence per
+        // stream, so no foreign-sequence cells). The 2-D index gathers from the [n_kv]-row input itself: the scheduler
+        // copies n_kv floats per stage instead of the n_kv x n_tps mask. -1e30 instead of -INFINITY: finite, and
+        // exp() of a score this far below the row maximum underflows to 0 exactly as it does for -INFINITY.
+        GGML_ASSERT(inp->self_kv_pos->ne[0] == n_kv && inp->self_kv_pos->ne[3] == n_stream);
+        GGML_ASSERT(inp->self_q_pos->ne[1] == n_tps && inp->self_q_pos->ne[2] == n_stream);
+        if (!inp->kv_pos_rows) {
+            inp->kv_pos_rows = ggml_reshape_4d(ctx0, inp->self_kv_pos, 1, n_kv, 1, n_stream);
+        }
+        ggml_tensor * cp = ggml_get_rows(ctx0, inp->kv_pos_rows, ggml_reshape_3d(ctx0, idx, n_sel*n_tps, 1, n_stream));
+        cp = ggml_reshape_3d(ctx0, cp, n_sel, n_tps, n_stream);        // F32 position of each listed cell
+        ggml_tensor * d = ggml_sub(ctx0, cp, inp->self_q_pos);         // > 0: empty or after the query
+        mask = ggml_add(ctx0, mask, ggml_scale(ctx0, ggml_step(ctx0, d), -1e30f));
+    } else {
         // LLAMA_GRAPH_VIEW_CACHE=0: a fresh view per layer (each one is a separate split input of the stage)
         static const bool view_cache = !(getenv("LLAMA_GRAPH_VIEW_CACHE") && atoi(getenv("LLAMA_GRAPH_VIEW_CACHE")) == 0);
         ggml_tensor * kqm = view_cache ? inp->kq_mask_rows : nullptr;
