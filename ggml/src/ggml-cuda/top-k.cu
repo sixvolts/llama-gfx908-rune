@@ -201,17 +201,21 @@ static __global__ void top_k_radix_count_greater(
         const float * __restrict__ src,
         const top_k_radix_state * __restrict__ states,
         int * __restrict__ block_counts,
+        int * __restrict__ eq_counts,
         int ncols,
-        int blocks_per_row) {
+        int blocks_per_row,
+        int eq_chunk) {
     const int row = blockIdx.x / blocks_per_row;
     const int row_block = blockIdx.x % blocks_per_row;
     const int tid = threadIdx.x;
     const float * row_src = src + (size_t) row * ncols;
     const uint32_t prefix = states[row].prefix;
     __shared__ int total;
+    __shared__ int eq_total;   // ties of this block's contiguous chunk, for the parallel tie gather
 
     if (tid == 0) {
-        total = 0;
+        total    = 0;
+        eq_total = 0;
     }
     __syncthreads();
 
@@ -220,9 +224,22 @@ static __global__ void top_k_radix_count_greater(
         count += top_k_float_to_ordered(row_src[col]) > prefix;
     }
     atomicAdd(&total, count);   // integer: order-independent
+    // the ties of this block's contiguous chunk [row_block*eq_chunk, ...) (eq_counts null: the serial
+    // top_k_radix_gather_equal is used)
+    if (eq_counts != nullptr) {
+        const int c_end = min((row_block + 1) * eq_chunk, ncols);
+        int eq = 0;
+        for (int col = row_block * eq_chunk + tid; col < c_end; col += BLOCK_SIZE) {
+            eq += top_k_float_to_ordered(row_src[col]) == prefix;
+        }
+        atomicAdd(&eq_total, eq);
+    }
     __syncthreads();
 
     if (tid == 0) {
+        if (eq_counts != nullptr) {
+            eq_counts[blockIdx.x] = eq_total;
+        }
         block_counts[blockIdx.x] = total;
     }
 }
@@ -233,9 +250,11 @@ static __global__ void top_k_radix_gather(
         int * __restrict__ dst,
         const top_k_radix_state * __restrict__ states,
         const int * __restrict__ block_counts,
+        const int * __restrict__ eq_counts,
         int ncols,
         int k,
-        int blocks_per_row) {
+        int blocks_per_row,
+        int eq_chunk) {
     const int row = blockIdx.x / blocks_per_row;
     const int row_block = blockIdx.x % blocks_per_row;
     const int tid = threadIdx.x;
@@ -272,6 +291,40 @@ static __global__ void top_k_radix_gather(
             row_dst[before + __popcll(mask & lane_mask)] = col;
         }
         __syncthreads();
+    }
+
+    // Parallel tie gather (GGML_CUDA_TOPK_TIEPAR, default on): the first `rank` keys equal to the k-th key in column
+    // order, as top_k_radix_gather_equal, but each block writes the ties of its contiguous chunk at the global tie
+    // index (earlier chunks' tie counts + its own column-order rank) instead of one block scanning the whole row
+    // (~17 us at 8k columns, ~70 us at 32k on gfx908). Same positions, so the same bytes.
+    if (eq_counts != nullptr) {
+        const int rank = states[row].rank;
+        int found = 0;
+        for (int b = 0; b < row_block; ++b) {
+            found += eq_counts[row * blocks_per_row + b];
+        }
+        const int c_end = min((row_block + 1) * eq_chunk, ncols);
+        for (int base = row_block * eq_chunk; base < c_end && found < rank; base += BLOCK_SIZE) {
+            const int col = base + tid;
+            const bool equal = col < c_end && top_k_float_to_ordered(row_src[col]) == prefix;
+            const unsigned long long mask = __ballot(equal);
+            if (lane == 0) {
+                warp_counts[warp] = __popcll(mask);
+            }
+            __syncthreads();
+            int before = found;
+            for (int w = 0; w < nwarps; ++w) {
+                if (w < warp) {
+                    before += warp_counts[w];
+                }
+                found += warp_counts[w];
+            }
+            const int pos = before + __popcll(mask & ((1ULL << lane) - 1));
+            if (equal && pos < rank) {
+                row_dst[k - rank + pos] = col;
+            }
+            __syncthreads();
+        }
     }
 }
 
@@ -352,14 +405,20 @@ static void top_k_radix_cuda(
             <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift, scan);
     }
 
+    static const bool tie_par = [] { const char * e = getenv("GGML_CUDA_TOPK_TIEPAR"); return e == nullptr || atoi(e) != 0; }();
+    const int eq_chunk = ((ncols + blocks_per_row - 1) / blocks_per_row + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
     ggml_cuda_pool_alloc<int> counts_alloc(pool, (size_t) nrows * blocks_per_row);
+    ggml_cuda_pool_alloc<int> eq_alloc(pool);
+    int * eq_counts = tie_par ? eq_alloc.alloc((size_t) nrows * blocks_per_row) : nullptr;
     top_k_radix_count_greater<BLOCK_SIZE>
-        <<<row_grid, BLOCK_SIZE, 0, stream>>>(src, states, counts_alloc.get(), ncols, blocks_per_row);
+        <<<row_grid, BLOCK_SIZE, 0, stream>>>(src, states, counts_alloc.get(), eq_counts, ncols, blocks_per_row, eq_chunk);
     top_k_radix_gather<BLOCK_SIZE>
         <<<row_grid, BLOCK_SIZE, 0, stream>>>(
-            src, dst, states, counts_alloc.get(), ncols, k, blocks_per_row);
-    top_k_radix_gather_equal<BLOCK_SIZE>
-        <<<nrows, BLOCK_SIZE, 0, stream>>>(src, dst, states, ncols, k);
+            src, dst, states, counts_alloc.get(), eq_counts, ncols, k, blocks_per_row, eq_chunk);
+    if (!tie_par) {
+        top_k_radix_gather_equal<BLOCK_SIZE>
+            <<<nrows, BLOCK_SIZE, 0, stream>>>(src, dst, states, ncols, k);
+    }
 }
 
 // Fused few-row top-k (decode on GLM-5.3-Flash: 1..18 rows of up to ~33k pool scores, k = 512): one 1024-thread
@@ -565,7 +624,14 @@ static __global__ void __launch_bounds__(TOP_K_FUSED_NT, 1) top_k_fused_kernel(
 
 static bool top_k_fused_cuda(const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
     static const bool on = [] { const char * e = getenv("GGML_CUDA_TOPK_FUSED"); return e == nullptr || atoi(e) != 0; }();
-    if (!on || ncols <= 1024 || ncols > TOP_K_FUSED_MAX_COLS || nrows > TOP_K_FUSED_MAX_ROWS || k > ncols) {
+    // one workgroup per row is a serial chain of L2 round trips per phase: it beats the multi-block radix path only on
+    // short rows (gfx908, 1..18 rows: 2051 columns 56 vs 66 us, 8258 columns 102 vs 76 us); GGML_CUDA_TOPK_FUSED_MAX
+    // moves the limit (up to 32832)
+    static const int max_cols = [] {
+        const char * e = getenv("GGML_CUDA_TOPK_FUSED_MAX");
+        return e ? std::min(atoi(e), TOP_K_FUSED_MAX_COLS) : 3072;
+    }();
+    if (!on || ncols <= 1024 || ncols > max_cols || nrows > TOP_K_FUSED_MAX_ROWS || k > ncols) {
         return false;
     }
     top_k_fused_kernel<<<nrows, TOP_K_FUSED_NT, 0, stream>>>(src, dst, ncols, k);
