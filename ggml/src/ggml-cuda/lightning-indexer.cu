@@ -749,6 +749,8 @@ static __global__ void __launch_bounds__(li_dec::NT, 1) lightning_indexer_kernel
     const int r        = ((g & 1) << 1) | (g >> 1);  // bitrev2(g): leaf 8g+j is vec lane 4*bitrev3(j) + r
     const int ip       = blockIdx.x*KPB + tid/4;
     const int i_stream = blockIdx.z;
+    // queries q0 .. q0+NQ-1 of this block (grid.y = ceil(n_batch / NQ)): the verify batch's queries run in parallel blocks
+    const int q0       = blockIdx.y*NQ;
 
     // mask of this lane's outputs; skip the block when the mask hides every key for every query
     float mval[NQ];
@@ -757,8 +759,8 @@ static __global__ void __launch_bounds__(li_dec::NT, 1) lightning_indexer_kernel
 #pragma unroll
     for (int i = 0; i < NQ; ++i) {
         float mv = -INFINITY;
-        if (i < n_batch && ip < n_kv) {
-            const half * m_row = (const half *) (m_base + (int64_t) i*nbm1);
+        if (q0 + i < n_batch && ip < n_kv) {
+            const half * m_row = (const half *) (m_base + (int64_t) (q0 + i)*nbm1);
             mv = __half2float(m_row[ip]);
         }
         mval[i] = mv;
@@ -768,8 +770,8 @@ static __global__ void __launch_bounds__(li_dec::NT, 1) lightning_indexer_kernel
         if (g == 0 && ip < n_kv) {
 #pragma unroll
             for (int i = 0; i < NQ; ++i) {
-                if (i < n_batch) {
-                    ((float *) ((char *) dst + (int64_t) i*nb1 + i_stream*nb3))[ip] = mval[i];
+                if (q0 + i < n_batch) {
+                    ((float *) ((char *) dst + (int64_t) (q0 + i)*nb1 + i_stream*nb3))[ip] = mval[i];
                 }
             }
         }
@@ -789,7 +791,7 @@ static __global__ void __launch_bounds__(li_dec::NT, 1) lightning_indexer_kernel
     for (int e = tid; e < NQ*N_HEAD; e += NT) {
         const int i = e / N_HEAD;
         const int h = e % N_HEAD;
-        w_s[i][h] = i < n_batch ? ((const float *) ((const char *) W + (int64_t) i*nbw1 + i_stream*nbw3))[h] : 0.0f;
+        w_s[i][h] = q0 + i < n_batch ? ((const float *) ((const char *) W + (int64_t) (q0 + i)*nbw1 + i_stream*nbw3))[h] : 0.0f;
     }
 
     const char * q_base = (const char *) Q + i_stream*nbq3;
@@ -805,8 +807,8 @@ static __global__ void __launch_bounds__(li_dec::NT, 1) lightning_indexer_kernel
             const int i  = e / (HC*32);
             const int hh = (e / 32) % HC;
             const int c4 = e % 32;
-            q_s[i][hh][c4] = i < n_batch ? ((const float4 *) (q_base + (int64_t) i*nbq2 + (int64_t) (h0 + hh)*nbq1))[c4]
-                                         : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+            q_s[i][hh][c4] = q0 + i < n_batch ? ((const float4 *) (q_base + (int64_t) (q0 + i)*nbq2 + (int64_t) (h0 + hh)*nbq1))[c4]
+                                              : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
         }
         __syncthreads();
 #pragma unroll 4
@@ -814,8 +816,9 @@ static __global__ void __launch_bounds__(li_dec::NT, 1) lightning_indexer_kernel
 #pragma unroll
             for (int i = 0; i < NQ; ++i) {
                 float t = sub<0, 8>::run(kr, q_s[i][hh], r);
-                t = t + __shfl_xor_sync(0xffffffff, t, 1, 4);   // (t0 + t1), (t2 + t3)
-                t = t + __shfl_xor_sync(0xffffffff, t, 2, 4);   // (t0 + t1) + (t2 + t3)
+                // quad_perm [1,0,3,2] = xor 1, [2,3,0,1] = xor 2 within each 4-lane group (exact register moves)
+                t = t + __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(t), 0xB1, 0xF, 0xF, false));   // (t0 + t1), (t2 + t3)
+                t = t + __int_as_float(__builtin_amdgcn_mov_dpp(__float_as_int(t), 0x4E, 0xF, 0xF, false));   // (t0 + t1) + (t2 + t3)
                 const float w_val = w_s[i][h0 + hh];
                 float sum = t;
                 // ReLU, weight
@@ -828,8 +831,8 @@ static __global__ void __launch_bounds__(li_dec::NT, 1) lightning_indexer_kernel
     if (g == 0 && ip < n_kv) {
 #pragma unroll
         for (int i = 0; i < NQ; ++i) {
-            if (i < n_batch) {
-                ((float *) ((char *) dst + (int64_t) i*nb1 + i_stream*nb3))[ip] = score[i] + mval[i];
+            if (q0 + i < n_batch) {
+                ((float *) ((char *) dst + (int64_t) (q0 + i)*nb1 + i_stream*nb3))[ip] = score[i] + mval[i];
             }
         }
     }
@@ -948,7 +951,7 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
 #if defined(GGML_USE_HIP)
     if (n_embd == 128 && (n_head == 64 || n_head == 32) && lightning_indexer_use_decode(k, n_batch)) {
         dim3 block(li_dec::NT, 1, 1);
-        dim3 grid((n_kv + li_dec::KPB - 1) / li_dec::KPB, 1, n_stream);
+        dim3 grid((n_kv + li_dec::KPB - 1) / li_dec::KPB, n_batch, n_stream);   // one query per block
         auto launch = [&](auto kern) {
             kern<<<grid, block, 0, ctx.stream()>>>(
                 q_d, k_d, w_d, m_d, dst_d,
@@ -960,24 +963,12 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
                 nbm1, nbm2, nbm3,
                 nem3);
         };
-        // NQ = queries per block (n_batch rounded up to 1, 2, 4, 8: the drafter scores 1, the verify 3); LDS: NQ x HC x
-        // 512 B of Q (<= 32 KB) + NQ x N_HEAD floats of W
-        auto go = [&](auto nh_tag) {
-            constexpr int64_t NH = decltype(nh_tag)::value;
-            if (n_batch == 1) {
-                launch(lightning_indexer_kernel_decode_f32<NH, 1, 32>);
-            } else if (n_batch == 2) {
-                launch(lightning_indexer_kernel_decode_f32<NH, 2, 32>);
-            } else if (n_batch <= 4) {
-                launch(lightning_indexer_kernel_decode_f32<NH, 4, 16>);
-            } else {
-                launch(lightning_indexer_kernel_decode_f32<NH, 8, 8>);
-            }
-        };
+        // one query per block (the verify's 3 queries run as parallel blocks; one block holding all queries scored them
+        // serially and was slower than the vec kernel at 3 queries); LDS: 32 heads x 512 B of Q + W
         if (n_head == 64) {
-            go(std::integral_constant<int64_t, 64>{});
+            launch(lightning_indexer_kernel_decode_f32<64, 1, 32>);
         } else {
-            go(std::integral_constant<int64_t, 32>{});
+            launch(lightning_indexer_kernel_decode_f32<32, 1, 32>);
         }
         return;
     }
