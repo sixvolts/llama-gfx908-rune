@@ -506,8 +506,12 @@ bool ggml_cuda_mmvq_moe_dedup(
     static const int cfg_q51 = getenv("GGML_MOE_V2_Q51") ? atoi(getenv("GGML_MOE_V2_Q51")) : 41;
     switch (type) {
         case GGML_TYPE_Q4_K: {
-            // Qwen3.8-Flash-Next: K = 2560 (10 superblocks); GLM-5.3-Flash gate/up: K = 4096 (16)
-            if (ncols_x != 10*QK_K && ncols_x != 16*QK_K) {
+            // Qwen3.8-Flash-Next: K = 2560 (10 superblocks); GLM-5.3-Flash gate/up: K = 4096 (16); GLM-5.3-Flash down
+            // in the rune Q4_K quant: K = 2048 (8, no GLU; it fell back to mul_mat_vec_q_moe before - tolerance class,
+            // the dedup kernel scales each 32-weight block after its integer dot). GGML_MOE_V2_Q4K_DOWN=0 keeps the fallback.
+            static const bool q4k_down_on = !getenv("GGML_MOE_V2_Q4K_DOWN") || atoi(getenv("GGML_MOE_V2_Q4K_DOWN")) != 0;
+            const bool k2048 = ncols_x == 8*QK_K && !glu && q4k_down_on;
+            if (ncols_x != 10*QK_K && ncols_x != 16*QK_K && !k2048) {
                 return false;
             }
             auto launch = [&](auto nw_tag, auto rg_tag) {
@@ -538,6 +542,8 @@ bool ggml_cuda_mmvq_moe_dedup(
                 };
                 if (ncols_x == 16*QK_K) {
                     go_nt(std::integral_constant<int, 16>{});
+                } else if (ncols_x == 8*QK_K) {
+                    go_nt(std::integral_constant<int, 8>{});
                 } else {
                     go_nt(std::integral_constant<int, 10>{});
                 }
