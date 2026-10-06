@@ -106,13 +106,20 @@ static __global__ void top_k_radix_histogram(
     block_histograms[histogram_offset + tid] = histogram[tid];
 }
 
+// Picks the digit of the k-th key: the highest bin whose count of keys at or above it (inclusive suffix sum) reaches
+// the remaining rank, bin 0 if none; the new rank subtracts the keys strictly above that bin. The serial version (one
+// thread walking the bins down from the top) left select at 11-18 us per launch in decode (4 per top-k call, 14 calls
+// per verify step on GLM-5.3-Flash). The scan version computes the same integers with wave suffix scans and an integer
+// max (identical state, so identical selections). GGML_CUDA_TOPK_SCAN=0 keeps the serial walk.
 template<int BLOCK_SIZE, int RADIX_BITS>
 static __global__ void top_k_radix_select(
         const int * __restrict__ block_histograms,
         top_k_radix_state * __restrict__ states,
         int blocks_per_row,
-        int shift) {
+        int shift,
+        bool scan) {
     constexpr int NBINS = 1 << RADIX_BITS;
+    static_assert(BLOCK_SIZE == NBINS, "one thread per bin");
 
     const int row = blockIdx.x;
     const int tid = threadIdx.x;
@@ -123,6 +130,52 @@ static __global__ void top_k_radix_select(
         const size_t offset = ((size_t) row * blocks_per_row + row_block) * NBINS;
         count += block_histograms[offset + tid];
     }
+
+    if (scan) {
+        constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+        constexpr int nwarps    = NBINS / warp_size;
+        __shared__ int warp_total[nwarps];
+        __shared__ int chosen;
+        const int lane = tid % warp_size;
+        const int warp = tid / warp_size;
+
+        // inclusive suffix sum within the wave (sum over this lane and the lanes above it)
+        int sfx = count;
+#pragma unroll
+        for (int off = 1; off < warp_size; off <<= 1) {
+            const int v = __shfl_down(sfx, off, warp_size);
+            if (lane + off < warp_size) {
+                sfx += v;
+            }
+        }
+        if (lane == 0) {
+            warp_total[warp] = sfx;
+        }
+        if (tid == 0) {
+            chosen = 0;
+        }
+        __syncthreads();
+#pragma unroll
+        for (int w = 0; w < nwarps; ++w) {
+            if (w > warp) {
+                sfx += warp_total[w];
+            }
+        }
+        const top_k_radix_state state0 = states[row];
+        if (tid > 0 && sfx >= state0.rank) {
+            atomicMax(&chosen, tid);   // integer max: order-independent
+        }
+        __syncthreads();
+        if (tid == chosen) {
+            top_k_radix_state state = state0;
+            state.rank -= sfx - count;  // keys strictly above the chosen bin
+            state.prefix |= (uint32_t) tid << shift;
+            state.prefix_mask |= (uint32_t) (NBINS - 1) << shift;
+            states[row] = state;
+        }
+        return;
+    }
+
     histogram[tid] = count;
     __syncthreads();
 
@@ -286,6 +339,8 @@ static void top_k_radix_cuda(
     top_k_radix_state * states = states_alloc.get();
     int * histograms = histograms_alloc.get();
 
+    static const bool scan = [] { const char * e = getenv("GGML_CUDA_TOPK_SCAN"); return e == nullptr || atoi(e) != 0; }();
+
     top_k_radix_init<<<(nrows + BLOCK_SIZE - 1) / BLOCK_SIZE, BLOCK_SIZE, 0, stream>>>(states, nrows, k);
 
     const dim3 row_grid(blocks_per_row * nrows);
@@ -294,7 +349,7 @@ static void top_k_radix_cuda(
             <<<row_grid, BLOCK_SIZE, 0, stream>>>(
                 src, states, histograms, ncols, blocks_per_row, shift);
         top_k_radix_select<BLOCK_SIZE, RADIX_BITS>
-            <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift);
+            <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift, scan);
     }
 
     ggml_cuda_pool_alloc<int> counts_alloc(pool, (size_t) nrows * blocks_per_row);
