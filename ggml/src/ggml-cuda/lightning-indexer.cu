@@ -687,6 +687,160 @@ static __global__ void __launch_bounds__(li_tiled::NT, 1) lightning_indexer_kern
     }
 }
 
+#if defined(GGML_USE_HIP)
+// rune gfx908: decode-shaped f32 indexer (1..8 queries), BIT-EXACT with lightning_indexer_kernel_vec (f32 K path).
+//
+// In decode the vec kernel is latency-bound: every (query, head, key) runs a dependent 5-step xor butterfly (2048
+// shuffles per lane per block for 32 heads x 8 keys), ~85 us per call however short the context. Here each
+// (query, key) score is computed by 4 lanes: lane g evaluates the leaves 8g..8g+7 of the vec kernel's 32-leaf tree
+// (leaf j = vec lane bitrev5(j), the same 4-FMA leaf chain, the same pairwise grouping inside the 8 leaves), and the
+// four subtrees are combined as ((t0 + t1) + (t2 + t3)) with two xor shuffles = the tree's top two levels (IEEE add is
+// commutative, so every lane ends with identical bits). Then relu(dot) * w is accumulated over the heads in order and
+// the mask is added, exactly as in the vec kernel. A key's K row stays in registers across all heads (8 float4 per
+// lane); Q and W are staged in LDS per chunk of heads and read as broadcasts. A block whose keys are all hidden
+// (mask -inf for every query) writes the mask value without scoring, as the tiled kernel does.
+// GGML_CUDA_LI_DECODE=0 keeps the vec kernel.
+namespace li_dec {
+constexpr int NT  = 256;          // threads per block
+constexpr int KPB = NT / 4;       // keys per block (4 lanes per key)
+
+constexpr int bitrev3(int x) {
+    return ((x & 1) << 2) | (x & 2) | ((x & 4) >> 2);
+}
+
+// leaves LO..LO+N-1 (local, 0..7) of this lane's 8-leaf subtree: kr[j] = K float4 of leaf j, q4 = this head's Q row
+// as float4 with the lane's leaf j at q4[4*bitrev3(j) + r]
+template <int LO, int N>
+struct sub {
+    static __device__ __forceinline__ float run(const float4 (&kr)[8], const float4 * q4, const int r) {
+        if constexpr (N == 1) {
+            const float4 qv = q4[4*bitrev3(LO) + r];
+            float s = 0.0f;
+            ggml_cuda_mad(s, qv.x, kr[LO].x);
+            ggml_cuda_mad(s, qv.y, kr[LO].y);
+            ggml_cuda_mad(s, qv.z, kr[LO].z);
+            ggml_cuda_mad(s, qv.w, kr[LO].w);
+            return s;
+        } else {
+            const float a = sub<LO,       N/2>::run(kr, q4, r);
+            const float b = sub<LO + N/2, N/2>::run(kr, q4, r);
+            return a + b;
+        }
+    }
+};
+} // namespace li_dec
+
+template <int64_t N_HEAD, int NQ, int HC>
+static __global__ void __launch_bounds__(li_dec::NT, 1) lightning_indexer_kernel_decode_f32(
+        const float * Q, const char * K, const float * W, const half * M, float * dst,
+        int64_t n_stream, int64_t n_batch, int64_t n_kv,
+        size_t nb1, size_t nb2, size_t nb3,
+        size_t nbq1, size_t nbq2, size_t nbq3,
+        size_t nbk1, size_t nbk2, size_t nbk3,
+        size_t nbw1, size_t nbw2, size_t nbw3,
+        size_t nbm1, size_t nbm2, size_t nbm3,
+        int64_t nem3) {
+    using namespace li_dec;
+    GGML_UNUSED_VARS(n_stream, nb2, nbk1, nbw2, nbm2);
+    static_assert(N_HEAD % HC == 0, "head chunks");
+
+    const int tid      = threadIdx.x;
+    const int g        = tid % 4;                    // subtree of this lane: leaves 8g..8g+7
+    const int r        = ((g & 1) << 1) | (g >> 1);  // bitrev2(g): leaf 8g+j is vec lane 4*bitrev3(j) + r
+    const int ip       = blockIdx.x*KPB + tid/4;
+    const int i_stream = blockIdx.z;
+
+    // mask of this lane's outputs; skip the block when the mask hides every key for every query
+    float mval[NQ];
+    int visible = 0;
+    const char * m_base = (const char *) M + (i_stream % nem3)*nbm3;
+#pragma unroll
+    for (int i = 0; i < NQ; ++i) {
+        float mv = -INFINITY;
+        if (i < n_batch && ip < n_kv) {
+            const half * m_row = (const half *) (m_base + (int64_t) i*nbm1);
+            mv = __half2float(m_row[ip]);
+        }
+        mval[i] = mv;
+        visible |= !(isinf(mv) && mv < 0.0f);
+    }
+    if (!__syncthreads_or(visible)) {
+        if (g == 0 && ip < n_kv) {
+#pragma unroll
+            for (int i = 0; i < NQ; ++i) {
+                if (i < n_batch) {
+                    ((float *) ((char *) dst + (int64_t) i*nb1 + i_stream*nb3))[ip] = mval[i];
+                }
+            }
+        }
+        return;
+    }
+
+    // this lane's 8 K float4 (leaf j -> vec lane 4*bitrev3(j) + r), kept for all heads
+    float4 kr[8];
+#pragma unroll
+    for (int j = 0; j < 8; ++j) {
+        kr[j] = ip < n_kv ? ((const float4 *) (K + (int64_t) ip*nbk2 + i_stream*nbk3))[4*bitrev3(j) + r]
+                          : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    }
+
+    __shared__ __align__(16) float4 q_s[NQ][HC][32];
+    __shared__ float w_s[NQ][N_HEAD];
+    for (int e = tid; e < NQ*N_HEAD; e += NT) {
+        const int i = e / N_HEAD;
+        const int h = e % N_HEAD;
+        w_s[i][h] = i < n_batch ? ((const float *) ((const char *) W + (int64_t) i*nbw1 + i_stream*nbw3))[h] : 0.0f;
+    }
+
+    const char * q_base = (const char *) Q + i_stream*nbq3;
+    float score[NQ];
+#pragma unroll
+    for (int i = 0; i < NQ; ++i) {
+        score[i] = 0.0f;
+    }
+
+    for (int h0 = 0; h0 < N_HEAD; h0 += HC) {
+        __syncthreads();   // previous chunk's q_s reads are done (and w_s is written)
+        for (int e = tid; e < NQ*HC*32; e += NT) {
+            const int i  = e / (HC*32);
+            const int hh = (e / 32) % HC;
+            const int c4 = e % 32;
+            q_s[i][hh][c4] = i < n_batch ? ((const float4 *) (q_base + (int64_t) i*nbq2 + (int64_t) (h0 + hh)*nbq1))[c4]
+                                         : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+        __syncthreads();
+#pragma unroll 4
+        for (int hh = 0; hh < HC; ++hh) {
+#pragma unroll
+            for (int i = 0; i < NQ; ++i) {
+                float t = sub<0, 8>::run(kr, q_s[i][hh], r);
+                t = t + __shfl_xor_sync(0xffffffff, t, 1, 4);   // (t0 + t1), (t2 + t3)
+                t = t + __shfl_xor_sync(0xffffffff, t, 2, 4);   // (t0 + t1) + (t2 + t3)
+                const float w_val = w_s[i][h0 + hh];
+                float sum = t;
+                // ReLU, weight
+                sum = (sum > 0.0f) ? sum : 0.0f;
+                score[i] += sum * w_val;
+            }
+        }
+    }
+
+    if (g == 0 && ip < n_kv) {
+#pragma unroll
+        for (int i = 0; i < NQ; ++i) {
+            if (i < n_batch) {
+                ((float *) ((char *) dst + (int64_t) i*nb1 + i_stream*nb3))[ip] = score[i] + mval[i];
+            }
+        }
+    }
+}
+
+static bool lightning_indexer_use_decode(const ggml_tensor * k, int64_t n_batch) {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_LI_DECODE"); return e == nullptr || atoi(e) != 0; }();
+    return on && k->type == GGML_TYPE_F32 && n_batch >= 1 && n_batch <= 8;
+}
+#endif // defined(GGML_USE_HIP)
+
 // GGML_CUDA_LI_TILED: unset/1 = tiled kernel for f32 K when the batch has >= GGML_CUDA_LI_TILED_MIN queries (default 32;
 // MI100, 8192 pools: vec/tiled = 0.20x at 1 query, 0.58x at 8, 0.99x at 16, 1.80x at 32, 2.84x at 128), 0 = never,
 // 2 = always
@@ -790,6 +944,44 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
         }
         return;
     }
+
+#if defined(GGML_USE_HIP)
+    if (n_embd == 128 && (n_head == 64 || n_head == 32) && lightning_indexer_use_decode(k, n_batch)) {
+        dim3 block(li_dec::NT, 1, 1);
+        dim3 grid((n_kv + li_dec::KPB - 1) / li_dec::KPB, 1, n_stream);
+        auto launch = [&](auto kern) {
+            kern<<<grid, block, 0, ctx.stream()>>>(
+                q_d, k_d, w_d, m_d, dst_d,
+                n_stream, n_batch, n_kv,
+                nb1, nb2, nb3,
+                nbq1, nbq2, nbq3,
+                nbk1, nbk2, nbk3,
+                nbw1, nbw2, nbw3,
+                nbm1, nbm2, nbm3,
+                nem3);
+        };
+        // NQ = queries per block (n_batch rounded up to 1, 2, 4, 8: the drafter scores 1, the verify 3); LDS: NQ x HC x
+        // 512 B of Q (<= 32 KB) + NQ x N_HEAD floats of W
+        auto go = [&](auto nh_tag) {
+            constexpr int64_t NH = decltype(nh_tag)::value;
+            if (n_batch == 1) {
+                launch(lightning_indexer_kernel_decode_f32<NH, 1, 32>);
+            } else if (n_batch == 2) {
+                launch(lightning_indexer_kernel_decode_f32<NH, 2, 32>);
+            } else if (n_batch <= 4) {
+                launch(lightning_indexer_kernel_decode_f32<NH, 4, 16>);
+            } else {
+                launch(lightning_indexer_kernel_decode_f32<NH, 8, 8>);
+            }
+        };
+        if (n_head == 64) {
+            go(std::integral_constant<int64_t, 64>{});
+        } else {
+            go(std::integral_constant<int64_t, 32>{});
+        }
+        return;
+    }
+#endif // defined(GGML_USE_HIP)
 
     if (n_embd == 128 && n_head == 64) {
 #if !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
