@@ -11052,6 +11052,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             }
         }
     }
+    // GLM-5.3-Flash DSA pool selection in decode: k = 512 pools over n_kv/4 + 2*n_seqs columns, 1..18 rows (6 streams x 3),
+    // and the radix path's boundaries (1025 = smallest radix shape, 32770/32780 = a full 128k slot)
+    for (int64_t ncols : {1025, 2051, 8258, 32770, 32780}) {
+        for (int nrows : {1, 3, 18, 33}) {
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {ncols, nrows, 1, 1}, 512));
+            test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {ncols, nrows, 1, 1}, 512, true));
+        }
+    }
     for (int k : {4, 8, 16, 32}) {
         for (int nrows : {1, 8, 16}) {
             test_cases.emplace_back(new test_top_k(GGML_TYPE_F32, {202048, nrows, 1, 1}, k));
@@ -11453,14 +11461,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     }
 
     // few-token expert-dedup MoE kernels (mmvq-moe.cu) at their shapes (Qwen3.8 K=2560, GLM-5.3 K=4096 gate/up and
-    // K=2048 Q5_K down), 1..8 tokens; 32 experts so tokens share experts; 72 rows for a partial row tile, 76 for a
-    // partial 8-row group
+    // K=2048 down in Q5_K (UD quant) and Q4_K (rune quant)), 1..8 tokens; 32 experts so tokens share experts; 72 rows
+    // for a partial row tile, 76 for a partial 8-row group
     for (int n_tok : {1, 2, 3, 4, 5, 6, 7, 8}) {
         for (bool b : {false, true}) {
             for (int rows : {72, 76}) {
                 test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32, 8, b, rows, n_tok, 4096));
                 test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32, 8, b, rows, n_tok, 2560));
                 test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 32, 8, b, rows, n_tok, 2048));
+                test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32, 8, b, rows, n_tok, 2048));
             }
         }
         for (ggml_glu_op op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_SWIGLU_CLAMP}) {
