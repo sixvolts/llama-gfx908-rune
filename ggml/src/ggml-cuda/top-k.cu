@@ -362,6 +362,217 @@ static void top_k_radix_cuda(
         <<<nrows, BLOCK_SIZE, 0, stream>>>(src, dst, states, ncols, k);
 }
 
+// Fused few-row top-k (decode on GLM-5.3-Flash: 1..18 rows of up to ~33k pool scores, k = 512): one 1024-thread
+// workgroup per row and one launch instead of top_k_radix_cuda's 12 (whose launch floor alone is ~54 us per call).
+// BIT-EXACT with top_k_radix_cuda: the k-th key and the tie rank come from the same exact 8-bit radix select (the digit
+// is picked with the same integer suffix scan as top_k_radix_select), the entries above the k-th key are written in
+// the radix gather's order (blocks_per_row = min(ceil(ncols/1024), 64) strided 256-column chunks, block-major, then
+// (j, t) order inside a block) and the first `rank` ties in column order. Histogram increments are aggregated per
+// wave and distinct bin (ReLU'd scores fall into a handful of first-digit bins); every count is an integer, so the
+// result does not depend on atomic order. The row is re-read from L2 in each phase (<= 128 KB, just written by the
+// indexer) instead of being kept in registers. GGML_CUDA_TOPK_FUSED=0 keeps the radix path.
+#define TOP_K_FUSED_NT        1024
+#define TOP_K_FUSED_MAX_COLS  32832    // blocks_per_row <= 33 -> <= 132 chunks
+#define TOP_K_FUSED_MAX_ROWS  32
+#define TOP_K_FUSED_MAX_CHUNK 136
+
+static __global__ void __launch_bounds__(TOP_K_FUSED_NT, 1) top_k_fused_kernel(
+        const float * __restrict__ src, int * __restrict__ dst, const int ncols, const int k) {
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps    = TOP_K_FUSED_NT / warp_size;
+    constexpr int sel_warps = 256 / warp_size;               // the waves that hold the 256 histogram bins
+    constexpr int grp_warps = 256 / warp_size;               // waves per 256-column group
+    const int tid  = threadIdx.x;
+    const int lane = tid % warp_size;
+    const int warp = tid / warp_size;
+    const unsigned long long lt_mask = (1ULL << lane) - 1;   // lanes below this one
+    const float * row_src = src + (size_t) blockIdx.x * ncols;
+    int         * row_dst = dst + (size_t) blockIdx.x * k;
+
+    __shared__ int      hist[256];
+    __shared__ int      warp_tot[nwarps];
+    __shared__ int      s_chosen;
+    __shared__ int      s_rank;
+    __shared__ uint32_t s_prefix;
+    __shared__ int      chunk_base[TOP_K_FUSED_MAX_CHUNK];
+    __shared__ int      chunk_wcnt[TOP_K_FUSED_MAX_CHUNK][grp_warps];
+
+    // 1. radix select of the k-th key, 8 bits per pass from the top
+    uint32_t prefix = 0;
+    uint32_t pmask  = 0;
+    int      rank   = k;
+    for (int shift = 24; shift >= 0; shift -= 8) {
+        if (tid < 256) {
+            hist[tid] = 0;
+        }
+        __syncthreads();
+        for (int c0 = 0; c0 < ncols; c0 += TOP_K_FUSED_NT) {
+            const int col = c0 + tid;
+            bool valid = false;
+            int  bin   = 0;
+            if (col < ncols) {
+                const uint32_t key = top_k_float_to_ordered(row_src[col]);
+                valid = (key & pmask) == prefix;
+                bin   = (key >> shift) & 255;
+            }
+            unsigned long long act = __ballot(valid);
+            while (act) {                                        // one LDS add per (wave, distinct bin)
+                const int leader = __ffsll((unsigned long long) act) - 1;
+                const int b      = __shfl(bin, leader, warp_size);
+                const unsigned long long same = __ballot(valid && bin == b);
+                if (lane == leader) {
+                    atomicAdd(&hist[b], (int) __popcll(same));
+                }
+                if (bin == b) {
+                    valid = false;
+                }
+                act &= ~same;
+            }
+        }
+        __syncthreads();
+
+        // the digit: highest bin whose inclusive suffix count reaches rank (0 if none), as in top_k_radix_select
+        const int count = tid < 256 ? hist[tid] : 0;
+        int sfx = count;
+#pragma unroll
+        for (int off = 1; off < warp_size; off <<= 1) {
+            const int v = __shfl_down(sfx, off, warp_size);
+            if (lane + off < warp_size) {
+                sfx += v;
+            }
+        }
+        if (lane == 0 && warp < sel_warps) {
+            warp_tot[warp] = sfx;
+        }
+        if (tid == 0) {
+            s_chosen = 0;
+        }
+        __syncthreads();
+        if (tid < 256) {
+            for (int w = warp + 1; w < sel_warps; ++w) {
+                sfx += warp_tot[w];
+            }
+            if (tid > 0 && sfx >= rank) {
+                atomicMax(&s_chosen, tid);
+            }
+        }
+        __syncthreads();
+        if (tid == s_chosen) {
+            s_rank   = rank - (sfx - count);
+            s_prefix = prefix | ((uint32_t) tid << shift);
+        }
+        __syncthreads();
+        prefix = s_prefix;
+        rank   = s_rank;
+        pmask |= 255u << shift;
+    }
+    const uint32_t thr = prefix;   // the k-th key; `rank` of its ties are taken
+
+    // 2. entries above thr: per (strided chunk, wave) counts, chunk c = b*J + j covers columns b*256 + j*bpr*256 + t
+    const int bpr     = min((ncols + 1023) / 1024, 64);
+    const int J       = (ncols + bpr*256 - 1) / (bpr*256);
+    const int nchunks = bpr*J;
+    const int grp     = tid / 256;
+    const int t       = tid % 256;
+    const int gw      = t / warp_size;
+    for (int c = grp; c < nchunks; c += TOP_K_FUSED_NT/256) {
+        const int b   = c / J;
+        const int j   = c % J;
+        const int col = b*256 + j*bpr*256 + t;
+        const bool gt = col < ncols && top_k_float_to_ordered(row_src[col]) > thr;
+        const unsigned long long m = __ballot(gt);
+        if (lane == 0) {
+            chunk_wcnt[c][gw] = (int) __popcll(m);
+        }
+    }
+    __syncthreads();
+    if (warp == 0) {                                     // exclusive scan of the chunk totals in chunk order
+        constexpr int per_lane = (TOP_K_FUSED_MAX_CHUNK + warp_size - 1) / warp_size;
+        int v[per_lane];
+        int s = 0;
+#pragma unroll
+        for (int u = 0; u < per_lane; ++u) {
+            const int c = lane*per_lane + u;
+            int tot = 0;
+            if (c < nchunks) {
+#pragma unroll
+                for (int w = 0; w < grp_warps; ++w) {
+                    tot += chunk_wcnt[c][w];
+                }
+            }
+            v[u] = tot;
+            s += tot;
+        }
+        int incl = s;                                    // inclusive prefix over lanes
+#pragma unroll
+        for (int off = 1; off < warp_size; off <<= 1) {
+            const int x = __shfl_up(incl, off, warp_size);
+            if (lane >= off) {
+                incl += x;
+            }
+        }
+        int run = incl - s;
+#pragma unroll
+        for (int u = 0; u < per_lane; ++u) {
+            const int c = lane*per_lane + u;
+            if (c < nchunks) {
+                chunk_base[c] = run;
+            }
+            run += v[u];
+        }
+    }
+    __syncthreads();
+    for (int c = grp; c < nchunks; c += TOP_K_FUSED_NT/256) {
+        const int b   = c / J;
+        const int j   = c % J;
+        const int col = b*256 + j*bpr*256 + t;
+        const bool gt = col < ncols && top_k_float_to_ordered(row_src[col]) > thr;
+        const unsigned long long m = __ballot(gt);
+        if (gt) {
+            int pos = chunk_base[c];
+            for (int w = 0; w < gw; ++w) {
+                pos += chunk_wcnt[c][w];
+            }
+            row_dst[pos + (int) __popcll(m & lt_mask)] = col;
+        }
+    }
+
+    // 3. the first `rank` ties in column order, written after the k - rank greater entries
+    int found = 0;
+    for (int c0 = 0; c0 < ncols && found < rank; c0 += TOP_K_FUSED_NT) {
+        const int col = c0 + tid;
+        const bool eq = col < ncols && top_k_float_to_ordered(row_src[col]) == thr;
+        const unsigned long long m = __ballot(eq);
+        __syncthreads();                                 // previous iteration's warp_tot reads are done
+        if (lane == 0) {
+            warp_tot[warp] = (int) __popcll(m);
+        }
+        __syncthreads();
+        int before = found;
+        int total  = 0;
+        for (int w = 0; w < nwarps; ++w) {
+            const int x = warp_tot[w];
+            before += w < warp ? x : 0;
+            total  += x;
+        }
+        const int pos = before + (int) __popcll(m & lt_mask);
+        if (eq && pos < rank) {
+            row_dst[k - rank + pos] = col;
+        }
+        found += total;
+    }
+}
+
+static bool top_k_fused_cuda(const float * src, int * dst, int ncols, int nrows, int k, cudaStream_t stream) {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_TOPK_FUSED"); return e == nullptr || atoi(e) != 0; }();
+    if (!on || ncols <= 1024 || ncols > TOP_K_FUSED_MAX_COLS || nrows > TOP_K_FUSED_MAX_ROWS || k > ncols) {
+        return false;
+    }
+    top_k_fused_kernel<<<nrows, TOP_K_FUSED_NT, 0, stream>>>(src, dst, ncols, k);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 #endif // !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
 
 #if !defined(GGML_CUDA_USE_CUB) && defined(GGML_USE_HIP)
@@ -532,7 +743,8 @@ void ggml_cuda_op_top_k(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 #else                             // GGML_CUDA_USE_CUB
 #if defined(GGML_USE_HIP)
     if (ncols > 1024) {
-        if (!top_k_small_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream)) {
+        if (!top_k_small_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream) &&
+            !top_k_fused_cuda(src0_d, dst_d, ncols, nrows, k, stream)) {
             top_k_radix_cuda(pool, src0_d, dst_d, ncols, nrows, k, stream);
         }
     } else {
