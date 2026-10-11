@@ -1431,20 +1431,84 @@ ggml_cuda_q8_cache & ggml_cuda_q8_cache_get(int device) {
     return caches[device];
 }
 
+// Cache key of a q8_1 activation: the q8_1 rows are row r of src1 in (i3, i2, i1) order, so two src1 that resolve to
+// the same producing tensor, offset, row length and affine row sequence quantize to the same bytes in the same order -
+// e.g. the shared expert's [n_embd, n_tokens] input and MUL_MAT_ID's reshaped [n_embd, 1, n_tokens] view of it. Only
+// pure RESHAPE/VIEW ops are walked (an in-place op's result is its own node, so data written later is a different key).
+// Only tensors whose bytes live in their own ggml buffer are cached: MUL_MAT_ID's per-expert fallback passes stack
+// tensors over pool memory, whose address and contents repeat across experts and ops.
+static bool ggml_cuda_q8_cache_key(const ggml_tensor * src1, ggml_cuda_q8_cache_entry & k) {
+    if (src1->nb[0] != sizeof(float) || src1->buffer == nullptr) {
+        return false;
+    }
+    const char * buf_base = (const char *) ggml_backend_buffer_get_base(src1->buffer);
+    if ((const char *) src1->data < buf_base || (const char *) src1->data >= buf_base + ggml_backend_buffer_get_size(src1->buffer)) {
+        return false;
+    }
+    size_t stride = 0, next = 0;
+    bool have = false;
+    for (int d = 1; d < 4; ++d) {
+        if (src1->ne[d] == 1) {
+            continue;
+        }
+        if (have && src1->nb[d] != next) {
+            return false;
+        }
+        if (!have) {
+            stride = src1->nb[d];
+            have = true;
+        }
+        next = src1->ne[d]*src1->nb[d];
+    }
+    const ggml_tensor * base = src1;
+    while ((base->op == GGML_OP_RESHAPE || base->op == GGML_OP_VIEW) && base->src[0] != nullptr) {
+        base = base->src[0];
+    }
+    k.base   = base;
+    k.data   = src1->data;
+    k.offs   = (const char *) src1->data - (const char *) base->data;
+    k.ne10   = src1->ne[0];
+    k.nrows  = src1->ne[1]*src1->ne[2]*src1->ne[3];
+    k.row_nb = have ? stride : 0;
+    return true;
+}
+
 void ggml_cuda_q8_cache_begin(ggml_backend_cuda_context & ctx) {
     static const bool enabled = !(getenv("GGML_CUDA_Q8_CACHE") && atoi(getenv("GGML_CUDA_Q8_CACHE")) == 0);
     ggml_cuda_q8_cache & c = ggml_cuda_q8_cache_get(ctx.device);
     c.entries.clear();
     c.hits = 0;
     c.misses = 0;
+    c.side = 0;
     c.active = enabled;
+}
+
+void * ggml_cuda_q8_cache_reserve(ggml_backend_cuda_context & ctx, const ggml_tensor * t) {
+    static const bool enabled = !getenv("GGML_CUDA_Q8_SIDE") || atoi(getenv("GGML_CUDA_Q8_SIDE")) != 0;
+    ggml_cuda_q8_cache & cache = ggml_cuda_q8_cache_get(ctx.device);
+    ggml_cuda_q8_cache_entry e;
+    if (!enabled || !cache.active || t->type != GGML_TYPE_F32 || !ggml_cuda_q8_cache_key(t, e)) {
+        return nullptr;
+    }
+    e.bytes = e.nrows * GGML_PAD(e.ne10, MATRIX_ROW_PADDING) * sizeof(block_q8_1)/QK8_1;
+    for (auto & o : cache.entries) {
+        if (o.base == e.base && o.data == e.data) {
+            return nullptr;   // already quantized in this graph
+        }
+    }
+    e.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), e.bytes);
+    e.side = true;
+    void * p = e.buf->get();
+    cache.entries.push_back(std::move(e));
+    cache.side++;
+    return p;
 }
 
 void ggml_cuda_q8_cache_end(ggml_backend_cuda_context & ctx) {
     static const bool stats = getenv("GGML_CUDA_Q8_CACHE_STATS") && atoi(getenv("GGML_CUDA_Q8_CACHE_STATS"));
     ggml_cuda_q8_cache & c = ggml_cuda_q8_cache_get(ctx.device);
     if (stats && (c.hits + c.misses) > 0) {
-        GGML_LOG_INFO("q8 cache dev%d: %zu quantize launches saved, %zu issued\n", ctx.device, c.hits, c.misses);
+        GGML_LOG_WARN("q8 cache dev%d: %zu quantize launches saved, %zu issued, %zu written by producers\n", ctx.device, c.hits, c.misses, c.side);
     }
     while (!c.entries.empty()) {   // release in reverse allocation order (pool-friendly)
         c.entries.pop_back();
@@ -1541,19 +1605,33 @@ void ggml_cuda_mul_mat_vec_q(
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
         ggml_cuda_q8_cache & cache = ggml_cuda_q8_cache_get(ctx.device);
-        if (!ids && cache.active) {
+        static const bool cache_ids = !getenv("GGML_CUDA_Q8_CACHE_IDS") || atoi(getenv("GGML_CUDA_Q8_CACHE_IDS")) != 0;
+        ggml_cuda_q8_cache_entry key;
+        if (cache.active && (!ids || cache_ids) && ggml_cuda_q8_cache_key(src1, key)) {
+            key.bytes = q8_bytes;
             for (auto & e : cache.entries) {
-                if (e.t == src1 && e.data == src1->data && e.bytes == q8_bytes &&
-                    memcmp(e.ne, src1->ne, sizeof(e.ne)) == 0 && memcmp(e.nb, src1->nb, sizeof(e.nb)) == 0) {
+                if (e.base == key.base && e.data == key.data && e.offs == key.offs && e.ne10 == key.ne10 && e.nrows == key.nrows &&
+                    e.row_nb == key.row_nb && e.bytes == key.bytes) {
                     src1_q8_1_d = e.buf->get();
                     cache.hits++;
+                    // GGML_CUDA_Q8_SIDE_VERIFY=1 (debug, syncs every call): re-quantize a producer-written entry and compare the bytes
+                    static const bool side_verify = getenv("GGML_CUDA_Q8_SIDE_VERIFY") && atoi(getenv("GGML_CUDA_Q8_SIDE_VERIFY"));
+                    if (side_verify && e.side) {
+                        ggml_cuda_pool_alloc<char> ref(ctx.pool(), q8_bytes);
+                        quantize_row_q8_1_cuda(src1_d, nullptr, ref.get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+                        std::vector<char> a(q8_bytes), b(q8_bytes);
+                        CUDA_CHECK(cudaMemcpyAsync(a.data(), e.buf->get(), q8_bytes, cudaMemcpyDeviceToHost, stream));
+                        CUDA_CHECK(cudaMemcpyAsync(b.data(), ref.get(), q8_bytes, cudaMemcpyDeviceToHost, stream));
+                        CUDA_CHECK(cudaStreamSynchronize(stream));
+                        size_t nd = 0;
+                        for (size_t i = 0; i < q8_bytes; ++i) { nd += a[i] != b[i]; }
+                        GGML_LOG_WARN("Q8SIDE dev%d src1=%s bytes=%zu differing=%zu%s\n", ctx.device, src1->name, q8_bytes, nd, nd ? " MISMATCH" : "");
+                    }
                     break;
                 }
             }
             if (!src1_q8_1_d) {
-                ggml_cuda_q8_cache_entry e;
-                e.t = src1; e.data = src1->data; e.bytes = q8_bytes;
-                memcpy(e.ne, src1->ne, sizeof(e.ne)); memcpy(e.nb, src1->nb, sizeof(e.nb));
+                ggml_cuda_q8_cache_entry e = std::move(key);
                 e.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_bytes);
                 quantize_row_q8_1_cuda(src1_d, nullptr, e.buf->get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
                 src1_q8_1_d = e.buf->get();

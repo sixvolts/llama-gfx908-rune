@@ -1,12 +1,32 @@
 #include "common.cuh"
 #include "dsv4-hc.cuh"
+#include "mmvq.cuh"
 
-// llama-halo-hybrid's q8_1 side-copy registry (its hc.cuh) is not in this tree: the fused boundary norm writes no
-// q8_1 copy, so the GEMV behind it quantizes the normed row as before
-static block_q8_1 * ggml_cuda_q8_side_reserve_rows(ggml_backend_cuda_context &, const ggml_tensor *, int64_t, int64_t, int64_t) {
-    return nullptr;
+// q8_1 side copy of the fused boundary norm's output: reserved in the mmvq activation cache (ggml_cuda_q8_cache) under
+// the MUL node, so the GEMVs that read the normed row take it instead of launching quantize_q8_1 on it. Both writers
+// below produce quantize_q8_1's bytes: per 32 columns amax (order-free), d = amax/127, roundf(x/d), and the block sum
+// in warp_reduce_sum<32>'s xor-butterfly order. nullptr (no copy) above 8 tokens, for non-contiguous rows, or with
+// GGML_CUDA_Q8_SIDE=0.
+static block_q8_1 * ggml_cuda_q8_side_reserve_rows(ggml_backend_cuda_context & ctx, const ggml_tensor * t, int64_t ne0, int64_t nrows, int64_t row_stride) {
+    if (nrows > 8 || row_stride != ne0 || ne0 % MATRIX_ROW_PADDING != 0) {
+        return nullptr;
+    }
+    return (block_q8_1 *) ggml_cuda_q8_cache_reserve(ctx, t);
 }
-static __device__ __forceinline__ void q8_side_store(block_q8_1 *, const int64_t, const float) {}
+
+// one column per lane, 32 consecutive columns per 32-lane group (all lanes of the group active): quantize_q8_1's code
+static __device__ __forceinline__ void q8_side_store(block_q8_1 * q8, const int64_t i, const float v) {
+    float amax = fabsf(v);
+    float sum  = v;
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(v / d);
+    q8[i / QK8_1].qs[i % QK8_1] = q;
+    if (i % QK8_1 == 0) {
+        q8[i / QK8_1].ds = make_half2(d, sum);
+    }
+}
 
 
 static constexpr int DSV4_HC = 4;
@@ -881,10 +901,26 @@ static __global__ void __launch_bounds__(DSV4_HC_SPLIT_T) dsv4_hc_mix_split_f32(
             *(float4 *) (nrow + j0 + 4*q) = make_float4(v[4*q + 0], v[4*q + 1], v[4*q + 2], v[4*q + 3]);
         }
         if (ext.q8) {
+            static_assert(NL == 16, "a q8_1 block is this thread's 16 columns and its neighbour's");
 #pragma unroll
-            for (int k = 0; k < NL; ++k) { amax = fmaxf(amax, fabsf(v[k])); sum += v[k]; }
+            for (int k = 0; k < NL; ++k) { amax = fmaxf(amax, fabsf(v[k])); }
             amax = fmaxf(amax, __shfl_xor_sync(0xffffffff, amax, 1, WARP_SIZE));
-            sum += __shfl_xor_sync(0xffffffff, sum, 1, WARP_SIZE);
+            // block sum in warp_reduce_sum<32>'s order (lane c holds column c; xor offsets 16, 8, 4, 2, 1): level 16
+            // pairs column c with c + 16 = this thread's v[c] with the neighbour's v[c]; the rest is in-register
+            {
+                float s16[16];
+#pragma unroll
+                for (int k = 0; k < 16; ++k) {   // column k + column k + 16 (fp add is commutative: same in both lanes)
+                    s16[k] = v[k] + __shfl_xor_sync(0xffffffff, v[k], 1, WARP_SIZE);
+                }
+#pragma unroll
+                for (int k = 0; k < 8; ++k) { s16[k] = s16[k] + s16[k + 8]; }
+#pragma unroll
+                for (int k = 0; k < 4; ++k) { s16[k] = s16[k] + s16[k + 4]; }
+#pragma unroll
+                for (int k = 0; k < 2; ++k) { s16[k] = s16[k] + s16[k + 2]; }
+                sum = s16[0] + s16[1];
+            }
             const float d = amax / 127.0f;
             const int64_t col0 = (int64_t) it*n_embd + j0;
             block_q8_1 * b = ext.q8 + col0 / QK8_1;
