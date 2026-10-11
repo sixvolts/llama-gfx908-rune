@@ -1,11 +1,16 @@
 #include "llama-kv-cache-kpool.h"
 
 #include "llama-batch.h"
+#include "llama-impl.h"
 #include "llama-kv-cache.h"
 #include "llama-kv-cells.h"
 #include "llama-memory-hybrid.h"
 
 #include <algorithm>
+#include <chrono>
+#include <cstring>
+#include <iterator>
+#include <thread>
 #include <cmath>
 #include <cstdlib>
 #include <vector>
@@ -84,7 +89,8 @@ static void kpool_mask_row(
     }
 }
 
-void llama_kv_cache_set_input_kpool(
+// the original single-threaded implementation, kept as the byte reference for LLAMA_KPOOL_VERIFY=1
+static void llama_kv_cache_set_input_kpool_ref(
         const llama_kv_cache * kv,
               int64_t          n_kv,
               ggml_tensor    * cell_pool,
@@ -562,6 +568,597 @@ void llama_kv_cache_set_input_kpool(
                     cur_new_reps[p] = (int64_t) strm_of[s]*kv_size;
                 }
             }
+        }
+    }
+}
+
+// Per-stream work of llama_kv_cache_set_input_kpool. Same outputs as llama_kv_cache_set_input_kpool_ref, byte for byte,
+// with the per-cell passes fused: the reference walks all n_kv cells ~7 times per stream (the run-length scan, pos_at,
+// the anchor scan, the pool assignment, the completeness pass, the tail-cell scan), here one scan builds pos_at and the
+// pool bounds of every sequence (a used cell has pos >= 0, an empty one -1, so both of the reference's bound scans see
+// the same cells) and one pass assigns pools and the tail cells; pool_of (per-cell pool, read only by the dense masks,
+// cell_pool and bias) is built only when one of them is requested. Streams write disjoint slices of every output, so
+// they run on separate threads.
+struct kpool_stream_args {
+    const llama_kv_cache * kv;
+    int64_t n_kv, n_ns, n_ps, n_pools, n_tps, n_padq, n_tail, n_new_max, r, kv_size;
+    bool dense, mask_f16, kcache, rebuild;
+    size_t mask_ts;
+    const uint32_t * strm_of;
+    const llama_ubatch * ubatch;
+    int32_t * dst_pool_reps; int32_t * dst_new_cells; int64_t * dst_new_reps;
+    int32_t * dst_cell_pool; int32_t * dst_pool_cells; float * dst_bias; float * dst_pool_bias;
+    char * dst_sel_mask; char * dst_cand_mask; int32_t * dst_tail_cells; float * dst_tail_mask;
+};
+
+static void kpool_set_input_stream(const kpool_stream_args & a, const int64_t s) {
+    const llama_kv_cache * kv = a.kv;
+    const llama_ubatch * ubatch = a.ubatch;
+    const int64_t n_kv = a.n_kv, n_ps = a.n_ps, n_pools = a.n_pools, n_tps = a.n_tps, n_padq = a.n_padq;
+    const int64_t n_tail = a.n_tail, n_new_max = a.n_new_max, r = a.r;
+    const bool dense = a.dense, mask_f16 = a.mask_f16, kcache = a.kcache;
+    const size_t mask_ts = a.mask_ts;
+
+    auto seq_of = [&](int64_t ps) {
+        return n_ps == 1 ? ubatch->seq_id[s*n_tps][0] : ubatch->seq_id_unq[ps];
+    };
+
+    int32_t * cur_pool_cells = a.dst_pool_cells + s*(r*n_pools);
+    char    * cur_sel_mask   = dense ? a.dst_sel_mask  + s*(n_padq*n_kv)*mask_ts : nullptr;
+    char    * cur_cand_mask  = dense ? a.dst_cand_mask + s*(n_padq*n_kv)*mask_ts : nullptr;
+    float   * cur_pool_bias  = a.dst_pool_bias  + s*(n_tps*n_pools);
+    int32_t * cur_tail_cells = dense ? nullptr : a.dst_tail_cells + s*(n_tps*n_tail);
+    float   * cur_tail_mask  = dense ? nullptr : a.dst_tail_mask  + s*(n_tps*n_tail);
+    int32_t * cur_cell_pool  = a.dst_cell_pool ? a.dst_cell_pool + s*n_kv : nullptr;
+
+    if (!dense) {
+        std::fill(cur_tail_cells, cur_tail_cells + n_tps*n_tail, 0);
+        std::fill(cur_tail_mask,  cur_tail_mask  + n_tps*n_tail, -INFINITY);
+    }
+
+    std::fill(cur_pool_cells, cur_pool_cells + r*n_pools, 0);
+    std::fill(cur_pool_bias,  cur_pool_bias  + n_tps*n_pools, -INFINITY);
+
+    int32_t * cur_pool_reps = kcache ? a.dst_pool_reps + s*n_pools       : nullptr;
+    int32_t * cur_new_cells = kcache ? a.dst_new_cells + s*(r*n_new_max) : nullptr;
+    int64_t * cur_new_reps  = kcache ? a.dst_new_reps  + s*n_new_max     : nullptr;
+
+    int64_t n_new = 0;
+    const int32_t * any_rep_src = nullptr;
+
+    if (kcache) {
+        std::fill(cur_pool_reps, cur_pool_reps + n_pools, 0);
+        std::fill(cur_new_cells, cur_new_cells + r*n_new_max, 0);
+    }
+
+    if (!dense) {
+        // no padded query rows to fill
+    } else if (mask_f16) {
+        kpool_mask_fill((ggml_fp16_t *) (cur_sel_mask  + n_tps*n_kv*mask_ts), (n_padq - n_tps)*n_kv);
+        kpool_mask_fill((ggml_fp16_t *) (cur_cand_mask + n_tps*n_kv*mask_ts), (n_padq - n_tps)*n_kv);
+    } else {
+        kpool_mask_fill((float *) (cur_sel_mask  + n_tps*n_kv*mask_ts), (n_padq - n_tps)*n_kv);
+        kpool_mask_fill((float *) (cur_cand_mask + n_tps*n_kv*mask_ts), (n_padq - n_tps)*n_kv);
+    }
+
+    // one scan per sequence: pos_at (-1 = not this sequence's) and the pool bounds [b_min, b_max] of its cells
+    std::vector<std::vector<llama_pos>> pos_at(n_ps);
+    std::vector<int64_t> b_lo(n_ps, 0), b_hi(n_ps, 0);
+    std::vector<int64_t> run_off(n_ps), run_len(n_ps);
+    {
+        int64_t n_want = 0;
+
+        for (int64_t ps = 0; ps < n_ps; ++ps) {
+            const llama_seq_id seq = seq_of(ps);
+            const auto & cells = kv->get_cells(seq);
+
+            pos_at[ps].resize(n_kv);
+            llama_pos * pa = pos_at[ps].data();
+
+            int64_t b_min = 0;
+            int64_t b_max = 0;
+            bool    found = false;
+
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (cells.is_empty(j) || !cells.seq_has(j, seq)) {
+                    pa[j] = -1;
+                    continue;
+                }
+                const llama_pos p = cells.pos_get(j);
+                pa[j] = p;
+                const int64_t b = p/r;
+                b_min = found ? std::min(b_min, b) : b;
+                b_max = found ? std::max(b_max, b) : b;
+                found = true;
+            }
+
+            b_lo[ps] = b_min;
+            b_hi[ps] = b_max;
+            run_len[ps] = found ? b_max - b_min + 1 : 0;
+            n_want += run_len[ps];
+        }
+
+        if (n_want > n_pools) {
+            int64_t rem = n_pools;
+
+            for (int64_t ps = 0; ps < n_ps; ++ps) {
+                run_len[ps] = std::min(run_len[ps], rem/(n_ps - ps));
+                rem -= run_len[ps];
+            }
+        }
+
+        int64_t off = 0;
+        for (int64_t ps = 0; ps < n_ps; ++ps) {
+            run_off[ps] = off;
+            off += run_len[ps];
+        }
+
+        GGML_ASSERT(off <= n_pools);
+    }
+
+    const bool need_pool_of = dense || cur_cell_pool != nullptr || a.dst_bias != nullptr;
+
+    std::vector<int32_t> pool_of(need_pool_of ? n_kv : 0);
+    std::vector<int32_t> filled(n_pools);
+    std::vector<int32_t> cell_at;
+
+    int64_t n_done = 0;
+
+    for (int64_t ps = 0; ps < n_ps; ++ps) {
+        const llama_seq_id seq_of_pool = seq_of(ps);
+        const llama_pos  * pa          = pos_at[ps].data();
+
+        const int64_t n_run = run_len[ps];
+
+        int32_t * part_pool_cells = cur_pool_cells + run_off[ps]*r;
+
+        if (need_pool_of) {
+            std::fill(pool_of.begin(), pool_of.end(), -1);
+        }
+        std::fill(filled.begin(), filled.end(), 0);
+
+        const int64_t b_base = std::max(b_lo[ps], b_hi[ps] - (n_run - 1));
+
+        // sparse: positions a query's tail can reach (depends on the ubatch only)
+        llama_pos p_lo = 0;
+        llama_pos p_hi = -1;
+        bool want_cells = false;
+
+        if (!dense) {
+            bool any = false;
+
+            for (int64_t ii = 0; ii < n_tps; ++ii) {
+                const int64_t i = s*n_tps + ii;
+
+                if (ubatch->seq_id[i][0] != seq_of_pool) {
+                    continue;
+                }
+
+                const llama_pos q  = ubatch->pos[i];
+                const llama_pos ts = (q + 1)/r*r;
+
+                p_lo = any ? std::min(p_lo, ts) : ts;
+                p_hi = any ? std::max(p_hi, q)  : q;
+                any  = true;
+            }
+
+            want_cells = any && p_hi >= p_lo;
+            if (want_cells) {
+                cell_at.assign(p_hi - p_lo + 1, -1);
+            } else {
+                cell_at.clear();
+            }
+        }
+
+        // pool assignment and the tail cells in one pass (later cells win in both, as in the reference)
+        for (int64_t j = 0; j < n_kv; ++j) {
+            const llama_pos p = pa[j];
+            if (p < 0) {
+                continue;
+            }
+
+            if (want_cells && p >= p_lo && p <= p_hi) {
+                cell_at[p - p_lo] = (int32_t) j;
+            }
+
+            const int64_t bo = p/r - b_base;
+
+            if (bo < 0 || bo >= n_run) {
+                continue;
+            }
+
+            if (need_pool_of) {
+                pool_of[j] = (int32_t) bo;
+            }
+            part_pool_cells[bo*r + (p%r)] = (int32_t) j;
+            filled[bo]++;
+        }
+
+        // pool_valid = grouped_valid_keys.all(-1): the compressor consumes all r keys
+        if (need_pool_of) {
+            for (int64_t j = 0; j < n_kv; ++j) {
+                if (pool_of[j] >= 0 && filled[pool_of[j]] != (int32_t) r) {
+                    pool_of[j] = -1;
+                }
+                if (cur_cell_pool) {
+                    cur_cell_pool[j] = pool_of[j] < 0 ? 0 : pool_of[j];
+                }
+            }
+        }
+
+        if (kcache) {
+            for (int64_t p = 0; p < n_run; ++p) {
+                if (filled[p] == (int32_t) r) {
+                    cur_pool_reps[run_off[ps] + p] = part_pool_cells[p*r + (r - 1)];
+
+                    if (any_rep_src == nullptr) {
+                        any_rep_src = part_pool_cells + p*r;
+                    }
+                }
+            }
+
+            std::vector<uint8_t> touched(n_run, 0);
+
+            for (int64_t ii = 0; ii < n_tps; ++ii) {
+                const int64_t i = s*n_tps + ii;
+
+                if (ubatch->seq_id[i][0] != seq_of_pool) {
+                    continue;
+                }
+
+                const int64_t bo = ubatch->pos[i]/r - b_base;
+
+                if (bo >= 0 && bo < n_run) {
+                    touched[bo] = 1;
+                }
+            }
+
+            for (int64_t p = 0; p < n_run; ++p) {
+                if ((!touched[p] && !a.rebuild) || filled[p] != (int32_t) r) {
+                    continue;
+                }
+
+                GGML_ASSERT(n_new < n_new_max && "k-pool: more pools completed than the fixed bound");
+
+                std::copy(part_pool_cells + p*r, part_pool_cells + (p + 1)*r, cur_new_cells + n_new*r);
+
+                cur_new_reps[n_new] = (int64_t) a.strm_of[s]*a.kv_size + part_pool_cells[p*r + (r - 1)];
+
+                n_new++;
+            }
+        }
+
+        for (int64_t ii = 0; ii < n_tps; ++ii) {
+            const int64_t i = s*n_tps + ii;
+
+            if (ubatch->seq_id[i][0] != seq_of_pool) {
+                continue;
+            }
+
+            const llama_pos q = ubatch->pos[i];
+
+            GGML_ASSERT(q >= 0);
+
+            n_done++;
+
+            const llama_pos tail_start = (q + 1)/r*r;
+
+            const int64_t bo_vis = std::max<int64_t>(0, tail_start/r - b_base);
+
+            float * cur_bias = a.dst_bias ? a.dst_bias + i*n_kv : nullptr;
+
+            if (!dense) {
+                int32_t * tc = cur_tail_cells + ii*n_tail;
+                float   * tm = cur_tail_mask  + ii*n_tail;
+
+                for (llama_pos p = tail_start; p <= q; ++p) {
+                    const int32_t j = cell_at[p - p_lo];
+
+                    if (j >= 0) {
+                        tc[p - tail_start] = j;
+                        tm[p - tail_start] = 0.0f;
+                    }
+                }
+            } else if (mask_f16) {
+                char * cur_sel  = cur_sel_mask  + ii*n_kv*mask_ts;
+                char * cur_cand = cur_cand_mask + ii*n_kv*mask_ts;
+
+                kpool_mask_row((ggml_fp16_t *) cur_sel, (ggml_fp16_t *) cur_cand,
+                        pa, pool_of.data(), n_kv, q, tail_start, bo_vis);
+            } else {
+                char * cur_sel  = cur_sel_mask  + ii*n_kv*mask_ts;
+                char * cur_cand = cur_cand_mask + ii*n_kv*mask_ts;
+
+                kpool_mask_row((float *) cur_sel, (float *) cur_cand,
+                        pa, pool_of.data(), n_kv, q, tail_start, bo_vis);
+            }
+
+            if (cur_bias) {
+                for (int64_t j = 0; j < n_kv; ++j) {
+                    const bool vis    = (uint32_t) pa     [j] <= (uint32_t) q;
+                    const bool pooled = (uint32_t) pool_of[j] <  (uint32_t) bo_vis;
+
+                    cur_bias[j] = vis && pooled ? 0.0f : -INFINITY;
+                }
+            }
+
+            float * q_pool_bias = cur_pool_bias + ii*n_pools + run_off[ps];
+
+            for (int64_t p = 0; p < n_run; ++p) {
+                const bool valid   = filled[p] == (int32_t) r;
+                const bool visible = p < bo_vis;
+
+                q_pool_bias[p] = valid && visible ? 0.0f : -INFINITY;
+            }
+        }
+    }
+
+    GGML_ASSERT(n_done == n_tps && "every query must belong to a sequence of the ubatch");
+
+    if (kcache) {
+        for (int64_t p = n_new; p < n_new_max; ++p) {
+            if (any_rep_src) {
+                std::copy(any_rep_src, any_rep_src + r, cur_new_cells + p*r);
+                cur_new_reps[p] = (int64_t) a.strm_of[s]*a.kv_size + any_rep_src[r - 1];
+            } else {
+                cur_new_reps[p] = (int64_t) a.strm_of[s]*a.kv_size;
+            }
+        }
+    }
+}
+
+static void llama_kv_cache_set_input_kpool_fast(
+        const llama_kv_cache * kv,
+              int64_t          n_kv,
+              ggml_tensor    * cell_pool,
+              ggml_tensor    * pool_cells,
+              ggml_tensor    * bias,
+              ggml_tensor    * pool_bias,
+              ggml_tensor    * sel_mask,
+              ggml_tensor    * cand_mask,
+              ggml_tensor    * tail_cells,
+              ggml_tensor    * tail_mask,
+              ggml_tensor    * pool_reps,
+              ggml_tensor    * new_pool_cells,
+              ggml_tensor    * new_pool_reps,
+        const uint32_t       * strm_of,
+              int64_t          kv_size,
+              bool             rebuild,
+        const llama_ubatch   * ubatch,
+              uint32_t         kpool) {
+    GGML_ASSERT(kv != nullptr);
+    GGML_ASSERT(kpool > 0);
+
+    // dense masks (sel_mask + cand_mask) or the sparse tail (tail_cells + tail_mask), exactly one of the two
+    const bool dense = sel_mask != nullptr;
+
+    GGML_ASSERT((cand_mask  != nullptr) == dense);
+    GGML_ASSERT((tail_cells != nullptr) == !dense);
+    GGML_ASSERT((tail_mask  != nullptr) == !dense);
+
+    GGML_ASSERT(ggml_backend_buffer_is_host(pool_cells->buffer));
+    GGML_ASSERT(ggml_backend_buffer_is_host(pool_bias ->buffer));
+
+    GGML_ASSERT(pool_cells->type == GGML_TYPE_I32);
+    GGML_ASSERT(pool_bias ->type == GGML_TYPE_F32);
+
+    GGML_ASSERT(ggml_is_contiguous(pool_cells));
+    GGML_ASSERT(ggml_is_contiguous(pool_bias));
+
+    if (dense) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(sel_mask  ->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(cand_mask ->buffer));
+        GGML_ASSERT((sel_mask->type == GGML_TYPE_F16 || sel_mask->type == GGML_TYPE_F32) &&
+                "sel_mask must be f16 or f32");
+        GGML_ASSERT(cand_mask->type == sel_mask->type && "both masks must have the KQ mask's type");
+        GGML_ASSERT(ggml_is_contiguous(sel_mask));
+        GGML_ASSERT(ggml_is_contiguous(cand_mask));
+        GGML_ASSERT(sel_mask->ne[0] == n_kv);
+    } else {
+        GGML_ASSERT(ggml_backend_buffer_is_host(tail_cells->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(tail_mask ->buffer));
+        GGML_ASSERT(tail_cells->type == GGML_TYPE_I32);
+        GGML_ASSERT(tail_mask ->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(tail_cells));
+        GGML_ASSERT(ggml_is_contiguous(tail_mask));
+        GGML_ASSERT(ggml_are_same_shape(tail_cells, tail_mask));
+        GGML_ASSERT(tail_cells->ne[0] == (int64_t) kpool - 1);
+    }
+
+    const int64_t n_ns     = pool_cells->ne[1];
+    const int64_t r        = kpool;
+    const int64_t n_tokens = ubatch->n_tokens;
+
+    // [TAG_KPOOL_SEQ_PARTITION] positions are unambiguous only within one sequence, so one
+    // pool map per SEQUENCE, not per stream
+    GGML_ASSERT(n_ns == 1 || (int64_t) ubatch->n_seqs_unq == n_ns);
+
+    const int64_t n_ps    = (int64_t) ubatch->n_seqs_unq/n_ns;
+    const int64_t n_pools = pool_cells->ne[0]/r;
+
+    GGML_ASSERT(n_ps > 0 && (int64_t) ubatch->n_seqs_unq == n_ns*n_ps);
+    GGML_ASSERT(pool_cells->ne[0] % r == 0);
+    GGML_ASSERT(n_pools >= 2*n_ps);
+    GGML_ASSERT(!dense || (sel_mask->ne[2] == 1 && sel_mask->ne[3] == n_ns));
+    GGML_ASSERT(!dense || ggml_are_same_shape(cand_mask, sel_mask));
+    GGML_ASSERT(pool_bias->ne[0] == n_pools && pool_bias->ne[2] == n_ns);
+    GGML_ASSERT(n_tokens % n_ns == 0);
+
+    const int64_t n_tps  = n_tokens/n_ns;
+    const int64_t n_padq = dense ? sel_mask->ne[1] : n_tps;
+
+    GGML_ASSERT(pool_bias->ne[1] == n_tps);
+    GGML_ASSERT(n_padq >= n_tps);
+    GGML_ASSERT(dense || (tail_cells->ne[1] == n_tps && tail_cells->ne[2] == n_ns));
+
+    if (cell_pool) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(cell_pool->buffer));
+        GGML_ASSERT(cell_pool->type == GGML_TYPE_I32);
+        GGML_ASSERT(ggml_is_contiguous(cell_pool));
+        GGML_ASSERT(cell_pool->ne[0] == n_kv && cell_pool->ne[1] == n_ns);
+
+        // one row per stream, so a shared cell has nowhere to put its second pool
+        GGML_ASSERT(n_ps == 1 && "the per-cell pool view needs one sequence per stream");
+    }
+
+    if (bias) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(bias->buffer));
+        GGML_ASSERT(bias->type == GGML_TYPE_F32);
+        GGML_ASSERT(ggml_is_contiguous(bias));
+        GGML_ASSERT(bias->ne[0] == n_kv && bias->ne[1] == n_tps && bias->ne[2] == n_ns);
+    }
+
+    const bool kcache = pool_reps != nullptr;
+
+    GGML_ASSERT((new_pool_cells != nullptr) == kcache);
+    GGML_ASSERT((new_pool_reps  != nullptr) == kcache);
+
+    int64_t n_new_max = 0;
+
+    if (kcache) {
+        GGML_ASSERT(ggml_backend_buffer_is_host(pool_reps     ->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(new_pool_cells->buffer));
+        GGML_ASSERT(ggml_backend_buffer_is_host(new_pool_reps ->buffer));
+
+        GGML_ASSERT(pool_reps     ->type == GGML_TYPE_I32);
+        GGML_ASSERT(new_pool_cells->type == GGML_TYPE_I32);
+        GGML_ASSERT(new_pool_reps ->type == GGML_TYPE_I64);
+
+        GGML_ASSERT(ggml_is_contiguous(pool_reps));
+        GGML_ASSERT(ggml_is_contiguous(new_pool_cells));
+        GGML_ASSERT(ggml_is_contiguous(new_pool_reps));
+
+        GGML_ASSERT(pool_reps->ne[0] == n_pools && pool_reps->ne[1] == n_ns);
+        GGML_ASSERT(new_pool_cells->ne[0] % r == 0 && new_pool_cells->ne[1] == n_ns);
+
+        n_new_max = new_pool_cells->ne[0]/r;
+
+        GGML_ASSERT(new_pool_reps->ne[0] == n_new_max*n_ns);
+        GGML_ASSERT(strm_of != nullptr && kv_size > 0);
+    }
+
+    int32_t * dst_pool_reps = kcache ? (int32_t *) pool_reps     ->data : nullptr;
+    int32_t * dst_new_cells = kcache ? (int32_t *) new_pool_cells->data : nullptr;
+    int64_t * dst_new_reps  = kcache ? (int64_t *) new_pool_reps ->data : nullptr;
+
+    int32_t * dst_cell_pool  = cell_pool ? (int32_t *) cell_pool->data : nullptr;
+    int32_t * dst_pool_cells = (int32_t *) pool_cells->data;
+    float   * dst_bias       = bias ? (float *) bias->data : nullptr;
+    float   * dst_pool_bias  = (float   *) pool_bias ->data;
+    char    * dst_sel_mask   = dense ? (char *) sel_mask ->data : nullptr;
+    char    * dst_cand_mask  = dense ? (char *) cand_mask->data : nullptr;
+    int32_t * dst_tail_cells = dense ? nullptr : (int32_t *) tail_cells->data;
+    float   * dst_tail_mask  = dense ? nullptr : (float   *) tail_mask ->data;
+
+    const bool   mask_f16 = dense && sel_mask->type == GGML_TYPE_F16;
+    const size_t mask_ts  = dense ? ggml_type_size(sel_mask->type) : 0;
+    const int64_t n_tail  = r - 1;
+
+    kpool_stream_args args;
+    args.kv = kv; args.n_kv = n_kv; args.n_ns = n_ns; args.n_ps = n_ps; args.n_pools = n_pools; args.n_tps = n_tps;
+    args.n_padq = n_padq; args.n_tail = n_tail; args.n_new_max = n_new_max; args.r = r; args.kv_size = kv_size;
+    args.dense = dense; args.mask_f16 = mask_f16; args.kcache = kcache; args.rebuild = rebuild; args.mask_ts = mask_ts;
+    args.strm_of = strm_of; args.ubatch = ubatch;
+    args.dst_pool_reps = dst_pool_reps; args.dst_new_cells = dst_new_cells; args.dst_new_reps = dst_new_reps;
+    args.dst_cell_pool = dst_cell_pool; args.dst_pool_cells = dst_pool_cells; args.dst_bias = dst_bias;
+    args.dst_pool_bias = dst_pool_bias; args.dst_sel_mask = dst_sel_mask; args.dst_cand_mask = dst_cand_mask;
+    args.dst_tail_cells = dst_tail_cells; args.dst_tail_mask = dst_tail_mask;
+
+    // LLAMA_KPOOL_THREADS: max threads over streams (default 8; 1 = serial). Spawned per call: ~20 us each against
+    // ~1 ms of work per 32k-cell stream, so only for enough cells
+    static const int max_thr = getenv("LLAMA_KPOOL_THREADS") ? std::max(1, atoi(getenv("LLAMA_KPOOL_THREADS"))) : 8;
+    const int64_t n_thr = n_kv*n_ns >= 16384 ? std::min<int64_t>(n_ns, max_thr) : 1;
+
+    if (n_thr <= 1) {
+        for (int64_t s = 0; s < n_ns; ++s) {
+            kpool_set_input_stream(args, s);
+        }
+    } else {
+        std::vector<std::thread> workers;
+        workers.reserve(n_thr - 1);
+        for (int64_t t = 1; t < n_thr; ++t) {
+            workers.emplace_back([&args, t, n_thr, n_ns] {
+                for (int64_t s = t; s < n_ns; s += n_thr) {
+                    kpool_set_input_stream(args, s);
+                }
+            });
+        }
+        for (int64_t s = 0; s < n_ns; s += n_thr) {
+            kpool_set_input_stream(args, s);
+        }
+        for (auto & w : workers) {
+            w.join();
+        }
+    }
+}
+
+// LLAMA_KPOOL_VERIFY=1 (debug): also run the reference implementation and compare every output byte (aborts on a
+// difference). LLAMA_KPOOL_TIMING=1: log the mean host time of this input every 256 calls.
+void llama_kv_cache_set_input_kpool(
+        const llama_kv_cache * kv,
+              int64_t          n_kv,
+              ggml_tensor    * cell_pool,
+              ggml_tensor    * pool_cells,
+              ggml_tensor    * bias,
+              ggml_tensor    * pool_bias,
+              ggml_tensor    * sel_mask,
+              ggml_tensor    * cand_mask,
+              ggml_tensor    * tail_cells,
+              ggml_tensor    * tail_mask,
+              ggml_tensor    * pool_reps,
+              ggml_tensor    * new_pool_cells,
+              ggml_tensor    * new_pool_reps,
+        const uint32_t       * strm_of,
+              int64_t          kv_size,
+              bool             rebuild,
+        const llama_ubatch   * ubatch,
+              uint32_t         kpool) {
+    static const bool verify = getenv("LLAMA_KPOOL_VERIFY") && atoi(getenv("LLAMA_KPOOL_VERIFY"));
+    static const bool timing = getenv("LLAMA_KPOOL_TIMING") && atoi(getenv("LLAMA_KPOOL_TIMING"));
+    static const bool use_ref = getenv("LLAMA_KPOOL_REF") && atoi(getenv("LLAMA_KPOOL_REF"));
+
+    const auto t0 = std::chrono::steady_clock::now();
+    if (use_ref) {
+        llama_kv_cache_set_input_kpool_ref(kv, n_kv, cell_pool, pool_cells, bias, pool_bias, sel_mask, cand_mask,
+                tail_cells, tail_mask, pool_reps, new_pool_cells, new_pool_reps, strm_of, kv_size, rebuild, ubatch, kpool);
+    } else {
+        llama_kv_cache_set_input_kpool_fast(kv, n_kv, cell_pool, pool_cells, bias, pool_bias, sel_mask, cand_mask,
+                tail_cells, tail_mask, pool_reps, new_pool_cells, new_pool_reps, strm_of, kv_size, rebuild, ubatch, kpool);
+    }
+    const auto t1 = std::chrono::steady_clock::now();
+
+    if (timing) {
+        static double acc_ms = 0.0;
+        static int    n_call = 0;
+        acc_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
+        if (++n_call % 256 == 0) {
+            LLAMA_LOG_WARN("kpool input: %.3f ms per call (mean of 256; n_kv %lld, streams %lld)\n", acc_ms/256,
+                    (long long) n_kv, (long long) pool_cells->ne[1]);
+            acc_ms = 0.0;
+        }
+    }
+
+    if (verify && !use_ref) {
+        ggml_tensor * outs[] = { cell_pool, pool_cells, bias, pool_bias, sel_mask, cand_mask, tail_cells, tail_mask,
+                                 pool_reps, new_pool_cells, new_pool_reps };
+        std::vector<std::vector<char>> fast;
+        for (ggml_tensor * t : outs) {
+            fast.emplace_back();
+            if (t) {
+                fast.back().assign((const char *) t->data, (const char *) t->data + ggml_nbytes(t));
+            }
+        }
+        llama_kv_cache_set_input_kpool_ref(kv, n_kv, cell_pool, pool_cells, bias, pool_bias, sel_mask, cand_mask,
+                tail_cells, tail_mask, pool_reps, new_pool_cells, new_pool_reps, strm_of, kv_size, rebuild, ubatch, kpool);
+        static int64_t n_checked = 0;
+        for (size_t k = 0; k < std::size(outs); ++k) {
+            if (outs[k] && memcmp(fast[k].data(), outs[k]->data, fast[k].size()) != 0) {
+                LLAMA_LOG_ERROR("kpool input: output %zu differs from the reference (n_kv %lld)\n", k, (long long) n_kv);
+                GGML_ABORT("LLAMA_KPOOL_VERIFY mismatch");
+            }
+        }
+        if (++n_checked % 256 == 0) {
+            LLAMA_LOG_WARN("kpool input: %lld calls verified identical to the reference\n", (long long) n_checked);
         }
     }
 }
