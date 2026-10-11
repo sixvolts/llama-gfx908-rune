@@ -2,6 +2,9 @@
 #include "ggml-cuda/common.cuh"
 
 #include <cstdlib>
+#include <cstring>
+#include <memory>
+#include <vector>
 
 // NPRE > 0 (short batches, e.g. the 3-token MTP verify): every token's k/q/v/g/beta is loaded before the recurrence
 // starts, so the per-token global latency is not exposed on the serial state chain. Arithmetic and reduction order
@@ -644,6 +647,129 @@ static void launch_gated_delta_net_lpc(
         sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
 }
 
+
+// Decode-shaped KDA step (1 token per sequence, several sequences): BIT-EXACT with gated_delta_net_cuda<S_v, true, ...>.
+// The reference gives every state column its own wave, so each wave reloads the head's k, q, g and recomputes expf(g)
+// for one column and then waits on two dependent 64-lane reductions: at 6 sequences x 64 heads (12288 blocks) the
+// step is latency bound (MI100 ~127 us for ~48 MB of state traffic). Here one wave owns CPW columns of a head: k, q
+// and expf(g) are loaded/computed once (the same values every column's wave computed), all CPW state columns are
+// loaded together, and each column runs the reference's statements in order (kv_shard over rows 0..R-1, the same
+// warp_reduce_sum<64>, delta, the fused update + attn partial, the same reduction, attn * scale): the CPW columns are
+// independent chains, so interleaving them changes no column's arithmetic. GGML_GDN_DEC=0 keeps the reference.
+template <int S_v, bool keep_rs_t, int CPW>
+__global__ void __launch_bounds__(64 * 4, 2)
+gated_delta_net_kda_dec_cuda(const float * q, const float * k, const float * v, const float * g, const float * beta,
+        const float * curr_state, float * dst, float * state, int64_t H, int64_t n_tokens, int64_t n_seqs,
+        int64_t sq1, int64_t sq2, int64_t sq3, int64_t sv1, int64_t sv2, int64_t sv3, int64_t sb1, int64_t sb2, int64_t sb3,
+        const uint3 neqk1_magic, const uint3 rq3_magic, float scale, int64_t state_slot_stride, int K) {
+    constexpr int warp_size     = 64;
+    constexpr int rows_per_lane = S_v / warp_size;
+    static_assert(S_v % warp_size == 0, "S_v must be a multiple of 64");
+
+    const uint32_t h_idx    = blockIdx.x;
+    const uint32_t sequence = blockIdx.y;
+    const int      lane     = threadIdx.x;
+    const int      col0     = (blockIdx.z * blockDim.y + threadIdx.y) * CPW;
+
+    const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
+    const uint32_t iq3 = fastdiv(sequence, rq3_magic);
+
+    const int64_t state_in_offset  = sequence * H * S_v * S_v + h_idx * S_v * S_v;
+    const int64_t state_out_offset = (sequence * H + h_idx) * S_v * S_v;
+    state      += state_out_offset;
+    curr_state += state_in_offset;
+    float * attn_data = dst + (sequence * n_tokens * H + h_idx) * S_v;
+
+    ggml_cuda_pdl_sync();
+    float s_shard[CPW][rows_per_lane];
+#pragma unroll
+    for (int c = 0; c < CPW; c++) {
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            s_shard[c][r] = curr_state[(col0 + c) * S_v + r * warp_size + lane];
+        }
+    }
+
+    for (int t = 0; t < n_tokens; t++) {
+        const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
+        const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
+        const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
+        const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
+        const float beta_val = beta[gb_offset];
+        const float * g_t = g + gb_offset * S_v;
+
+        float k_reg[rows_per_lane], q_reg[rows_per_lane], eg[rows_per_lane];
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            const int i = r * warp_size + lane;
+            k_reg[r] = k_t[i];
+            q_reg[r] = q_t[i];
+            eg[r]    = expf(g_t[i]);
+        }
+        float v_col[CPW];
+#pragma unroll
+        for (int c = 0; c < CPW; c++) {
+            v_col[c] = v_t[col0 + c];
+        }
+
+        // kv[col] = sum_i g[i] * S[i][col] * k[i]
+        float kv_col[CPW];
+#pragma unroll
+        for (int c = 0; c < CPW; c++) {
+            float kv_shard = 0.0f;
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                kv_shard += eg[r] * s_shard[c][r] * k_reg[r];
+            }
+            kv_col[c] = warp_reduce_sum<warp_size>(kv_shard);
+        }
+
+        float attn_col[CPW];
+#pragma unroll
+        for (int c = 0; c < CPW; c++) {
+            const float delta_col = (v_col[c] - kv_col[c]) * beta_val;
+            float attn_partial = 0.0f;
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                s_shard[c][r] = eg[r] * s_shard[c][r] + k_reg[r] * delta_col;
+                attn_partial += s_shard[c][r] * q_reg[r];
+            }
+            attn_col[c] = warp_reduce_sum<warp_size>(attn_partial);
+        }
+        if (lane == 0) {
+#pragma unroll
+            for (int c = 0; c < CPW; c++) {
+                attn_data[col0 + c] = attn_col[c] * scale;
+            }
+        }
+        attn_data += S_v * H;
+
+        if constexpr (keep_rs_t) {
+            const int target_slot = (int) n_tokens - 1 - t;
+            if (target_slot >= 0 && target_slot < K) {
+                float * cs = state + target_slot * state_slot_stride;
+#pragma unroll
+                for (int c = 0; c < CPW; c++) {
+#pragma unroll
+                    for (int r = 0; r < rows_per_lane; r++) {
+                        cs[(col0 + c) * S_v + r * warp_size + lane] = s_shard[c][r];
+                    }
+                }
+            }
+        }
+    }
+
+    if constexpr (!keep_rs_t) {
+#pragma unroll
+        for (int c = 0; c < CPW; c++) {
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                state[(col0 + c) * S_v + r * warp_size + lane] = s_shard[c][r];
+            }
+        }
+    }
+}
+
 // GGML_GDN_LPC: unset/1 = lane-per-column kernel for batches of >= GGML_GDN_LPC_MIN tokens (default 8), 0 = never, 2 = always.
 static bool gated_delta_net_use_lpc(const int64_t S_v, const int64_t n_tokens) {
     static const int  mode    = [] { const char * e = getenv("GGML_GDN_LPC");     return e ? atoi(e) : 1; }();
@@ -706,6 +832,50 @@ static void launch_gated_delta_net(
             break;
         }
         case 128: {
+            // 1 token per sequence over several sequences (multi-stream decode, KDA): CPW columns per wave
+            static const bool dec_on = !getenv("GGML_GDN_DEC") || atoi(getenv("GGML_GDN_DEC")) != 0;
+            static const int  dec_cpw = getenv("GGML_GDN_DEC_CPW") ? atoi(getenv("GGML_GDN_DEC_CPW")) : 4;
+            if (KDA && dec_on && n_tokens == 1 && n_seqs >= 2) {
+                static const bool verify = getenv("GGML_GDN_DEC_VERIFY") && atoi(getenv("GGML_GDN_DEC_VERIFY"));
+                const size_t n_dst = (size_t) S_v * H * n_tokens * n_seqs;
+                const size_t n_st  = (size_t) S_v * S_v * H * n_seqs;   // the one state slot a 1-token step writes
+                std::unique_ptr<ggml_cuda_pool_alloc<float>> rdst, rst;
+                if (verify && pool != nullptr) {
+                    // reference into scratch first (it only reads q/k/v/g/beta/curr_state), then the decode kernel
+                    rdst = std::make_unique<ggml_cuda_pool_alloc<float>>(*pool, n_dst);
+                    rst  = std::make_unique<ggml_cuda_pool_alloc<float>>(*pool, n_st);
+                    ggml_cuda_kernel_launch(gated_delta_net_cuda<128, KDA, keep_rs_t>, launch_params,
+                        q_d, k_d, v_d, g_d, b_d, s_d, rdst->get(), rst->get(), H,
+                        n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                        sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, (int64_t) 0, 1);
+                }
+                const int cpw = dec_cpw == 2 ? 2 : dec_cpw == 8 ? 8 : 4;
+                const dim3 grid_dec(H, n_seqs, 128 / (num_warps * cpw));
+                const ggml_cuda_kernel_launch_params lp_dec = ggml_cuda_kernel_launch_params(grid_dec, block_dims, 0, stream);
+#define GDN_DEC(C) ggml_cuda_kernel_launch(gated_delta_net_kda_dec_cuda<128, keep_rs_t, C>, lp_dec, \
+                    q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H, n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3, \
+                    sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K)
+                cpw == 2 ? GDN_DEC(2) : cpw == 8 ? GDN_DEC(8) : GDN_DEC(4);
+#undef GDN_DEC
+                if (rdst) {
+                    std::vector<float> a(n_dst), b(n_dst), sa(n_st), sb(n_st);
+                    CUDA_CHECK(cudaMemcpyAsync(a.data(), rdst->get(), n_dst*sizeof(float), cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(b.data(), dst_d, n_dst*sizeof(float), cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(sa.data(), rst->get(), n_st*sizeof(float), cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaMemcpyAsync(sb.data(), state_d, n_st*sizeof(float), cudaMemcpyDeviceToHost, stream));
+                    CUDA_CHECK(cudaStreamSynchronize(stream));
+                    const bool same = memcmp(a.data(), b.data(), n_dst*sizeof(float)) == 0 && memcmp(sa.data(), sb.data(), n_st*sizeof(float)) == 0;
+                    static int64_t n_ok = 0;
+                    if (!same) {
+                        GGML_LOG_ERROR("GDN_DEC verify: MISMATCH (n_seqs %lld)\n", (long long) n_seqs);
+                        GGML_ABORT("GGML_GDN_DEC_VERIFY mismatch");
+                    }
+                    if (++n_ok % 256 == 0) {
+                        GGML_LOG_WARN("GDN_DEC verify: %lld calls identical to the reference\n", (long long) n_ok);
+                    }
+                }
+                break;
+            }
             // 2..4 tokens (MTP verify): preload variant, bit-exact with the plain loop. GGML_GDN_PRELOAD=0 disables.
             static const bool preload = !getenv("GGML_GDN_PRELOAD") || atoi(getenv("GGML_GDN_PRELOAD")) != 0;
             if (preload && n_tokens >= 2 && n_tokens <= 4) {
