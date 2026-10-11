@@ -752,7 +752,8 @@ static __global__ void __launch_bounds__(li_dec::NT, 1) lightning_indexer_kernel
     // queries q0 .. q0+NQ-1 of this block (grid.y = ceil(n_batch / NQ)): the verify batch's queries run in parallel blocks
     const int q0       = blockIdx.y*NQ;
 
-    // mask of this lane's outputs; skip the block when the mask hides every key for every query
+    // mask of this lane's outputs; skip the block when the mask hides every key for every query (writes the mask value,
+    // -inf, as the vec kernel's score + mask does for any finite score; they differ only for a non-finite score)
     float mval[NQ];
     int visible = 0;
     const char * m_base = (const char *) M + (i_stream % nem3)*nbm3;
@@ -951,7 +952,8 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
 #if defined(GGML_USE_HIP)
     if (n_embd == 128 && (n_head == 64 || n_head == 32) && lightning_indexer_use_decode(k, n_batch)) {
         dim3 block(li_dec::NT, 1, 1);
-        dim3 grid((n_kv + li_dec::KPB - 1) / li_dec::KPB, n_batch, n_stream);   // one query per block
+        constexpr int NQ = 1;   // one query per block
+        dim3 grid((n_kv + li_dec::KPB - 1) / li_dec::KPB, (n_batch + NQ - 1) / NQ, n_stream);
         auto launch = [&](auto kern) {
             kern<<<grid, block, 0, ctx.stream()>>>(
                 q_d, k_d, w_d, m_d, dst_d,
@@ -966,9 +968,9 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
         // one query per block (the verify's 3 queries run as parallel blocks; one block holding all queries scored them
         // serially and was slower than the vec kernel at 3 queries); LDS: 32 heads x 512 B of Q + W
         if (n_head == 64) {
-            launch(lightning_indexer_kernel_decode_f32<64, 1, 32>);
+            launch(lightning_indexer_kernel_decode_f32<64, NQ, 32>);
         } else {
-            launch(lightning_indexer_kernel_decode_f32<32, 1, 32>);
+            launch(lightning_indexer_kernel_decode_f32<32, NQ, 32>);
         }
         return;
     }

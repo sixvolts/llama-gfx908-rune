@@ -293,7 +293,7 @@ static __global__ void top_k_radix_gather(
         __syncthreads();
     }
 
-    // Parallel tie gather (GGML_CUDA_TOPK_TIEPAR, default on): the first `rank` keys equal to the k-th key in column
+    // Parallel tie gather (GGML_CUDA_TOPK_TIEPAR, default on for <= 64 rows): the first `rank` keys equal to the k-th key in column
     // order, as top_k_radix_gather_equal, but each block writes the ties of its contiguous chunk at the global tie
     // index (earlier chunks' tie counts + its own column-order rank) instead of one block scanning the whole row
     // (~17 us at 8k columns, ~70 us at 32k on gfx908). Same positions, so the same bytes.
@@ -405,7 +405,12 @@ static void top_k_radix_cuda(
             <<<nrows, BLOCK_SIZE, 0, stream>>>(histograms, states, blocks_per_row, shift, scan);
     }
 
-    static const bool tie_par = [] { const char * e = getenv("GGML_CUDA_TOPK_TIEPAR"); return e == nullptr || atoi(e) != 0; }();
+    // The parallel tie gather re-reads every row once more in count_greater; it wins at decode row counts (1 + drafts per
+    // stream, <= 18 at 6 streams: one serial gather_equal launch fewer) but loses at prefill rows (512 x 8258 columns
+    // 278 -> 333 us, 65547 columns 1891 -> 2105 us). Both gathers are byte-identical, so the row gate cannot change output.
+    static const bool tie_par_on = [] { const char * e = getenv("GGML_CUDA_TOPK_TIEPAR"); return e == nullptr || atoi(e) != 0; }();
+    static const int  tie_par_max_rows = [] { const char * e = getenv("GGML_CUDA_TOPK_TIEPAR_MAX_ROWS"); return e ? atoi(e) : 64; }();
+    const bool tie_par = tie_par_on && nrows <= tie_par_max_rows;
     const int eq_chunk = ((ncols + blocks_per_row - 1) / blocks_per_row + BLOCK_SIZE - 1) / BLOCK_SIZE * BLOCK_SIZE;
     ggml_cuda_pool_alloc<int> counts_alloc(pool, (size_t) nrows * blocks_per_row);
     ggml_cuda_pool_alloc<int> eq_alloc(pool);
