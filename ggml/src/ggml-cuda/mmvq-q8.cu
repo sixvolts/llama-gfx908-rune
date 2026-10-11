@@ -11,88 +11,100 @@
 // shared memory, warp 0 does warp_reduce_sum<64>. This kernel replays exactly that; it only changes WHEN the loads are
 // issued (all up front, the row's NB blocks known at compile time) and HOW (one 8-byte load for the lane's two ints,
 // which the 34-byte Q8_0 block leaves 2-byte aligned; CDNA global loads accept that).
-template <int NB, int ncols, int RPB>
-static __global__ void __launch_bounds__(128, 1) mmvq_q8_0_v2(
+// NW = warps per block of the replayed table entry (GCN: 2 for 1..4 columns, 1 for 5..8), which fixes the lane ->
+// block mapping (kbx = tid/4 + it*bpi, bpi = 16*NW) and whether warp 1 hands its partials over shared memory; RPB is a
+// tuning knob (a row's order does not depend on it). CH = iterations whose loads are issued together (all of them when
+// CH >= NIT): at 5..8 columns the full set does not fit in registers; chunking changes when loads are issued, never the
+// per-accumulator order.
+template <int NB, int ncols, int RPB, int NW = 2, int CH = 1 << 20>
+static __global__ void __launch_bounds__(64*NW, 1) mmvq_q8_0_v2(
         const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
         const int nrows, const int stride_row_x, const int stride_col_y, const int stride_col_dst) {
     constexpr int warp_size = 64;
-    constexpr int nwarps    = 2;
+    constexpr int nwarps    = NW;
     constexpr int qi        = QI8_0;                 // 8
     constexpr int vdr       = VDR_Q8_0_Q8_1_MMVQ;    // 2
-    constexpr int bpi       = vdr*nwarps*warp_size/qi;   // 32 blocks per iteration
+    constexpr int bpi       = vdr*nwarps*warp_size/qi;   // blocks per iteration: 32 (2 warps) or 16 (1 warp)
     constexpr int NIT       = (NB + bpi - 1)/bpi;
+    constexpr int C         = CH < NIT ? CH : NIT;   // iterations per load chunk
 
     const int tid  = warp_size*threadIdx.y + threadIdx.x;
     const int row0 = RPB*blockIdx.x;
     const int kb_l = tid/(qi/vdr);
     const int kqs  = vdr*(tid % (qi/vdr));
 
-    // loads: weights (2 ints + d per row and iteration), activations (2 ints + d per column and iteration)
-    int  v[NIT][RPB][vdr];
-    half dw[NIT][RPB];
-    int  u[NIT][ncols][vdr];
-    half du[NIT][ncols];
+    float tmp[ncols][RPB] = {{0.0f}};
+
 #pragma unroll
-    for (int it = 0; it < NIT; ++it) {
-        const int kbx = kb_l + it*bpi;
-        if (kbx < NB) {
+    for (int it0 = 0; it0 < NIT; it0 += C) {
+        // loads: weights (2 ints + d per row and iteration), activations (2 ints + d per column and iteration)
+        int  v[C][RPB][vdr];
+        half dw[C][RPB];
+        int  u[C][ncols][vdr];
+        half du[C][ncols];
 #pragma unroll
-            for (int i = 0; i < RPB; ++i) {
-                const block_q8_0 * bq = (const block_q8_0 *) vx + (row0 + i)*stride_row_x + kbx;
-                if (RPB == 1 || row0 + i < nrows) {
-                    int2 q;
-                    __builtin_memcpy(&q, bq->qs + 4*kqs, sizeof(q));   // = get_int_b2(bq->qs, kqs), get_int_b2(bq->qs, kqs+1)
-                    v[it][i][0] = q.x;
-                    v[it][i][1] = q.y;
-                    dw[it][i]   = bq->d;
-                } else {
-                    v[it][i][0] = 0; v[it][i][1] = 0; dw[it][i] = __float2half(0.0f);
+        for (int c = 0; c < C; ++c) {
+            const int kbx = kb_l + (it0 + c)*bpi;
+            if (it0 + c < NIT && kbx < NB) {
+#pragma unroll
+                for (int i = 0; i < RPB; ++i) {
+                    const block_q8_0 * bq = (const block_q8_0 *) vx + (row0 + i)*stride_row_x + kbx;
+                    if (RPB == 1 || row0 + i < nrows) {
+                        int2 q;
+                        __builtin_memcpy(&q, bq->qs + 4*kqs, sizeof(q));   // = get_int_b2(bq->qs, kqs), get_int_b2(bq->qs, kqs+1)
+                        v[c][i][0] = q.x;
+                        v[c][i][1] = q.y;
+                        dw[c][i]   = bq->d;
+                    } else {
+                        v[c][i][0] = 0; v[c][i][1] = 0; dw[c][i] = __float2half(0.0f);
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < ncols; ++j) {
+                    const block_q8_1 * by = (const block_q8_1 *) vy + j*stride_col_y + kbx;
+                    u[c][j][0] = get_int_b4(by->qs, kqs);
+                    u[c][j][1] = get_int_b4(by->qs, kqs + 1);
+                    du[c][j]   = __low2half(by->ds);
                 }
             }
+        }
+
 #pragma unroll
-            for (int j = 0; j < ncols; ++j) {
-                const block_q8_1 * by = (const block_q8_1 *) vy + j*stride_col_y + kbx;
-                u[it][j][0] = get_int_b4(by->qs, kqs);
-                u[it][j][1] = get_int_b4(by->qs, kqs + 1);
-                du[it][j]   = __low2half(by->ds);
+        for (int c = 0; c < C; ++c) {
+            const int kbx = kb_l + (it0 + c)*bpi;
+            if (it0 + c < NIT && kbx < NB) {
+#pragma unroll
+                for (int j = 0; j < ncols; ++j) {
+#pragma unroll
+                    for (int i = 0; i < RPB; ++i) {
+                        tmp[j][i] += vec_dot_q8_0_q8_1_impl<float, vdr>(v[c][i], u[c][j], dw[c][i], du[c][j]);
+                    }
+                }
             }
         }
     }
 
-    float tmp[ncols][RPB] = {{0.0f}};
-#pragma unroll
-    for (int it = 0; it < NIT; ++it) {
-        const int kbx = kb_l + it*bpi;
-        if (kbx < NB) {
+    if constexpr (nwarps > 1) {
+        __shared__ float tmp_shared[nwarps-1][ncols][RPB][warp_size];
+        if (threadIdx.y > 0) {
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
 #pragma unroll
                 for (int i = 0; i < RPB; ++i) {
-                    tmp[j][i] += vec_dot_q8_0_q8_1_impl<float, vdr>(v[it][i], u[it][j], dw[it][i], du[it][j]);
+                    tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
                 }
             }
         }
-    }
-
-    __shared__ float tmp_shared[nwarps-1][ncols][RPB][warp_size];
-    if (threadIdx.y > 0) {
+        __syncthreads();
+        if (threadIdx.y > 0) {
+            return;
+        }
 #pragma unroll
         for (int j = 0; j < ncols; ++j) {
 #pragma unroll
             for (int i = 0; i < RPB; ++i) {
-                tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
+                tmp[j][i] += tmp_shared[0][j][i][threadIdx.x];
             }
-        }
-    }
-    __syncthreads();
-    if (threadIdx.y > 0) {
-        return;
-    }
-#pragma unroll
-    for (int j = 0; j < ncols; ++j) {
-#pragma unroll
-        for (int i = 0; i < RPB; ++i) {
-            tmp[j][i] += tmp_shared[0][j][i][threadIdx.x];
         }
     }
     // warp_reduce_sum<64> per accumulator, level by level (same xor tree, exact)
@@ -118,12 +130,12 @@ static __global__ void __launch_bounds__(128, 1) mmvq_q8_0_v2(
     }
 }
 
-template <int NB, int ncols, int RPB>
+template <int NB, int ncols, int RPB, int NW = 2, int CH = 1 << 20>
 static void mmvq_q8_0_v2_launch(const void * vx, const void * vy, float * dst, int nrows, int stride_row_x, int stride_col_y,
         int stride_col_dst, cudaStream_t stream) {
     const dim3 block_nums((nrows + RPB - 1)/RPB, 1, 1);
-    const dim3 block_dims(64, 2, 1);
-    mmvq_q8_0_v2<NB, ncols, RPB><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, stride_row_x, stride_col_y, stride_col_dst);
+    const dim3 block_dims(64, NW, 1);
+    mmvq_q8_0_v2<NB, ncols, RPB, NW, CH><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, stride_row_x, stride_col_y, stride_col_dst);
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -140,6 +152,25 @@ static void mmvq_q8_0_v2_rpb(int rpb, const void * vx, const void * vy, float * 
     }
 }
 
+// 5..8 columns: the GCN table's nwarps = 1 entry (rows_per_block 2 there; any RPB is exact). GGML_MMVQ_Q8_RPB8 and
+// GGML_MMVQ_Q8_CH8 override the rows per block and the load chunk (tuning only). MI100, 6 columns, us (generic ->
+// 4 rows, chunk 1): 4096x8192 75.3 -> 54.7, 8192x4096 79.6 -> 56.7, 1536x16384 57.7 -> 46.2, 2048x4096 25.1 -> 19.4.
+template <int NB, int ncols>
+static void mmvq_q8_0_v2_wide(int nrows, const void * vx, const void * vy, float * dst, int stride_row_x, int stride_col_y,
+        int stride_col_dst, cudaStream_t stream) {
+    static const int rpb = getenv("GGML_MMVQ_Q8_RPB8") ? atoi(getenv("GGML_MMVQ_Q8_RPB8")) : 4;
+    static const int ch  = getenv("GGML_MMVQ_Q8_CH8")  ? atoi(getenv("GGML_MMVQ_Q8_CH8"))  : 1;
+#define MMVQ_Q8_WIDE(R, C) mmvq_q8_0_v2_launch<NB, ncols, R, 1, C>(vx, vy, dst, nrows, stride_row_x, stride_col_y, stride_col_dst, stream)
+    if (rpb == 4) {
+        ch == 1 ? MMVQ_Q8_WIDE(4, 1) : ch == 3 ? MMVQ_Q8_WIDE(4, 3) : ch == 4 ? MMVQ_Q8_WIDE(4, 4) : MMVQ_Q8_WIDE(4, 2);
+    } else if (rpb == 8) {
+        ch == 1 ? MMVQ_Q8_WIDE(8, 1) : ch == 3 ? MMVQ_Q8_WIDE(8, 3) : ch == 4 ? MMVQ_Q8_WIDE(8, 4) : MMVQ_Q8_WIDE(8, 2);
+    } else {
+        ch == 1 ? MMVQ_Q8_WIDE(2, 1) : ch == 3 ? MMVQ_Q8_WIDE(2, 3) : ch == 4 ? MMVQ_Q8_WIDE(2, 4) : MMVQ_Q8_WIDE(2, 2);
+    }
+#undef MMVQ_Q8_WIDE
+}
+
 template <int NB>
 static void mmvq_q8_0_v2_ncols(int ncols, const void * vx, const void * vy, float * dst, int nrows, int stride_row_x,
         int stride_col_y, int stride_col_dst, cudaStream_t stream) {
@@ -151,7 +182,11 @@ static void mmvq_q8_0_v2_ncols(int ncols, const void * vx, const void * vy, floa
         case 1: mmvq_q8_0_v2_rpb<NB, 1>(rpb, vx, vy, dst, nrows, stride_row_x, stride_col_y, stride_col_dst, stream); break;
         case 2: mmvq_q8_0_v2_rpb<NB, 2>(rpb, vx, vy, dst, nrows, stride_row_x, stride_col_y, stride_col_dst, stream); break;
         case 3: mmvq_q8_0_v2_rpb<NB, 3>(rpb, vx, vy, dst, nrows, stride_row_x, stride_col_y, stride_col_dst, stream); break;
-        default: mmvq_q8_0_v2_rpb<NB, 4>(rpb, vx, vy, dst, nrows, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+        case 4: mmvq_q8_0_v2_rpb<NB, 4>(rpb, vx, vy, dst, nrows, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+        case 5: mmvq_q8_0_v2_wide<NB, 5>(nrows, vx, vy, dst, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+        case 6: mmvq_q8_0_v2_wide<NB, 6>(nrows, vx, vy, dst, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+        case 7: mmvq_q8_0_v2_wide<NB, 7>(nrows, vx, vy, dst, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+        default: mmvq_q8_0_v2_wide<NB, 8>(nrows, vx, vy, dst, stride_row_x, stride_col_y, stride_col_dst, stream); break;
     }
 }
 
@@ -163,7 +198,9 @@ bool ggml_cuda_mmvq_q8_v2(
 #if defined(GGML_USE_HIP)
     static const bool enabled = !getenv("GGML_MMVQ_Q8_V2") || atoi(getenv("GGML_MMVQ_Q8_V2")) != 0;
     const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
-    if (!enabled || !GGML_CUDA_CC_IS_CDNA(cc) || ncols_dst < 1 || ncols_dst > 4 ||
+    // GGML_MMVQ_Q8_V2_WIDE=0 keeps 5..8 columns on mul_mat_vec_q
+    static const bool wide = !getenv("GGML_MMVQ_Q8_V2_WIDE") || atoi(getenv("GGML_MMVQ_Q8_V2_WIDE")) != 0;
+    if (!enabled || !GGML_CUDA_CC_IS_CDNA(cc) || ncols_dst < 1 || ncols_dst > (wide ? 8 : 4) ||
         nchannels_x != 1 || nchannels_y != 1 || nchannels_dst != 1 || nsamples_x != 1 || nsamples_dst != 1) {
         return false;
     }
@@ -176,10 +213,15 @@ bool ggml_cuda_mmvq_q8_v2(
         case 8192: mmvq_q8_0_v2_ncols<256>(ncols_dst, vx, vy, dst, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); return true;
         // the loads are all issued up front, so very long rows run out of registers at several columns (MI100, 3 columns:
         // K=12288 +0%, K=16384 +50..76% slower than mul_mat_vec_q); one column is still 11..20% faster
-        case 12288: if (ncols_dst > 1) { return false; }
+        // 5..8 columns load one iteration at a time (chunk 1), so long rows are fine there
+        case 12288: if (ncols_dst > 1 && ncols_dst < 5) { return false; }
                     mmvq_q8_0_v2_ncols<384>(ncols_dst, vx, vy, dst, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); return true;
-        case 16384: if (ncols_dst > 1) { return false; }
+        case 16384: if (ncols_dst > 1 && ncols_dst < 5) { return false; }
                     mmvq_q8_0_v2_ncols<512>(ncols_dst, vx, vy, dst, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); return true;
+        // K = 128 only at 5..8 columns: below that mul_mat_vec_q takes its small_k entry (2 warps, rows = nwarps), which
+        // this kernel does not replay
+        case  128: if (ncols_dst < 5) { return false; }
+                   mmvq_q8_0_v2_ncols<  4>(ncols_dst, vx, vy, dst, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); return true;
         case 2560: mmvq_q8_0_v2_ncols< 80>(ncols_dst, vx, vy, dst, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); return true;
         case 6144: mmvq_q8_0_v2_ncols<192>(ncols_dst, vx, vy, dst, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); return true;
         default: return false;
