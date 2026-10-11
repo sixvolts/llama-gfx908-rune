@@ -10991,6 +10991,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     test_cases.emplace_back(new test_lightning_indexer(128, 32, 1000, 77, 1, 1, GGML_TYPE_F32));
     test_cases.emplace_back(new test_lightning_indexer(128, 64, 333, 40, 2, 1, GGML_TYPE_F32));
     test_cases.emplace_back(new test_lightning_indexer(128, 32, 4096, 15, 1, 1, GGML_TYPE_F32));
+    // rune: decode-shaped f32 indexer (1..8 queries per stream): 6 streams with a broadcast mask, partial last 64-key
+    // block, mask per stream, 64 heads, and 9 queries just past the decode kernel's gate
+    test_cases.emplace_back(new test_lightning_indexer(128, 32, 8258, 3, 6, 1, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer(128, 32,  290, 8, 2, 2, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer(128, 32, 1058, 2, 3, 3, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer(128, 64, 32770, 1, 1, 1, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer(128, 32,   65, 5, 1, 1, GGML_TYPE_F32));
+    test_cases.emplace_back(new test_lightning_indexer(128, 32, 2051, 9, 2, 1, GGML_TYPE_F32));
 
     // rune: dim-0 concat with a transposed src1 (KDA conv input at prefill) - tiled path and its edges
     for (ggml_type t : {GGML_TYPE_F32, GGML_TYPE_F16}) {
