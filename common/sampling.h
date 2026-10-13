@@ -91,6 +91,11 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
 // assume idxs == [ 0, 1, 2, ..., draft.size() ]
 std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sampler * gsmpl, struct llama_context * ctx, const llama_tokens & draft, bool grammar_first = false);
 
+// true when the target chain gives one fixed distribution per position that rejection sampling can test against:
+// no mirostat and no adaptive-p (both adapt their state from the token they select themselves, so accepting a drafted
+// token instead breaks them)
+bool common_sampler_rejection_compatible(const struct common_sampler * gsmpl);
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl);
 
 // force the reasoning budget sampler (if any) to begin forcing its end sequence now.

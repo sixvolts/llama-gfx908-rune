@@ -1012,6 +1012,14 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
 }
 
+bool common_sampler_rejection_compatible(const struct common_sampler * gsmpl) {
+    if (!gsmpl || gsmpl->params.mirostat != 0) {
+        return false;
+    }
+    const auto & smpls = gsmpl->params.samplers;
+    return std::find(smpls.begin(), smpls.end(), COMMON_SAMPLER_TYPE_ADAPTIVE_P) == smpls.end();
+}
+
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
     return llama_sampler_get_seed(gsmpl->chain);
 }

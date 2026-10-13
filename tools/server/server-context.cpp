@@ -367,6 +367,7 @@ struct server_slot {
     }
     std::mt19937 spec_synth_rng;
 
+    bool spec_host_sampling = false; // the target samples on the host (no backend sampler): rejection sampling can verify
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -597,9 +598,10 @@ struct server_slot {
     }
 
     // at temp 0 both p and q are point masses, so rejection is the same as sample-and-match
-    // at temp 0 both p and q are point masses, so rejection is the same as sample-and-match
+    // rejection also needs the target's distribution on the host (no backend sampler) and a chain whose state does not
+    // depend on the token it picks itself (no mirostat / adaptive-p): otherwise verify by sample-and-match
     bool use_spec_rejection() const {
-        return task && task->params.sampling.temp > 0.0f;
+        return task && task->params.sampling.temp > 0.0f && spec_host_sampling && common_sampler_rejection_compatible(smpl.get());
     }
 
     void add_token(const completion_token_output & token) {
@@ -2242,6 +2244,9 @@ private:
                     ? std::random_device{}()
                     : task.params.sampling.seed;
                 slot.spec_synth_rng.seed(seed);
+            }
+            if (spec) {
+                slot.spec_host_sampling = !use_backend_sampling;
             }
         } else {
             slot.smpl.reset();
