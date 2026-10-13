@@ -76,6 +76,13 @@ static inline int nearest_int(float fval) {
     return (i & 0x007fffff) - 0x00400000;
 }
 
+// LLAMA_PPL_FIRST=<pos>: score from this position of each chunk instead of n_ctx/2 (diagnostics: a KL base and its
+// comparison runs must use the same value)
+static int ppl_first(int n_ctx) {
+    const char * e = getenv("LLAMA_PPL_FIRST");
+    return e ? std::max(0, std::min(n_ctx - 2, atoi(e))) : n_ctx/2;
+}
+
 static double log_softmax(int n_vocab, const float * logits, uint16_t * log_prob, int tok) {
     float max_logit = logits[0];
     float min_logit = logits[0];
@@ -539,7 +546,7 @@ static results_perplexity perplexity(llama_context * ctx, const common_params & 
     // Example, we have a context window of 512, we will compute perplexity for each of the
     // last 256 tokens.  Then, we split the input up into context window size chunks to
     // process the entire prompt.
-    const int first = n_ctx/2;
+    const int first = ppl_first(n_ctx);
 
     for (int i = 0; i < n_chunk; i += n_seq) {
         const int start =     i * n_ctx;
@@ -1755,9 +1762,9 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
 
     llama_batch batch = llama_batch_init(std::min(n_batch, static_cast<int>(n_ctx)*n_seq), 0, 1);
 
-    std::vector<uint16_t> log_probs_uint16(size_t(n_ctx - 1 - n_ctx/2) * nv);
-    std::vector<float>    kld_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
-    std::vector<float> p_diff_values(size_t(n_ctx - 1 - n_ctx/2)*n_chunk);
+    std::vector<uint16_t> log_probs_uint16(size_t(n_ctx - 1 - ppl_first(n_ctx)) * nv);
+    std::vector<float>    kld_values(size_t(n_ctx - 1 - ppl_first(n_ctx))*n_chunk);
+    std::vector<float> p_diff_values(size_t(n_ctx - 1 - ppl_first(n_ctx))*n_chunk);
     std::vector<float> logits;
     if (num_batches > 1) {
         logits.reserve(size_t(n_ctx) * n_vocab);
@@ -1789,7 +1796,7 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     auto    kld_ptr =    kld_values.data();
     auto p_diff_ptr = p_diff_values.data();
 
-    const int first = n_ctx/2;
+    const int first = ppl_first(n_ctx);
 
     for (int i = 0; i < n_chunk; i += n_seq) {
         const int start =     i * n_ctx;
@@ -1908,6 +1915,14 @@ static void kl_divergence(llama_context * ctx, const common_params & params) {
     LOG("\n");
 
     if (kld.count < 100) return; // we do not wish to do statistics on so few values
+
+    // LLAMA_KLD_DUMP=<file>: per-token KLD in evaluation order (float32; chunk c, token i = scored position first + i)
+    if (const char * dump = getenv("LLAMA_KLD_DUMP")) {
+        if (FILE * f = fopen(dump, "wb")) {
+            fwrite(kld_values.data(), sizeof(float), kld.count, f);
+            fclose(f);
+        }
+    }
 
     std::sort(kld_values.begin(), kld_values.end());
     std::sort(p_diff_values.begin(), p_diff_values.end());
