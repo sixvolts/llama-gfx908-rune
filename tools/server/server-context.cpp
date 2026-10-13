@@ -368,6 +368,7 @@ struct server_slot {
     std::mt19937 spec_synth_rng;
 
     bool spec_host_sampling = false; // the target samples on the host (no backend sampler): rejection sampling can verify
+    std::vector<int32_t> spec_i_probs; // verify-batch rows of the last verified draft (for n_probs of accepted tokens)
 
     // TODO: move members that belong to the task (such as `generated_text`, `has_new_line`) to task_results_state
     //       see https://github.com/ggml-org/llama.cpp/pull/18283#issuecomment-3710175837
@@ -4636,6 +4637,10 @@ private:
                 } else {
                     accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 }
+                // the verify batch's output rows, one per tested position: the logits of every accepted token
+                if (slot.task->params.sampling.n_probs > 0) {
+                    slot.spec_i_probs = slot.spec_i_batch;
+                }
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);
@@ -4723,7 +4728,14 @@ private:
                 result.text_to_send = common_token_to_piece(slot.ctx_tgt, result.tok, accept_special_token(slot, result.tok));
                 result.prob         = 1.0f; // set later
 
-                // TODO: set result.probs
+                // pre-sampling probs come from the verify row of this position (any accepted token); post-sampling
+                // probs exist only for the chain's last sample, which is the last token emitted here
+                if (slot.task->params.sampling.n_probs > 0 && i < slot.spec_i_probs.size()) {
+                    const bool post = slot.task->params.post_sampling_probs;
+                    if (!post || i + 1 == ids.size()) {
+                        populate_token_probs(slot, result, post, params_base.special, slot.spec_i_probs[i]);
+                    }
+                }
 
                 slot.stats.n_gen += 1;
 
