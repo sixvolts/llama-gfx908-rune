@@ -910,6 +910,15 @@ struct ggml_backend_sched {
     int debug_realloc;
     int debug_graph_size;
     int debug_prev_graph_size;
+
+    // GGML_SCHED_REALLOC_STATS=1: count graph re-plans (ggml_gallocr_reserve_n on a failed alloc) and their host time
+    // (backend syncs + reserve), [0] = same graph size as the previous graph (only tensor sizes grew), [1] = other;
+    // logged every 64 re-plans and when the scheduler is freed. Diagnostics only.
+    int     rs_on;          // 2: also log every re-plan (node counts, sync / plan time, buffer growth)
+    int     rs_prev_nodes;
+    int64_t rs_allocs;
+    int64_t rs_n[2];
+    int64_t rs_us[2];
 };
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
@@ -1663,6 +1672,12 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
     sched->rot_wait_pending = false;
 }
 
+static void ggml_backend_sched_log_realloc_stats(ggml_backend_sched_t sched) {
+    GGML_LOG_WARN("sched realloc stats: %lld graph allocs, re-planned %lld same-size (%.2f ms avg) + %lld other (%.2f ms avg)\n",
+        (long long) sched->rs_allocs, (long long) sched->rs_n[0], sched->rs_n[0] ? sched->rs_us[0]/1e3/sched->rs_n[0] : 0.0,
+        (long long) sched->rs_n[1], sched->rs_n[1] ? sched->rs_us[1]/1e3/sched->rs_n[1] : 0.0);
+}
+
 static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
     bool backend_ids_changed = false;
     for (int i = 0; i < sched->graph.n_nodes; i++) {
@@ -1699,17 +1714,48 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
             }
         }
 
+        const int64_t rs_t0 = sched->rs_on ? ggml_time_us() : 0;
+        size_t rs_buf0 = 0;
+        if (sched->rs_on > 1) {
+            for (int i = 0; i < sched->n_backends; i++) {
+                rs_buf0 += ggml_gallocr_get_buffer_size(sched->galloc, i);
+            }
+        }
+
         // the re-allocation may cause the split inputs to be moved to a different address
         // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
         for (int i = 0; i < sched->n_backends; i++) {
             ggml_backend_synchronize(sched->backends[i]);
         }
+        const int64_t rs_t1 = sched->rs_on ? ggml_time_us() : 0;
 
         ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
         }
+
+        if (sched->rs_on) {
+            const int k = !backend_ids_changed && sched->debug_prev_graph_size == sched->debug_graph_size ? 0 : 1;
+            sched->rs_n[k]++;
+            sched->rs_us[k] += ggml_time_us() - rs_t0;
+            if (sched->rs_on > 1) {
+                size_t rs_buf1 = 0;
+                for (int i = 0; i < sched->n_backends; i++) {
+                    rs_buf1 += ggml_gallocr_get_buffer_size(sched->galloc, i);
+                }
+                GGML_LOG_WARN("sched replan %s: nodes %d -> %d, splits %d, sync %.2f ms, plan %.2f ms, buffers %+.1f MiB\n",
+                    k == 0 ? "same-size" : "other", sched->rs_prev_nodes, sched->graph.n_nodes, sched->n_splits,
+                    (rs_t1 - rs_t0)/1e3, (ggml_time_us() - rs_t1)/1e3, ((double) rs_buf1 - (double) rs_buf0)/1048576.0);
+            }
+            if ((sched->rs_n[0] + sched->rs_n[1]) % 64 == 0) {
+                ggml_backend_sched_log_realloc_stats(sched);
+            }
+        }
+    }
+    if (sched->rs_on) {
+        sched->rs_allocs++;
+        sched->rs_prev_nodes = sched->graph.n_nodes;
     }
 
     return true;
@@ -2120,6 +2166,11 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->debug_graph_size = 0;
     sched->debug_prev_graph_size = 0;
+    sched->rs_on = getenv("GGML_SCHED_REALLOC_STATS") ? atoi(getenv("GGML_SCHED_REALLOC_STATS")) : 0;
+    sched->rs_prev_nodes = 0;
+    sched->rs_allocs = 0;
+    sched->rs_n[0] = sched->rs_n[1] = 0;
+    sched->rs_us[0] = sched->rs_us[1] = 0;
 
     sched->context_buffer_size = ggml_sched_max_splits*GGML_SCHED_MAX_SPLIT_INPUTS*2*sizeof(struct ggml_tensor) + ggml_graph_overhead_custom(graph_size, false);
     sched->context_buffer = (char *) malloc(sched->context_buffer_size);
@@ -2154,6 +2205,9 @@ ggml_backend_sched_t ggml_backend_sched_new(
 void ggml_backend_sched_free(ggml_backend_sched_t sched) {
     if (sched == NULL) {
         return;
+    }
+    if (sched->rs_on) {
+        ggml_backend_sched_log_realloc_stats(sched);
     }
     for (int b = 0; b < sched->n_backends; b++) {
         for (int c = 0; c < sched->n_copies; c++) {
