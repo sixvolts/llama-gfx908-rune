@@ -4,6 +4,8 @@
 #include "llama-memory-hybrid.h"
 #include "llama-kv-cache-kpool.h"
 
+#include <cstdlib>
+
 // ssm_a holds -exp(A_log) (kimi-k3), not +exp(A_log) (bailingmoe3); converter checks
 
 static uint32_t glm5next_n_select(const llama_hparams & hparams) {
@@ -827,6 +829,22 @@ llama_model_glm5next::graph_mtp::graph_mtp(const llama_model & model, const llm_
 
     cur = build_layer_attn(model, inp_mem, inp_kp, indexer_scoring, cur, il);
 
+    // crop to the output rows before the position-wise FFN (upstream b9acf138a, "crop the MTP graph to the output
+    // rows"): a headless NextN forward (the MTP catch-up, the draft context's prompt pass: no logits) persists only
+    // through its cache writes, which are done above, so the FFN, the head norm and the head run on no rows at all.
+    // Masked nextn extraction (the draft context) reads n_outputs rows of t_h_nextn, so the crop also publishes
+    // exactly the gathered rows. Not applied when every row is an output (the draft step): the graph is unchanged.
+    // LLAMA_MTP_CROP=0 restores the uncropped graph.
+    static const bool mtp_crop = !(getenv("LLAMA_MTP_CROP") && atoi(getenv("LLAMA_MTP_CROP")) == 0);
+    const bool cropped = mtp_crop && inp_out_ids && n_outputs < n_tokens &&
+        (!cparams.embeddings_nextn || cparams.embeddings_nextn_masked);
+    if (cropped) {
+        cur      = ggml_get_rows(ctx0, cur,      inp_out_ids);
+        residual = ggml_get_rows(ctx0, residual, inp_out_ids);
+        cb(cur,      "mtp_attn_out_cropped", il);
+        cb(residual, "mtp_residual_cropped", il);
+    }
+
     ggml_tensor * ffn_inp = ggml_add(ctx0, cur, residual);
     cb(ffn_inp, "mtp_ffn_inp", il);
 
@@ -846,7 +864,7 @@ llama_model_glm5next::graph_mtp::graph_mtp(const llama_model & model, const llm_
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
 
-    if (inp_out_ids) {
+    if (inp_out_ids && !cropped) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
     }
     cb(cur, "mtp_shared_head_norm", -1);
