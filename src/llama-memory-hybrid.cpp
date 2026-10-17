@@ -258,11 +258,40 @@ void llama_memory_hybrid::state_write(llama_io_write_i & io, llama_seq_id seq_id
 }
 
 void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    if ((flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0) {
+    const bool read_attn = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) == 0;
+
+    // a failed restore must leave the sequence empty in every cache (upstream #27530): each cache drops its own
+    // cells when its read fails, but the ones restored before it would keep theirs
+    auto undo = [&](llama_kv_cache * kv) {
+        if (seq_id == -1) {
+            kv->clear(true);
+        } else {
+            kv->seq_rm(seq_id, -1, -1);
+        }
+    };
+
+    if (read_attn) {
         mem_attn->state_read(io, seq_id, flags);
-        if (mem_idx) mem_idx->state_read(io, seq_id, flags);
+
+        if (mem_idx) {
+            try {
+                mem_idx->state_read(io, seq_id, flags);
+            } catch (...) {
+                undo(mem_attn.get());
+                throw;
+            }
+        }
     }
-    mem_recr->state_read(io, seq_id, flags);
+
+    try {
+        mem_recr->state_read(io, seq_id, flags);
+    } catch (...) {
+        if (read_attn) {
+            undo(mem_attn.get());
+            if (mem_idx) undo(mem_idx.get());
+        }
+        throw;
+    }
 }
 
 llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
