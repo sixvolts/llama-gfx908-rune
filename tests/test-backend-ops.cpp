@@ -5531,6 +5531,50 @@ struct test_mul_mat_id_fusion : public test_case {
     }
 };
 
+struct test_mul_mat_id_shared : public test_case {
+    const ggml_type type;
+    const ggml_type type_shared;
+    const int64_t k;
+    const int64_t m;
+    const int64_t n;
+    const int n_used;
+    const bool clamp;
+    ggml_tensor * routed = nullptr;
+    ggml_tensor * shared = nullptr;
+
+    test_mul_mat_id_shared(ggml_type type, ggml_type type_shared, int64_t k, int64_t m, int64_t n, int n_used, bool clamp)
+        : type(type), type_shared(type_shared), k(k), m(m), n(n), n_used(n_used), clamp(clamp) {}
+
+    std::string vars() override { return VARS_TO_STR7(type, type_shared, k, m, n, n_used, clamp); }
+    std::string op_desc(ggml_tensor *) override { return "MUL_MAT_ID_SHARED"; }
+    bool run_whole_graph() override { return true; }
+    double max_nmse_err() override { return 5e-4; }
+    std::vector<ggml_tensor *> fusion_test_nodes() override { return { routed, shared }; }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * input = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, k, n);
+        ggml_tensor * input_ids = ggml_reshape_3d(ctx, input, k, 1, n);
+        ggml_tensor * ids = ggml_new_tensor_2d(ctx, GGML_TYPE_I32, n_used, n);
+        ggml_set_name(ids, "ids");
+        ggml_tensor * up = ggml_new_tensor_3d(ctx, type, k, m, 8);
+        ggml_tensor * gate = ggml_new_tensor_3d(ctx, type, k, m, 8);
+        ggml_tensor * shared_up = ggml_new_tensor_2d(ctx, type_shared, k, m);
+        ggml_tensor * shared_gate = ggml_new_tensor_2d(ctx, type_shared, k, m);
+        ggml_tensor * rg = ggml_mul_mat_id(ctx, gate, input_ids, ids);
+        ggml_tensor * ru = ggml_mul_mat_id(ctx, up, input_ids, ids);
+        ggml_tensor * sg = ggml_mul_mat(ctx, shared_gate, input);
+        ggml_tensor * su = ggml_mul_mat(ctx, shared_up, input);
+        routed = clamp ? ggml_swiglu_clamp(ctx, rg, ru, 7.0f) : ggml_swiglu_split(ctx, rg, ru);
+        shared = clamp ? ggml_swiglu_clamp(ctx, sg, su, 7.0f) : ggml_swiglu_split(ctx, sg, su);
+        ggml_tensor * sum = ggml_sum_rows(ctx, ggml_cont(ctx, ggml_permute(ctx, routed, 1, 0, 2, 3)));
+        return ggml_add(ctx, ggml_reshape_2d(ctx, sum, m, n), shared);
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        init_mul_mat_id_tensors(ctx, 8);
+    }
+};
+
 // GGML_OP_OUT_PROD
 struct test_out_prod : public test_case {
     const ggml_type type_a;
@@ -10667,6 +10711,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
         test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_F16, GGML_TYPE_F32, 1, 1, false, 8, 16, k));
     }
     test_cases.emplace_back(new test_mul_mat_id_fusion(GGML_TYPE_F16, GGML_TYPE_F32, 16, 16, false, 32, 32, 32, 3));
+    // GLM-5.3-Flash MoE layer: Q4_K routed experts + one Q8_0 shared expert over the same activation, K = 4096
+    for (bool clamp : { false, true }) {
+        for (int64_t n : { 1, 2, 3, 4, 5, 6, 8, 9 }) {
+            test_cases.emplace_back(new test_mul_mat_id_shared(GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, 4096, 512, n, 3, clamp));
+        }
+    }
+    test_cases.emplace_back(new test_mul_mat_id_shared(GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, 4096, 520, 3, 8, true));
+    test_cases.emplace_back(new test_mul_mat_id_shared(GGML_TYPE_Q4_K, GGML_TYPE_Q8_0, 2048, 512, 2, 3, true));
 
     // gpt-oss issue with Vulkan mmq_id
     test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_MXFP4, GGML_TYPE_F32, 32, 2, false, 2880, 32, 2880));

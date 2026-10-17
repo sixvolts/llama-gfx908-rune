@@ -1,5 +1,7 @@
 #include "mmvq-moe.cuh"
 #include "unary.cuh"
+#include "reduce-dpp.cuh"
+#include "vecdotq.cuh"
 
 #include <cstdlib>
 #include <type_traits>
@@ -212,7 +214,244 @@ static __device__ __forceinline__ void  moe_kq_load(const block_q5_K * b, const 
 static __device__ __forceinline__ float moe_kq_dot(const moe_q4K_pair & w, const block_q8_1 * y, const float * s8) { return moe_q4K_dot(w, y, s8); }
 static __device__ __forceinline__ float moe_kq_dot(const moe_q5K_pair & w, const block_q8_1 * y, const float * s8) { return moe_q5K_dot(w, y, s8); }
 
-template <int NSB, int NW, int RG, int NTMAX, bool GLU, typename block_t = block_q4_K, typename pair_t = moe_q4K_pair>
+
+// ---------------------------------------------------------------------------------------------------------------------
+// Shared expert fused into the routed gate/up/GLU launch (the idea of upstream #29184, CUDA: fuse shared experts into
+// MMVQ). GLM-5.3-Flash has one dense Q8_0 shared expert per MoE layer (ffn_{up,gate}_shexp [K=4096, n_ff_shexp]) over
+// the same activation as the routed Q4_K experts. Extra blocks at the end of the dedup grid (blockIdx.y >= n_used *
+// ncols_dst) compute it for all tokens and write the shared GLU output, so the shared up, gate and GLU launches (and
+// the shared expert's own q8_1 quantization of the activation) disappear from the graph. Bit-exact by construction:
+// every row replays mmvq_q8_0_v2 (mmvq-q8.cu; itself the exact replay of mul_mat_vec_q<Q8_0, ncols>) with the same
+// lane -> block partition, accumulation order and reductions, and the GLU is the same single-element function the
+// unfused graph applies (mul_mat_vec_q's fused epilogue at one column: an added 0.0f bias; the GLU kernel above one).
+// Tolerance class is unchanged: the routed blocks are the same code. GGML_MOE_SHEXP=0 disables the fusion.
+struct moe_shexp_args {
+    const void * up;
+    const void * gate;
+    float *      dst;
+    int          nrows;
+    int          stride_row_x;     // Q8_0 blocks per weight row
+    int          stride_col_dst;   // elements per token column of dst
+    bool         glu_clamp;
+    float        glu_limit;
+};
+
+// one mmvq_q8_0_v2 instance: RPB rows x ncols columns over NB blocks per row by NWq waves (ty = wave within the
+// instance, hand = the instance's warp hand-off region [(NWq-1)][ncols][RPB][64]); the reduced sums end in every lane of
+// wave 0 (tmp). All waves of the block must call this (block-wide barrier inside when NWq > 1).
+template <int NB, int ncols, int RPB, int NWq>
+static __device__ __forceinline__ void moe_shexp_q8_rows(const block_q8_0 * __restrict__ vx, const block_q8_1 * __restrict__ vy,
+        const int row0, const int nrows, const int stride_row_x, const int stride_col_y, const int ty, float * __restrict__ hand,
+        float (&tmp)[ncols][RPB]) {
+    constexpr int warp_size = 64;
+    constexpr int qi        = QI8_0;                 // 8
+    constexpr int vdr       = VDR_Q8_0_Q8_1_MMVQ;    // 2
+    constexpr int bpi       = vdr*NWq*warp_size/qi;  // 32 (2 waves) or 16 (1 wave)
+    constexpr int NIT       = (NB + bpi - 1)/bpi;
+    constexpr int C         = NWq > 1 ? NIT : 1;     // load chunk as mmvq_q8_0_v2 / _wide use (order-neutral)
+
+    const int tid  = warp_size*ty + threadIdx.x;
+    const int kb_l = tid/(qi/vdr);
+    const int kqs  = vdr*(tid % (qi/vdr));
+
+#pragma unroll
+    for (int j = 0; j < ncols; ++j) {
+#pragma unroll
+        for (int i = 0; i < RPB; ++i) {
+            tmp[j][i] = 0.0f;
+        }
+    }
+
+#pragma unroll
+    for (int it0 = 0; it0 < NIT; it0 += C) {
+        int  v[C][RPB][vdr];
+        half dw[C][RPB];
+        int  u[C][ncols][vdr];
+        half du[C][ncols];
+#pragma unroll
+        for (int c = 0; c < C; ++c) {
+            const int kbx = kb_l + (it0 + c)*bpi;
+            if (it0 + c < NIT && kbx < NB) {
+#pragma unroll
+                for (int i = 0; i < RPB; ++i) {
+                    const block_q8_0 * bq = vx + (row0 + i)*stride_row_x + kbx;
+                    if (RPB == 1 || row0 + i < nrows) {
+                        int2 q;
+                        __builtin_memcpy(&q, bq->qs + 4*kqs, sizeof(q));
+                        v[c][i][0] = q.x;
+                        v[c][i][1] = q.y;
+                        dw[c][i]   = bq->d;
+                    } else {
+                        v[c][i][0] = 0; v[c][i][1] = 0; dw[c][i] = __float2half(0.0f);
+                    }
+                }
+#pragma unroll
+                for (int j = 0; j < ncols; ++j) {
+                    const block_q8_1 * by = vy + j*stride_col_y + kbx;
+                    u[c][j][0] = get_int_b4(by->qs, kqs);
+                    u[c][j][1] = get_int_b4(by->qs, kqs + 1);
+                    du[c][j]   = __low2half(by->ds);
+                }
+            }
+        }
+#pragma unroll
+        for (int c = 0; c < C; ++c) {
+            const int kbx = kb_l + (it0 + c)*bpi;
+            if (it0 + c < NIT && kbx < NB) {
+#pragma unroll
+                for (int j = 0; j < ncols; ++j) {
+#pragma unroll
+                    for (int i = 0; i < RPB; ++i) {
+                        tmp[j][i] += vec_dot_q8_0_q8_1_impl<float, vdr>(v[c][i], u[c][j], dw[c][i], du[c][j]);
+                    }
+                }
+            }
+        }
+    }
+
+    if constexpr (NWq > 1) {
+        if (ty > 0) {
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+#pragma unroll
+                for (int i = 0; i < RPB; ++i) {
+                    hand[(((ty - 1)*ncols + j)*RPB + i)*warp_size + threadIdx.x] = tmp[j][i];
+                }
+            }
+        }
+        __syncthreads();
+        if (ty == 0) {
+#pragma unroll
+            for (int l = 0; l < NWq - 1; ++l) {
+#pragma unroll
+                for (int j = 0; j < ncols; ++j) {
+#pragma unroll
+                    for (int i = 0; i < RPB; ++i) {
+                        tmp[j][i] += hand[((l*ncols + j)*RPB + i)*warp_size + threadIdx.x];
+                    }
+                }
+            }
+        }
+    } else {
+        GGML_UNUSED(hand);
+    }
+    if (ty == 0) {
+        // warp_reduce_sum<64> per accumulator, level by level (same xor tree, exact)
+#pragma unroll
+        for (int offset = warp_size/2; offset > 0; offset >>= 1) {
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+#pragma unroll
+                for (int i = 0; i < RPB; ++i) {
+                    tmp[j][i] += ggml_cuda_shfl_xor_td<warp_size>(tmp[j][i], offset);
+                }
+            }
+        }
+    }
+}
+
+// tail block tb of a dedup launch with NW waves: instances of NWq waves, pairs (up, gate) over the same RPB rows,
+// TRG row groups per block; smem = scratch (the routed blocks' y_sh, unused here)
+template <int NB, int NW, int ncols>
+static __device__ __forceinline__ void moe_shexp_tail_n(const moe_shexp_args & sh, const void * __restrict__ vy,
+        const int stride_col_y, const int tb, float * __restrict__ smem) {
+    constexpr int NWq   = ncols <= 4 ? 2 : 1;   // mmvq_q8_0_v2: 2 waves for 1..4 columns, 1 wave above
+    constexpr int NI    = NW / NWq;
+    constexpr int PAIRS = NI / 2;
+    constexpr int RPB   = 4;
+    constexpr int TRG   = PAIRS >= 8 ? 1 : 8 / PAIRS;   // ~32 rows per tail block
+    constexpr int ROWS  = RPB*PAIRS*TRG;
+    constexpr int HAND  = (NWq - 1)*ncols*RPB*64;
+    static_assert(NW % NWq == 0 && PAIRS >= 1, "the tail needs at least one (up, gate) instance pair");
+
+    if (tb*ROWS >= sh.nrows) {
+        return;   // block-uniform: a padding block of the last grid row
+    }
+
+    const int  inst    = threadIdx.y / NWq;
+    const int  ty      = threadIdx.y % NWq;
+    const int  pair    = inst / 2;
+    const bool is_gate = inst % 2;
+
+    const block_q8_0 * vx   = (const block_q8_0 *) (is_gate ? sh.gate : sh.up);
+    float *            hand = smem + inst*HAND;
+    float *            glu  = smem + NI*HAND;   // [PAIRS][ncols][RPB]
+
+    for (int g = 0; g < TRG; ++g) {
+        const int row0 = tb*ROWS + (g*PAIRS + pair)*RPB;
+        float tmp[ncols][RPB];
+        moe_shexp_q8_rows<NB, ncols, RPB, NWq>(vx, (const block_q8_1 *) vy, row0, sh.nrows, sh.stride_row_x, stride_col_y, ty, hand, tmp);
+        if (ty == 0 && is_gate && threadIdx.x == 0) {
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+#pragma unroll
+                for (int i = 0; i < RPB; ++i) {
+                    glu[(pair*ncols + j)*RPB + i] = tmp[j][i];
+                }
+            }
+        }
+        __syncthreads();
+        if (ty == 0 && !is_gate) {
+#pragma unroll
+            for (int j = 0; j < ncols; ++j) {
+#pragma unroll
+                for (int i = 0; i < RPB; ++i) {
+                    if ((int) threadIdx.x == i && row0 + i < sh.nrows) {
+                        float up   = tmp[j][i];
+                        float gate = glu[(pair*ncols + j)*RPB + i];
+                        if constexpr (ncols == 1) {
+                            // the unfused graph runs mul_mat_vec_q's fused epilogue at one column: result += x_biases[j] (0.0f)
+                            up   += 0.0f;
+                            gate += 0.0f;
+                        }
+                        const float r = sh.glu_clamp ? ggml_cuda_op_swiglu_clamp_single(gate, up, sh.glu_limit)
+                                                     : up*ggml_cuda_op_silu_single(gate);
+                        sh.dst[j*sh.stride_col_dst + row0 + i] = r;
+                    }
+                }
+            }
+        }
+        __syncthreads();   // hand/glu are reused by the next row group
+    }
+}
+
+template <int NB, int NW, int NTMAX>
+static __device__ __forceinline__ void moe_shexp_tail(const moe_shexp_args & sh, const void * __restrict__ vy,
+        const int stride_col_y, const int ncols_dst, const int tb, float * __restrict__ smem) {
+    switch (ncols_dst) {
+        case 1: moe_shexp_tail_n<NB, NW, 1>(sh, vy, stride_col_y, tb, smem); break;
+        case 2: moe_shexp_tail_n<NB, NW, 2>(sh, vy, stride_col_y, tb, smem); break;
+        case 3: moe_shexp_tail_n<NB, NW, 3>(sh, vy, stride_col_y, tb, smem); break;
+        case 4: moe_shexp_tail_n<NB, NW, 4>(sh, vy, stride_col_y, tb, smem); break;
+        default:
+            if constexpr (NTMAX > 4) {
+                switch (ncols_dst) {
+                    case 5: moe_shexp_tail_n<NB, NW, 5>(sh, vy, stride_col_y, tb, smem); break;
+                    case 6: moe_shexp_tail_n<NB, NW, 6>(sh, vy, stride_col_y, tb, smem); break;
+                    case 7: moe_shexp_tail_n<NB, NW, 7>(sh, vy, stride_col_y, tb, smem); break;
+                    default: moe_shexp_tail_n<NB, NW, 8>(sh, vy, stride_col_y, tb, smem); break;
+                }
+            }
+            break;
+    }
+}
+
+// rows per tail block / tail block count, host and device
+template <int NW, int ncols>
+static constexpr __host__ __device__ int moe_shexp_rows_per_block() {
+    constexpr int NWq   = ncols <= 4 ? 2 : 1;
+    constexpr int PAIRS = (NW / NWq) / 2;
+    constexpr int TRG   = PAIRS >= 8 ? 1 : 8 / PAIRS;
+    return 4*PAIRS*TRG;
+}
+static int moe_shexp_rows_per_block(int nw, int ncols) {
+    if (ncols <= 4) {
+        return nw == 8 ? moe_shexp_rows_per_block<8, 1>() : moe_shexp_rows_per_block<4, 1>();
+    }
+    return nw == 8 ? moe_shexp_rows_per_block<8, 5>() : moe_shexp_rows_per_block<4, 5>();
+}
+
+template <int NSB, int NW, int RG, int NTMAX, bool GLU, typename block_t = block_q4_K, typename pair_t = moe_q4K_pair, bool SHEXP = false>
 static __global__ void __launch_bounds__(NW*moe_warp_size, 1) mmvq_moe_q4K(
         const void * __restrict__ vx, const void * __restrict__ vgate, const void * __restrict__ vy,
         const int32_t * __restrict__ ids, float * __restrict__ dst,
@@ -220,13 +459,26 @@ static __global__ void __launch_bounds__(NW*moe_warp_size, 1) mmvq_moe_q4K(
         const int stride_col_y, const int stride_channel_y, const int nchannels_y,
         const int stride_col_dst, const int stride_channel_dst,
         const int n_used, const int ncols_dst, const int ids_stride, unsigned int * __restrict__ stats,
-        const bool glu_clamp, const float glu_limit) {
+        const bool glu_clamp, const float glu_limit, const moe_shexp_args sh) {
     static_assert(NSB % 2 == 0, "8 lanes per row need an even superblock count");
     constexpr int NP  = NSB/2;                              // pairs per lane and row
     constexpr int NBY = NSB*(QK_K/QK8_1);
     constexpr int NI  = NBY*(int) (sizeof(block_q8_1)/sizeof(int));
     __shared__ int   y_sh[NTMAX][NI];
     __shared__ float s8_sh[NTMAX][NBY];
+
+    if constexpr (SHEXP) {
+        // shared-expert tail blocks: the same K (NSB superblocks of 256 = NSB*8 Q8_0 blocks); y_sh is their scratch
+        static_assert(sizeof(y_sh) >= sizeof(float)*((NW/2)*4*4*64 + (NW/2)*8*4), "tail scratch does not fit in y_sh");
+        const int n_routed = n_used*ncols_dst;
+        if ((int) blockIdx.y >= n_routed) {
+            const int tb = ((int) blockIdx.y - n_routed)*(int) gridDim.x + (int) blockIdx.x;
+            moe_shexp_tail<NSB*8, NW, NTMAX>(sh, vy, stride_col_y, ncols_dst, tb, (float *) &y_sh[0][0]);
+            return;
+        }
+    } else {
+        GGML_UNUSED(sh);
+    }
 
     int e;
     int sl[NTMAX];
@@ -465,6 +717,49 @@ static unsigned int * moe_dedup_stats(const int device) {
     return ptr[device];
 }
 
+#if defined(GGML_USE_HIP)
+static bool moe_dedup_enabled() {
+    static const bool enabled = !getenv("GGML_MOE_V2") || atoi(getenv("GGML_MOE_V2")) != 0;
+    return enabled;
+}
+// launch configuration knobs (see the Q4_K case below): waves per block for 1..4 and 5..8 tokens
+static int moe_q4k_cfg() {
+    static const int cfg_q4k = getenv("GGML_MOE_V2_Q4K") ? atoi(getenv("GGML_MOE_V2_Q4K")) : 41;
+    return cfg_q4k;
+}
+static int moe_nt8_nw() {
+    static const int nt8_nw = getenv("GGML_MOE_V2_NT8_NW") ? atoi(getenv("GGML_MOE_V2_NT8_NW")) : 8;
+    return nt8_nw;
+}
+static int moe_q4k_nw(int ncols_dst) {
+    if (ncols_dst > 4 && moe_nt8_nw() == 8) {
+        return 8;
+    }
+    switch (moe_q4k_cfg()) {
+        case 11: case 12: return 1;
+        case 22: return 2;
+        case 41: case 42: return 4;
+        default: return 2;
+    }
+}
+#endif
+
+bool ggml_cuda_mmvq_moe_shexp_supported(ggml_type type, ggml_type type_shared, int ncols_x, int ncols_dst, int n_used,
+        ggml_glu_op glu_op, ggml_glu_op glu_op_shared) {
+#if defined(GGML_USE_HIP)
+    static const bool enabled = !getenv("GGML_MOE_SHEXP") || atoi(getenv("GGML_MOE_SHEXP")) != 0;
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    const auto glu_ok = [](ggml_glu_op op) { return op == GGML_GLU_OP_SWIGLU || op == GGML_GLU_OP_SWIGLU_CLAMP; };
+    return enabled && moe_dedup_enabled() && GGML_CUDA_CC_IS_CDNA(cc) &&
+        type == GGML_TYPE_Q4_K && type_shared == GGML_TYPE_Q8_0 && ncols_x == 16*QK_K &&
+        ncols_dst >= 1 && ncols_dst <= 8 && n_used >= 1 && n_used < 64 && n_used*ncols_dst <= 64 &&
+        glu_ok(glu_op) && glu_ok(glu_op_shared) && moe_q4k_nw(ncols_dst) >= 4;
+#else
+    GGML_UNUSED_VARS(type, type_shared, ncols_x, ncols_dst, n_used, glu_op, glu_op_shared);
+    return false;
+#endif
+}
+
 bool ggml_cuda_mmvq_moe_dedup(
         ggml_type type, const void * vx, const void * vy, const int32_t * ids, const ggml_cuda_mm_fusion_args_device & fusion,
         float * dst, int ncols_x, int nrows_x, int nchannels_y,
@@ -473,13 +768,27 @@ bool ggml_cuda_mmvq_moe_dedup(
         int ncols_dst, int n_used, int ids_stride, cudaStream_t stream) {
 #if defined(GGML_USE_HIP)
     // host pass: the CDNA macro only exists in the device pass, so check the device here
-    static const bool enabled = !getenv("GGML_MOE_V2") || atoi(getenv("GGML_MOE_V2")) != 0;
+    const bool enabled = moe_dedup_enabled();
     const int device = ggml_cuda_get_device();
     const int cc     = ggml_cuda_info().devices[device].cc;
     // n_used < 64: moe_route builds (1 << n_used) - 1 masks. A token must not list the same expert twice (top-k never
     // does): only its first slot of an expert would be written.
     if (!enabled || ncols_dst < 1 || ncols_dst > 8 || n_used < 1 || n_used >= 64 || n_used*ncols_dst > 64 || !GGML_CUDA_CC_IS_CDNA(cc)) {
+        GGML_ASSERT(fusion.shared_up == nullptr && "shared-expert fusion needs the dedup kernel (ggml_cuda_mmvq_moe_shexp_supported)");
         return false;
+    }
+    moe_shexp_args sh = {};
+    if (fusion.shared_up) {
+        GGML_ASSERT(type == GGML_TYPE_Q4_K && ncols_x == 16*QK_K && fusion.gate && fusion.shared_gate && fusion.shared_dst);
+        sh.up             = fusion.shared_up;
+        sh.gate           = fusion.shared_gate;
+        sh.dst            = fusion.shared_dst;
+        sh.nrows          = (int) fusion.shared_nrows;
+        sh.stride_row_x   = (int) fusion.shared_stride_row_x;
+        sh.stride_col_dst = (int) fusion.shared_stride_col_dst;
+        sh.glu_clamp      = fusion.shared_glu_op == GGML_GLU_OP_SWIGLU_CLAMP;
+        sh.glu_limit      = fusion.shared_glu_limit;
+        GGML_ASSERT(sh.stride_row_x == 16*QK_K/QK8_0);
     }
     static const bool dbg = getenv("GGML_MOE_V2_DEBUG") && atoi(getenv("GGML_MOE_V2_DEBUG")) != 0;
     if (dbg) {
@@ -502,7 +811,7 @@ bool ggml_cuda_mmvq_moe_dedup(
     const float glu_limit = fusion.glu_limit;
     unsigned int * stats = moe_dedup_stats(device);
     // tuning: GGML_MOE_V2_Q4K = 10*NW + RG, GGML_MOE_V2_Q51 = 10*NW + RG (NW waves per block, RG row groups per wave)
-    static const int cfg_q4k = getenv("GGML_MOE_V2_Q4K") ? atoi(getenv("GGML_MOE_V2_Q4K")) : 41;
+    const int cfg_q4k = moe_q4k_cfg();
     static const int cfg_q51 = getenv("GGML_MOE_V2_Q51") ? atoi(getenv("GGML_MOE_V2_Q51")) : 41;
     switch (type) {
         case GGML_TYPE_Q4_K: {
@@ -512,6 +821,7 @@ bool ggml_cuda_mmvq_moe_dedup(
             static const bool q4k_down_on = !getenv("GGML_MOE_V2_Q4K_DOWN") || atoi(getenv("GGML_MOE_V2_Q4K_DOWN")) != 0;
             const bool k2048 = ncols_x == 8*QK_K && !glu && q4k_down_on;
             if (ncols_x != 10*QK_K && ncols_x != 16*QK_K && !k2048) {
+                GGML_ASSERT(!sh.up);
                 return false;
             }
             auto launch = [&](auto nw_tag, auto rg_tag) {
@@ -522,14 +832,27 @@ bool ggml_cuda_mmvq_moe_dedup(
                 auto go = [&](auto nsb_tag, auto nt_tag) {
                     constexpr int NSB = decltype(nsb_tag)::value;
                     constexpr int NT  = decltype(nt_tag)::value;
-                    if (glu) {
+                    if (glu && sh.up) {
+                        // shared-expert tail blocks after the routed (token, slot) rows of the grid (K = 4096 only)
+                        if constexpr (NSB == 16 && NW >= 4) {
+                            const int rows_tb  = moe_shexp_rows_per_block(NW, ncols_dst);
+                            const int n_tail   = (sh.nrows + rows_tb - 1)/rows_tb;
+                            const int n_tail_y = (n_tail + (int) block_nums.x - 1)/(int) block_nums.x;
+                            const dim3 nums_sh(block_nums.x, block_nums.y + n_tail_y, 1);
+                            mmvq_moe_q4K<NSB, NW, RG, NT, true, block_q4_K, moe_q4K_pair, true><<<nums_sh, block_dims, 0, stream>>>(vx, fusion.gate, vy, ids, dst,
+                                nrows_x, stride_row_x, stride_channel_x, stride_col_y, stride_channel_y, nchannels_y,
+                                stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats, glu_clamp, glu_limit, sh);
+                        } else {
+                            GGML_ABORT("shared-expert fusion: unsupported launch configuration (NSB %d, NW %d)", NSB, NW);
+                        }
+                    } else if (glu) {
                         mmvq_moe_q4K<NSB, NW, RG, NT, true><<<block_nums, block_dims, 0, stream>>>(vx, fusion.gate, vy, ids, dst,
                             nrows_x, stride_row_x, stride_channel_x, stride_col_y, stride_channel_y, nchannels_y,
-                            stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats, glu_clamp, glu_limit);
+                            stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats, glu_clamp, glu_limit, sh);
                     } else {
                         mmvq_moe_q4K<NSB, NW, RG, NT, false><<<block_nums, block_dims, 0, stream>>>(vx, vx, vy, ids, dst,
                             nrows_x, stride_row_x, stride_channel_x, stride_col_y, stride_channel_y, nchannels_y,
-                            stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats, false, 0.0f);
+                            stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats, false, 0.0f, sh);
                     }
                 };
                 // 1..4 tokens keep the 4-token instantiation; 5..8 (concurrent decode, 6 slots) take 8
@@ -552,7 +875,7 @@ bool ggml_cuda_mmvq_moe_dedup(
             // is the only way to add waves: 8 waves (default; GGML_MOE_V2_NT8_NW=4 for 4). Rows map to waves differently,
             // each row is still reduced by the same 8 lanes in the same order (bit-identical). rune GLM, 6 streams: 75.6 -> 79.9 t/s.
             // GGML_MOE_V2_Q4K applies to 5..8 tokens only with GGML_MOE_V2_NT8_NW=4.
-            static const int nt8_nw = getenv("GGML_MOE_V2_NT8_NW") ? atoi(getenv("GGML_MOE_V2_NT8_NW")) : 8;
+            const int nt8_nw = moe_nt8_nw();
             if (ncols_dst > 4 && nt8_nw == 8) {
                 launch(std::integral_constant<int, 8>{}, std::integral_constant<int, 1>{});
                 return true;
@@ -580,7 +903,7 @@ bool ggml_cuda_mmvq_moe_dedup(
                 const dim3 block_nums((nrows_x + 8*RG*NW - 1) / (8*RG*NW), n_used*ncols_dst, 1);
                 mmvq_moe_q4K<8, NW, RG, 8, false, block_q5_K, moe_q5K_pair><<<block_nums, block_dims, 0, stream>>>(vx, vx, vy, ids, dst,
                     nrows_x, stride_row_x, stride_channel_x, stride_col_y, stride_channel_y, nchannels_y,
-                    stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats, false, 0.0f);
+                    stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats, false, 0.0f, sh);
                 return true;
             }
             constexpr int NW = 4, RG = 1;
@@ -589,11 +912,11 @@ bool ggml_cuda_mmvq_moe_dedup(
             if (ncols_dst <= 4) {
                 mmvq_moe_q4K<8, NW, RG, 4, false, block_q5_K, moe_q5K_pair><<<block_nums, block_dims, 0, stream>>>(vx, vx, vy, ids, dst,
                     nrows_x, stride_row_x, stride_channel_x, stride_col_y, stride_channel_y, nchannels_y,
-                    stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats, false, 0.0f);
+                    stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats, false, 0.0f, sh);
             } else {
                 mmvq_moe_q4K<8, NW, RG, 8, false, block_q5_K, moe_q5K_pair><<<block_nums, block_dims, 0, stream>>>(vx, vx, vy, ids, dst,
                     nrows_x, stride_row_x, stride_channel_x, stride_col_y, stride_channel_y, nchannels_y,
-                    stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats, false, 0.0f);
+                    stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats, false, 0.0f, sh);
             }
             return true;
         }

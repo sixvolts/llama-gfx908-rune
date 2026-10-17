@@ -1167,6 +1167,7 @@ static void mul_mat_vec_q_switch_ncols_dst(
             ncols_dst, nchannels_dst, ids_stride, stream)) {
         return;
     }
+    GGML_ASSERT(fusion.shared_up == nullptr && "shared-expert fusion is only implemented by the MoE dedup kernel");
     if (has_ids && ncols_dst > 1) {
         // Multi-token MUL_MAT_ID path - dedicated MoE kernel
         mul_mat_vec_q_moe_launch<type>(
@@ -1518,6 +1519,27 @@ void ggml_cuda_mul_mat_vec_q(
         }
         fusion_local.glu_op = fusion->glu_op;
         fusion_local.glu_limit = fusion->glu_limit;
+
+        if (fusion->shared_up) {
+            // dense shared expert over the same activation, computed by tail blocks of the MoE dedup kernel (mmvq-moe.cu)
+            GGML_ASSERT(ids && fusion->gate && fusion->shared_gate && fusion->shared_dst);
+            GGML_ASSERT(!fusion->x_bias && !fusion->gate_bias && !fusion->x_scale && !fusion->gate_scale);
+            GGML_ASSERT(ne11 == 1 && ne03 == 1 && ne13 == 1);
+            GGML_ASSERT(fusion->shared_up->type == fusion->shared_gate->type);
+            GGML_ASSERT(ggml_are_same_shape(fusion->shared_up, fusion->shared_gate));
+            GGML_ASSERT(ggml_is_contiguous(fusion->shared_up) && ggml_is_contiguous(fusion->shared_gate));
+            GGML_ASSERT(fusion->shared_up->ne[0] == ne00 && ggml_is_matrix(fusion->shared_up));
+            GGML_ASSERT(fusion->shared_dst->type == GGML_TYPE_F32 && ggml_is_contiguous(fusion->shared_dst));
+            GGML_ASSERT(fusion->shared_dst->ne[0] == fusion->shared_up->ne[1] && fusion->shared_dst->ne[1] == ne2);
+            fusion_local.shared_up             = fusion->shared_up->data;
+            fusion_local.shared_gate           = fusion->shared_gate->data;
+            fusion_local.shared_dst            = (float *) fusion->shared_dst->data;
+            fusion_local.shared_nrows          = fusion->shared_up->ne[1];
+            fusion_local.shared_stride_row_x   = fusion->shared_up->nb[1] / ggml_type_size(fusion->shared_up->type);
+            fusion_local.shared_stride_col_dst = fusion->shared_dst->nb[1] / ts_dst;
+            fusion_local.shared_glu_op         = fusion->shared_glu_op;
+            fusion_local.shared_glu_limit      = fusion->shared_glu_limit;
+        }
     }
 
     // If src0 is a temporary compute buffer, clear any potential padding.

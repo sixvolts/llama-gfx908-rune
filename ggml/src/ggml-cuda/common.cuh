@@ -1626,6 +1626,13 @@ struct ggml_cuda_mm_fusion_args_host {
     const ggml_tensor * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    // shared expert fused into the routed MUL_MAT_ID gate/up/GLU (upstream #29184 idea; mmvq-moe.cu tail blocks):
+    // dense ffn_{up,gate}_shexp over the same activation, written to shared_dst = the shared GLU node
+    const ggml_tensor * shared_up   = nullptr;
+    const ggml_tensor * shared_gate = nullptr;
+    ggml_tensor *       shared_dst  = nullptr;
+    ggml_glu_op         shared_glu_op;
+    float               shared_glu_limit = 0.0f;
 };
 struct ggml_cuda_mm_fusion_args_device {
     const void * x_bias = nullptr;
@@ -1635,6 +1642,14 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    const void * shared_up   = nullptr;
+    const void * shared_gate = nullptr;
+    float *      shared_dst  = nullptr;
+    uint32_t     shared_nrows = 0;
+    uint32_t     shared_stride_row_x  = 0;   // quant blocks per shared weight row
+    uint32_t     shared_stride_col_dst = 0;  // elements per token column of shared_dst
+    ggml_glu_op  shared_glu_op;
+    float        shared_glu_limit = 0.0f;
 };
 
 struct ggml_cuda_kernel_launch_params {

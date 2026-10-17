@@ -33,6 +33,7 @@
 #include "ggml-cuda/mm-thin-f16.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mmvq-moe.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -1938,6 +1939,58 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     }
 
     return use_mul_mat_vec_q;
+}
+
+// Shared expert fused into the routed gate/up/GLU GEMV (upstream #29184; ours allows a different quant type for the
+// shared expert and leaves the kernel support decision to mmvq-moe.cu): routed_idx = {MUL_MAT_ID, MUL_MAT_ID, GLU} of
+// the routed experts, shared_idx = {MUL_MAT, MUL_MAT, GLU} of the dense shared expert over the same activation.
+static bool ggml_cuda_match_shared_expert(const ggml_cgraph * graph, int routed_idx, int shared_idx) {
+    if (routed_idx + 2 >= graph->n_nodes || shared_idx + 2 >= graph->n_nodes || shared_idx < routed_idx + 3) {
+        return false;
+    }
+    const int nodes[] = { routed_idx, routed_idx + 1, routed_idx + 2, shared_idx, shared_idx + 1, shared_idx + 2 };
+    const ggml_op ops[] = { GGML_OP_MUL_MAT_ID, GGML_OP_MUL_MAT_ID, GGML_OP_GLU,
+                           GGML_OP_MUL_MAT, GGML_OP_MUL_MAT, GGML_OP_GLU };
+    const int outputs[] = { routed_idx + 2, shared_idx + 2 };
+    if (!ggml_can_fuse_subgraph_ext(graph, nodes, 6, ops, outputs, 2)) {
+        return false;
+    }
+
+    const ggml_tensor * routed      = graph->nodes[routed_idx + 2];
+    const ggml_tensor * shared      = graph->nodes[shared_idx + 2];
+    const ggml_tensor * gate        = routed->src[0];
+    const ggml_tensor * up          = routed->src[1];
+    const ggml_tensor * shared_gate = shared->src[0];
+    const ggml_tensor * shared_up   = shared->src[1];
+    const auto is_pair = [&](const ggml_tensor * a, const ggml_tensor * b, int idx) {
+        return (a == graph->nodes[idx] && b == graph->nodes[idx + 1]) ||
+               (b == graph->nodes[idx] && a == graph->nodes[idx + 1]);
+    };
+    if (!is_pair(gate, up, routed_idx) || !is_pair(shared_gate, shared_up, shared_idx) ||
+            !ggml_cuda_should_fuse_mul_mat(up, gate, routed) ||
+            !ggml_cuda_should_fuse_mul_mat(shared_up, shared_gate, shared) ||
+            !up->src[0]->buffer ||
+            !ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+        return false;
+    }
+    const ggml_tensor * input         = up->src[1];
+    const ggml_tensor * ids           = up->src[2];
+    const ggml_tensor * weight        = up->src[0];
+    const ggml_tensor * shared_weight = shared_up->src[0];
+    if (input->op != GGML_OP_RESHAPE || input->src[0] != shared_up->src[1] ||
+            input->ne[1] != 1 || input->ne[3] != 1 || !ggml_is_contiguous(input) ||
+            !ggml_is_contiguous(shared_up->src[1]) || !ggml_is_matrix(shared_up->src[1]) ||
+            weight->ne[0] != shared_weight->ne[0] || weight->ne[3] != 1 ||
+            !ggml_is_matrix(shared_weight) || !ggml_is_contiguous(shared_weight) ||
+            !ggml_is_contiguous(shared_gate->src[0]) || !ggml_is_contiguous(routed) || !ggml_is_contiguous(shared)) {
+        return false;
+    }
+    if (shared_weight->op != GGML_OP_NONE || shared_gate->src[0]->op != GGML_OP_NONE || !shared_weight->buffer ||
+            shared->ne[0] != shared_weight->ne[1] || shared->ne[1] != input->ne[2]) {
+        return false;
+    }
+    return ggml_cuda_mmvq_moe_shexp_supported(weight->type, shared_weight->type, (int) weight->ne[0], (int) input->ne[2],
+            (int) ids->ne[0], ggml_get_glu_op(routed), ggml_get_glu_op(shared));
 }
 
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
@@ -4431,6 +4484,28 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     ggml_tensor * node = cgraph->nodes[i];
 
+    // routed gate/up/GLU + shared expert gate/up/GLU in one launch (grouped by graph_optimize)
+    if (node->op == GGML_OP_MUL_MAT_ID && cuda_ctx->stream_context().concurrent_events.empty() &&
+            ggml_cuda_match_shared_expert(cgraph, i, i + 3)) {
+        const int outputs[] = { i + 2, i + 5 };
+        if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, 6, outputs, 2)) {
+            ggml_tensor * routed = cgraph->nodes[i + 2];
+            ggml_tensor * shared = cgraph->nodes[i + 5];
+            const ggml_tensor * up = routed->src[1];
+            ggml_cuda_mm_fusion_args_host fusion{};
+            fusion.gate             = routed->src[0]->src[0];
+            fusion.glu_op           = ggml_get_glu_op(routed);
+            fusion.glu_limit        = ggml_get_op_params_f32(routed, 3);
+            fusion.shared_up        = shared->src[1]->src[0];
+            fusion.shared_gate      = shared->src[0]->src[0];
+            fusion.shared_dst       = shared;
+            fusion.shared_glu_op    = ggml_get_glu_op(shared);
+            fusion.shared_glu_limit = ggml_get_op_params_f32(shared, 3);
+            ggml_cuda_mul_mat_vec_q(*cuda_ctx, up->src[0], up->src[1], up->src[2], routed, &fusion);
+            return 5;
+        }
+    }
+
     if (node->op == GGML_OP_DSV4_HC_POST || node->op == GGML_OP_DSV4_HC_MIX) {
         const int skip = ggml_cuda_try_fuse_hc_norm(cuda_ctx, cgraph, i);
         if (skip > 0) {
@@ -5865,6 +5940,8 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     // GGML_CUDA_GRAPH_STATS=1: per-device counts of graph launches by kind (reused exec / re-captured / eager) and the
     // host time of re-captures, logged every 1000 computes. Diagnostics only.
     static const bool graph_stats = getenv("GGML_CUDA_GRAPH_STATS") && atoi(getenv("GGML_CUDA_GRAPH_STATS")) != 0;
+    // GGML_CUDA_GRAPH_STATS=<n> with n > 1: log every n computes instead of every 1000
+    static const int64_t gs_every = graph_stats && atoi(getenv("GGML_CUDA_GRAPH_STATS")) > 1 ? atoi(getenv("GGML_CUDA_GRAPH_STATS")) : 1000;
     static int64_t gs_n[GGML_CUDA_MAX_DEVICES][3] = {};
     static double  gs_t[GGML_CUDA_MAX_DEVICES][3] = {};
     const int64_t gs_t0 = graph_stats ? ggml_time_us() : 0;
@@ -5878,7 +5955,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         const int d = cuda_ctx->device;
         gs_n[d][kind]++; gs_t[d][kind] += ggml_time_us() - gs_t0;
         const int64_t tot = gs_n[d][0] + gs_n[d][1] + gs_n[d][2];
-        if (tot % 1000 == 0) {
+        if (tot % gs_every == 0) {
             GGML_LOG_WARN("cuda graph stats dev%d: reused %lld (%.2f ms avg) | re-captured %lld (%.2f ms avg) | eager %lld (%.2f ms avg) | nodes %d | keys %zu\n", d,
                 (long long) gs_n[d][0], gs_n[d][0] ? gs_t[d][0]/gs_n[d][0]/1e3 : 0.0, (long long) gs_n[d][1], gs_n[d][1] ? gs_t[d][1]/gs_n[d][1]/1e3 : 0.0,
                 (long long) gs_n[d][2], gs_n[d][2] ? gs_t[d][2]/gs_n[d][2]/1e3 : 0.0, cgraph->n_nodes, cuda_ctx->cuda_graphs.size());
@@ -5920,6 +5997,29 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
     static const bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
     if (!disable_fusion) {
+        // shared expert: move its {MUL_MAT, MUL_MAT, GLU} right after the routed {MUL_MAT_ID, MUL_MAT_ID, GLU} so one
+        // launch computes both (ggml_cuda_try_fuse); the activation and the ids must outlive the shared output, which
+        // the fused kernel writes while it still reads them
+        ggml_cuda_set_device(cuda_ctx->device);
+        for (int i = 0; i + 5 < cgraph->n_nodes; ++i) {
+            if (cgraph->nodes[i]->op != GGML_OP_MUL_MAT_ID) {
+                continue;
+            }
+            for (int j = i + 3; j + 2 < cgraph->n_nodes; ++j) {
+                if (cgraph->nodes[j]->op == GGML_OP_MUL_MAT_ID && cgraph->nodes[j + 1]->op == GGML_OP_MUL_MAT_ID) {
+                    break;
+                }
+                if (cgraph->nodes[j]->op != GGML_OP_MUL_MAT || !ggml_cuda_match_shared_expert(cgraph, i, j)) {
+                    continue;
+                }
+                std::rotate(cgraph->nodes + i + 3, cgraph->nodes + j, cgraph->nodes + j + 3);
+                ggml_tensor * up = cgraph->nodes[i + 2]->src[1];
+                params->add_alloc_dep(params->user_data, up->src[1], cgraph->nodes[i + 5]);
+                params->add_alloc_dep(params->user_data, up->src[2], cgraph->nodes[i + 5]);
+                i += 5;
+                break;
+            }
+        }
         for (int i = 0; i < cgraph->n_nodes; ++i) {
             if (cgraph->nodes[i]->op != GGML_OP_MUL) {
                 continue;

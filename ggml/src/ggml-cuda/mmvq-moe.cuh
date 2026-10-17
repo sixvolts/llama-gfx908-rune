@@ -12,3 +12,8 @@ bool ggml_cuda_mmvq_moe_dedup(
         int stride_row_x, int stride_col_y, int stride_col_dst,
         int stride_channel_x, int stride_channel_y, int stride_channel_dst,
         int ncols_dst, int n_used, int ids_stride, cudaStream_t stream);
+
+// Whether ggml_cuda_mmvq_moe_dedup can fuse a dense shared expert (type_shared, same K) into the routed gate/up/GLU
+// launch for this shape (GLM-5.3-Flash: Q4_K routed, Q8_0 shared, K = 4096, 1..8 tokens). GGML_MOE_SHEXP=0 disables.
+bool ggml_cuda_mmvq_moe_shexp_supported(ggml_type type, ggml_type type_shared, int ncols_x, int ncols_dst, int n_used,
+        ggml_glu_op glu_op, ggml_glu_op glu_op_shared);
