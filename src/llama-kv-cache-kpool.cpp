@@ -10,6 +10,7 @@
 #include <chrono>
 #include <cstring>
 #include <iterator>
+#include <map>
 #include <thread>
 #include <cmath>
 #include <cstdlib>
@@ -1135,6 +1136,54 @@ void llama_kv_cache_set_input_kpool(
             LLAMA_LOG_WARN("kpool input: %.3f ms per call (mean of 256; n_kv %lld, streams %lld)\n", acc_ms/256,
                     (long long) n_kv, (long long) pool_cells->ne[1]);
             acc_ms = 0.0;
+        }
+    }
+
+    // LLAMA_KPOOL_VERIFY also audits the scatter list: the fixed-size list may name one global row from several
+    // entries (the padding repeats a complete pool; a rebuild with cells shared by seq_cp re-pools a shared pool once
+    // per sequence), and the write is benign on every backend only while each entry gives the row the same member
+    // cells, hence the same pooled value (upstream #29994 was a race between DIFFERENT values for one row). Also
+    // checks that every row lies in its stream and is the row of the entry's last member.
+    if (verify && pool_reps) {
+        const int64_t n_ns      = pool_cells->ne[1];
+        const int64_t r         = kpool;
+        const int64_t n_new_max = new_pool_cells->ne[0]/r;
+        const int32_t * cells   = (const int32_t *) new_pool_cells->data;
+        const int64_t * reps    = (const int64_t *) new_pool_reps->data;
+
+        static int64_t n_dup = 0;
+        std::map<int64_t, const int32_t *> first;
+
+        for (int64_t s = 0; s < n_ns; ++s) {
+            for (int64_t p = 0; p < n_new_max; ++p) {
+                const int64_t   row = reps[s*n_new_max + p];
+                const int32_t * mem = cells + s*(r*n_new_max) + p*r;
+
+                if (row < 0 || row/kv_size != (int64_t) strm_of[s] || row % kv_size != mem[r - 1]) {
+                    LLAMA_LOG_ERROR("kpool input: scatter row %lld of stream %lld slot %lld is not its last member's "
+                            "row in its stream (strm %u, cell %d)\n", (long long) row, (long long) s, (long long) p,
+                            strm_of[s], mem[r - 1]);
+                    GGML_ABORT("LLAMA_KPOOL_VERIFY bad scatter row");
+                }
+
+                auto it = first.find(row);
+                if (it == first.end()) {
+                    first.emplace(row, mem);
+                } else {
+                    ++n_dup;
+                    if (memcmp(it->second, mem, r*sizeof(int32_t)) != 0) {
+                        LLAMA_LOG_ERROR("kpool input: scatter row %lld written from two entries with different "
+                                "members (stream %lld slot %lld)\n", (long long) row, (long long) s, (long long) p);
+                        GGML_ABORT("LLAMA_KPOOL_VERIFY scatter row race");
+                    }
+                }
+            }
+        }
+
+        static int64_t n_audited = 0;
+        if (++n_audited % 256 == 0) {
+            LLAMA_LOG_WARN("kpool input: %lld scatter lists audited, %lld duplicate rows, all with identical members\n",
+                    (long long) n_audited, (long long) n_dup);
         }
     }
 
