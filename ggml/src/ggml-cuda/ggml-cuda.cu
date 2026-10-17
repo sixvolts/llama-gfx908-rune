@@ -5863,8 +5863,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
     ggml_cuda_q8_cache_begin(*cuda_ctx);
     // GGML_CUDA_GRAPH_STATS=1: per-device counts of graph launches by kind (reused exec / re-captured / eager) and the
-    // host time of re-captures, logged every 1000 computes. Diagnostics only.
+    // host time of re-captures, logged every 1000 computes (GGML_CUDA_GRAPH_STATS=<n>, n > 1: every n). Diagnostics only.
     static const bool graph_stats = getenv("GGML_CUDA_GRAPH_STATS") && atoi(getenv("GGML_CUDA_GRAPH_STATS")) != 0;
+    static const int64_t gs_every = graph_stats && atoi(getenv("GGML_CUDA_GRAPH_STATS")) > 1 ? atoi(getenv("GGML_CUDA_GRAPH_STATS")) : 1000;
     static int64_t gs_n[GGML_CUDA_MAX_DEVICES][3] = {};
     static double  gs_t[GGML_CUDA_MAX_DEVICES][3] = {};
     const int64_t gs_t0 = graph_stats ? ggml_time_us() : 0;
@@ -5878,7 +5879,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         const int d = cuda_ctx->device;
         gs_n[d][kind]++; gs_t[d][kind] += ggml_time_us() - gs_t0;
         const int64_t tot = gs_n[d][0] + gs_n[d][1] + gs_n[d][2];
-        if (tot % 1000 == 0) {
+        if (tot % gs_every == 0) {
             GGML_LOG_WARN("cuda graph stats dev%d: reused %lld (%.2f ms avg) | re-captured %lld (%.2f ms avg) | eager %lld (%.2f ms avg) | nodes %d | keys %zu\n", d,
                 (long long) gs_n[d][0], gs_n[d][0] ? gs_t[d][0]/gs_n[d][0]/1e3 : 0.0, (long long) gs_n[d][1], gs_n[d][1] ? gs_t[d][1]/gs_n[d][1]/1e3 : 0.0,
                 (long long) gs_n[d][2], gs_n[d][2] ? gs_t[d][2]/gs_n[d][2]/1e3 : 0.0, cgraph->n_nodes, cuda_ctx->cuda_graphs.size());
