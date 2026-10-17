@@ -3155,6 +3155,15 @@ void common_speculative_print_stats(const common_speculative * spec) {
             str_stats = ", #mean acc len = " + oss.str() + ", #acc rate/pos = (" + tmp.str() + ")";
         }
 
+        // LLAMA_SPEC_STATS_INFO=1: log the statistics at INFO level (the MTP per-draft-decode timings)
+        static const bool stats_info = getenv("LLAMA_SPEC_STATS_INFO") && atoi(getenv("LLAMA_SPEC_STATS_INFO")) != 0;
+        if (stats_info) {
+            SPC_INF("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu%s%s\n",
+                    common_speculative_type_to_str(impl->type).c_str(),
+                    impl->n_call_begin, impl->n_call_draft, impl->n_call_accept,
+                    impl->n_gen_drafts, impl->n_acc_drafts, impl->n_gen_tokens, impl->n_acc_tokens,
+                    str_stats.c_str(), str_perf.c_str());
+        }
         SPC_TRC("statistics %16s: #calls(b,g,a) = %4zu %6zu %6zu, #gen drafts = %6zu, #acc drafts = %5zu, #gen tokens = %6zu, #acc tokens = %5zu%s%s\n",
                 common_speculative_type_to_str(impl->type).c_str(),
                 impl->n_call_begin, impl->n_call_draft, impl->n_call_accept,
