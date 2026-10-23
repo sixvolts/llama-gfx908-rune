@@ -1779,6 +1779,20 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
                 const auto * cur_p = common_sampler_get_candidates(smpl, true);
 
+                // LLAMA_MTP_DUMP_H=<file>: append the LM-head input row of every draft decode as {int32 depth, n_embd x f32}
+                // (training data for a low-rank candidate head); at most LLAMA_MTP_DUMP_H_MAX rows (default 200000).
+                {
+                    static FILE * dump_h = getenv("LLAMA_MTP_DUMP_H") ? fopen(getenv("LLAMA_MTP_DUMP_H"), "ab") : nullptr;
+                    static const long dump_max = getenv("LLAMA_MTP_DUMP_H_MAX") ? atol(getenv("LLAMA_MTP_DUMP_H_MAX")) : 200000;
+                    static long dump_n = 0;
+                    if (dump_h && h_row && dump_n < dump_max) {
+                        const int32_t depth = i;
+                        fwrite(&depth, sizeof(depth), 1, dump_h);
+                        fwrite(h_row, sizeof(float), n_embd, dump_h);
+                        if (++dump_n % 1024 == 0 || dump_n == dump_max) { fflush(dump_h); }
+                    }
+                }
+
                 for (int k = 0; k < std::min(3, (int) cur_p->size); ++k) {
                     SPC_DBG(" - seq_id %d, draft candidate %3d, pos %3d: %6d (%8.3f) '%s'\n",
                             seq_id, k, i, cur_p->data[k].id, cur_p->data[k].p,

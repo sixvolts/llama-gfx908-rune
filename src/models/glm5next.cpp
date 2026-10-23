@@ -229,6 +229,13 @@ void llama_model_glm5next::load_arch_tensors(llama_model_loader & ml) {
             layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", il), {n_embd}, flags);
             layer.nextn.embed_tokens     = create_tensor(tn(LLM_TENSOR_NEXTN_EMBED_TOKENS,     "weight", il), {n_embd, n_vocab}, flags | TENSOR_NOT_REQUIRED);
             layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), {n_embd, n_vocab}, flags | TENSOR_NOT_REQUIRED);
+
+            // rune: low-rank candidate head (lrhead/train_lrhead.py); its rank is whatever the file was trained with
+            if (const ggml_tensor * m = ml.get_tensor_meta(tn(LLM_TENSOR_NEXTN_LR_HEAD_A, "weight", il).str().c_str())) {
+                const int64_t rank = m->ne[0];
+                layer.nextn.lr_head_a = create_tensor(tn(LLM_TENSOR_NEXTN_LR_HEAD_A, "weight", il), {rank, n_vocab}, flags);
+                layer.nextn.lr_head_b = create_tensor(tn(LLM_TENSOR_NEXTN_LR_HEAD_B, "weight", il), {n_embd, rank}, flags);
+            }
         }
     }
 }
@@ -854,7 +861,34 @@ llama_model_glm5next::graph_mtp::graph_mtp(const llama_model & model, const llm_
     ggml_tensor * head_w = layer.nextn.shared_head_head ? layer.nextn.shared_head_head : model.output;
     ggml_tensor * head_s = layer.nextn.shared_head_head ? layer.nextn.shared_head_head_s : model.output_s;
     GGML_ASSERT(head_w && "glm5next MTP: no nextn.shared_head_head and no output");
-    cur = build_lora_mm(head_w, cur, head_s);
+
+    // rune (EAGLE-4 style efficient head): with the optional low-rank factors, the rank-r head A (B h) only RETRIEVES the
+    // top-K candidates (LLAMA_MTP_LRHEAD_K, default 256; 0 = full head); those K are scored exactly with their rows of the
+    // real head and scattered into a -inf vocabulary row, so the draft samplers see ordinary logits. The drafted
+    // distribution then lives on the candidates only, which speculative verification handles exactly (any draft
+    // distribution is valid; it only moves acceptance). Reads ~0.04-0.08 GB instead of the 0.67 GB head per draft decode.
+    static const int lr_k = getenv("LLAMA_MTP_LRHEAD_K") ? atoi(getenv("LLAMA_MTP_LRHEAD_K")) : 256;
+    // draft decodes only (1..16 output rows): the catch-up pass has 0 outputs (a [d, K, 0] batched mul_mat divides by
+    // zero in ggml_can_mul_mat) and a wide prompt pass would gather K rows per output
+    const int64_t n_out = cur->ne[1];
+    if (layer.nextn.lr_head_a && layer.nextn.lr_head_b && lr_k > 0 && !head_s && n_out >= 1 && n_out <= 16) {
+        ggml_tensor * t  = ggml_mul_mat(ctx0, layer.nextn.lr_head_b, cur);          // [rank, n_out]
+        ggml_tensor * zt = ggml_mul_mat(ctx0, layer.nextn.lr_head_a, t);            // [n_vocab, n_out]
+        cb(zt, "mtp_lr_logits", -1);
+        ggml_tensor * ids = ggml_top_k(ctx0, zt, lr_k);                             // [K, n_out] i32
+        cb(ids, "mtp_lr_ids", -1);
+        ggml_tensor * rows = ggml_get_rows(ctx0, head_w, ggml_reshape_1d(ctx0, ids, lr_k*n_out)); // [n_embd, K*n_out] f32
+        rows = ggml_reshape_3d(ctx0, rows, rows->ne[0], lr_k, n_out);
+        ggml_tensor * h3   = ggml_reshape_3d(ctx0, cur, cur->ne[0], 1, n_out);
+        ggml_tensor * zc   = ggml_mul_mat(ctx0, rows, h3);                          // [K, 1, n_out] exact logits
+        cb(zc, "mtp_lr_exact", -1);
+        ggml_tensor * full = ggml_fill(ctx0, zt, -INFINITY);
+        full = ggml_set_rows(ctx0, ggml_reshape_3d(ctx0, full, 1, full->ne[0], n_out),
+                             ggml_reshape_3d(ctx0, zc, 1, lr_k, n_out), ids);
+        cur = ggml_reshape_2d(ctx0, full, full->ne[1], n_out);
+    } else {
+        cur = build_lora_mm(head_w, cur, head_s);
+    }
     cb(cur, "result_output", -1);
 
     res->t_logits = cur;

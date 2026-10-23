@@ -956,6 +956,30 @@ std::vector<llama_token> common_sampler_sample_and_accept_n_rejection(struct com
             }
         }
 
+        // LLAMA_SPEC_TREELOG=<file>: per verified draft row, the quantities an offline tree-drafting estimate needs:
+        //   "T <row> <n_draft> <p_x> <q_x> <alpha> <p(S1)> <p(S2)> <p(S4)> <p(S10)>"
+        // alpha = sum_x min(p, q) (expected chain rejection acceptance), p(Sk) = target mass on the draft's top-k
+        // candidates (sample-and-match acceptance of a k-wide sibling set). Diagnostics only; does not touch sampling.
+        static FILE * tree_log = getenv("LLAMA_SPEC_TREELOG") ? fopen(getenv("LLAMA_SPEC_TREELOG"), "a") : nullptr;
+        static const bool tree_log_lb = tree_log && setvbuf(tree_log, nullptr, _IOLBF, 0) == 0; (void) tree_log_lb;
+        if (tree_log) {
+            std::vector<llama_token_data> qs(q.begin(), q.end());
+            std::sort(qs.begin(), qs.end(), [](const llama_token_data & a, const llama_token_data & b) { return a.p > b.p; });
+            float alpha = 0.0f, pS[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+            static const size_t kS[4] = { 1, 2, 4, 10 };
+            for (size_t j = 0; j < qs.size(); ++j) {
+                float pj = 0.0f;
+                for (size_t k = 0; k < cur_p->size; ++k) {
+                    if (cur_p->data[k].id == qs[j].id) { pj = p_of(k); break; }
+                }
+                alpha += std::min(pj, qs[j].p);
+                for (int s = 0; s < 4; ++s) {
+                    if (j < kS[s]) { pS[s] += pj; }
+                }
+            }
+            fprintf(tree_log, "T %zu %zu %.5f %.5f %.5f %.5f %.5f %.5f %.5f\n", i, draft.size(), p_x, q_x, alpha, pS[0], pS[1], pS[2], pS[3]);
+        }
+
         if (q_x > 0.0f && (p_x >= q_x || uni(gsmpl->rng) < p_x / q_x)) {
             common_sampler_accept(gsmpl, draft[i], true);
             result.push_back(draft[i]);
