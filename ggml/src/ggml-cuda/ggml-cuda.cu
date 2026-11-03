@@ -2848,12 +2848,23 @@ static void ggml_cuda_cpy_host_staged(ggml_backend_cuda_context * ctx_src, ggml_
         if (ht) { ggml_host_trace("ring_e", ctx_src->device, (int64_t) nbytes); }
     }
     if (r.size[i] < slot_bytes) {
+        // cudaFreeHost synchronizes the device (~1 ms on rune): decode copies of varying size kept regrowing slots
+        // to the exact size every few steps (w74 trace: ~1.5 per decode step, all GPUs idle). Grow by 1.5x in 1 MiB
+        // steps instead (GGML_CUDA_STAGE_RING_GROW=0: exact size). The trailer check keys on the sequence number, so
+        // bytes past nbytes in a larger slot are never read as data.
+        static const bool grow = !(getenv("GGML_CUDA_STAGE_RING_GROW") && atoi(getenv("GGML_CUDA_STAGE_RING_GROW")) == 0);
+        const size_t alloc = grow ? GGML_PAD(std::max(slot_bytes, r.size[i] + r.size[i] / 2), (size_t) 1 << 20) : slot_bytes;
+        static const bool alloc_log = getenv("GGML_CUDA_ALLOC_LOG") && atoi(getenv("GGML_CUDA_ALLOC_LOG")) != 0;
+        if (alloc_log) {
+            GGML_LOG_WARN("[ring] dev%d->dev%d slot %d regrow %zu -> %zu (copy %zu bytes)\n",
+                ctx_src->device, ctx_dst->device, i, r.size[i], alloc, nbytes);
+        }
         if (r.buf[i]) {
             CUDA_CHECK(cudaFreeHost(r.buf[i]));
         }
-        CUDA_CHECK(cudaMallocHost(&r.buf[i], slot_bytes));
-        memset(r.buf[i], 0, slot_bytes);
-        r.size[i] = slot_bytes;
+        CUDA_CHECK(cudaMallocHost(&r.buf[i], alloc));
+        memset(r.buf[i], 0, alloc);
+        r.size[i] = alloc;
     }
     if (!r.d2h_done[i]) {
         ggml_cuda_set_device(ctx_src->device);
