@@ -11470,9 +11470,17 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
             true, 16, 8, b, false, true, false));
     }
 
+    // prompt-batch MoE (MMQ) at the GLM-5.3 expert shapes for the CDNA Q6_K dot (mmq-vec-dot.cuh): partial row tile,
+    // 64 / 512 tokens over 32 experts
+    for (int n_tok : {64, 512}) {
+        for (int k : {2048, 4096}) {
+            test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 32, 8, false, 200, n_tok, k));
+        }
+    }
+
     // few-token expert-dedup MoE kernels (mmvq-moe.cu) at their shapes (Qwen3.8 K=2560, GLM-5.3 K=4096 gate/up and
-    // K=2048 down in Q5_K (UD quant) and Q4_K (rune quant)), 1..8 tokens; 32 experts so tokens share experts; 72 rows
-    // for a partial row tile, 76 for a partial 8-row group
+    // K=2048 down in Q5_K (UD quant) and Q4_K (rune quant), Q6_K at both (rune XL+)), 1..8 tokens; 32 experts so tokens
+    // share experts; 72 rows for a partial row tile, 76 for a partial 8-row group
     for (int n_tok : {1, 2, 3, 4, 5, 6, 7, 8}) {
         for (bool b : {false, true}) {
             for (int rows : {72, 76}) {
@@ -11480,10 +11488,14 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
                 test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32, 8, b, rows, n_tok, 2560));
                 test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q5_K, GGML_TYPE_F32, 32, 8, b, rows, n_tok, 2048));
                 test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q4_K, GGML_TYPE_F32, 32, 8, b, rows, n_tok, 2048));
+                test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 32, 8, b, rows, n_tok, 2048));
+                test_cases.emplace_back(new test_mul_mat_id(GGML_TYPE_Q6_K, GGML_TYPE_F32, 32, 8, b, rows, n_tok, 4096));
             }
         }
         for (ggml_glu_op op : {GGML_GLU_OP_SWIGLU, GGML_GLU_OP_SWIGLU_CLAMP}) {
             test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q4_K, op, n_tok, 72, 4096,
+                true, 32, 8, true, false, true, false, {1, 1}));
+            test_cases.emplace_back(new test_mul_mat_vec_fusion(GGML_TYPE_Q6_K, op, n_tok, 72, 4096,
                 true, 32, 8, true, false, true, false, {1, 1}));
         }
     }
@@ -11656,6 +11668,15 @@ static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
 // Test cases for performance evaluation: should be representative of real-world use cases
 static std::vector<std::unique_ptr<test_case>> make_test_cases_perf() {
     std::vector<std::unique_ptr<test_case>> test_cases;
+
+    // GLM-5.3-Flash experts (288 x 8 used) at decode / MTP verify / 6-stream / prompt ubatch sizes: down K=2048 x 4096 rows,
+    // up/gate K=4096 x 2048 rows, in the rune quants' expert types (few-token dedup kernels, mmvq-moe.cu)
+    for (ggml_type type_a : {GGML_TYPE_Q4_K, GGML_TYPE_Q5_K, GGML_TYPE_Q6_K, GGML_TYPE_Q8_0}) {
+        for (int n_tok : {1, 3, 6, 512}) {
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 288, 8, false, 4096, n_tok, 2048));
+            test_cases.emplace_back(new test_mul_mat_id(type_a, GGML_TYPE_F32, 288, 8, false, 2048, n_tok, 4096));
+        }
+    }
 
     // rune GLM-5.3-Flash prefill shapes (ub 512): indexer over 8192/32768 pools (f32 pooled keys, 32 heads), causal mask
     // pattern comes from init_tensor_kq_mask; KDA conv-input concat [3 + 512, 12288]

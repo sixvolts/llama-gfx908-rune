@@ -1,3 +1,9 @@
+#ifndef GGML_MMQ_Q6K_I64
+#define GGML_MMQ_Q6K_I64 1
+#endif
+#ifndef GGML_MMQ_Q6K_CDNA
+#define GGML_MMQ_Q6K_CDNA 1 // CDNA Q6_K dot: int32 sub-block scaling (mmq-vec-dot.cuh); 0 = generic MFMA dot
+#endif
 #ifndef GGML_MMQ_Q4K_I128
 #define GGML_MMQ_Q4K_I128 0
 #endif
@@ -111,6 +117,12 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     CASE(GGML_TYPE_Q5_K, 512, 1, 128,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
     CASE(GGML_TYPE_Q5_K, 512, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1, MMQ_ITER_K, true, false);
 
+#if GGML_MMQ_Q6K_I64
+    CASE(GGML_TYPE_Q6_K, 256, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, true);
+    CASE(GGML_TYPE_Q6_K, 256, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, true);
+    CASE(GGML_TYPE_Q6_K, 256, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, false);
+    CASE(GGML_TYPE_Q6_K, 256, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, false);
+#else
     CASE(GGML_TYPE_Q6_K, 512, 1, 128,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, true);
     CASE(GGML_TYPE_Q6_K, 512, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, true);
     CASE(GGML_TYPE_Q6_K, 512, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, true);
@@ -118,6 +130,7 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     CASE(GGML_TYPE_Q6_K, 512, 1, 128,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, false);
     CASE(GGML_TYPE_Q6_K, 512, 1, 128,  48, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, false);
     CASE(GGML_TYPE_Q6_K, 512, 1, 128,  64, GGML_CUDA_MMQ_SRAM_LAYOUT_Q6_K, MMQ_ITER_K, true, false);
+#endif
 
 // ---------------------------------------------------------------------------------------------
 

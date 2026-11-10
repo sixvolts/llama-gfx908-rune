@@ -2162,6 +2162,88 @@ template <int J, bool fallback> struct mmq_x_prefetch<GGML_TYPE_Q8_0, J, fallbac
 };
 
 #if defined(AMD_MFMA_AVAILABLE)
+// Q6_K (load_tiles_q6_K's LDS contents, bit-exact). A thread moves 4 consecutive ql ints and the 4 qh ints they take
+// their high bits from (both runs are contiguous), stored as two 16-byte LDS writes (low / high nibbles). block_q6_K
+// is 210 bytes, so a row's quants are only 2-byte aligned: each run is fetched as 5 dwords from the dword boundary
+// below (one dwordx4 + one dword; the extra dword stays inside the block) and shifted into place (alignbyte) in the
+// store half, after the prefetch has landed. The generic loader's 2-byte loads were 4 instructions per 8 bytes.
+template <int J, bool fallback> struct mmq_x_prefetch<GGML_TYPE_Q6_K, J, fallback> {
+    static constexpr bool available = true;
+    static constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
+    static constexpr int nwarps          = ggml_cuda_mmq_get_nthreads(GGML_TYPE_Q6_K, J, fallback) / warp_size;
+    static constexpr int I               = ggml_cuda_mmq_get_I(GGML_TYPE_Q6_K, J, fallback);
+    static constexpr int sram_stride     = ggml_cuda_mmq_get_sram_stride(GGML_TYPE_Q6_K, J, fallback);
+    static constexpr int threads_per_row = QI6_K/4;  // 8: 4 ql ints each
+    static constexpr int nrows           = warp_size / threads_per_row;
+    static constexpr int NQ              = (I + nrows*nwarps - 1) / (nrows*nwarps);
+    struct regs { int ql[NQ][5]; int qh[NQ][5]; int sh_l[NQ]; int sh_h[NQ]; int sc[NQ]; half d[NQ]; };
+
+    static __device__ __forceinline__ int row_q(const int n, const int i_max) {
+        int i = n*nrows*nwarps + threadIdx.y*nrows + threadIdx.x/threads_per_row;
+        if (fallback) { i = min(i, i_max); }
+        return i;
+    }
+    // 5 dwords from the dword boundary at or below p, and p's byte offset to it
+    static __device__ __forceinline__ void load5(const uint8_t * p, int (&raw)[5], int & sh) {
+        const uintptr_t a = (uintptr_t) p;
+        const int * q = (const int *) (a & ~(uintptr_t) 3);
+        sh = a & 3;
+        const int4 v = *((const int4 *) q);
+        raw[0] = v.x; raw[1] = v.y; raw[2] = v.z; raw[3] = v.w;
+        raw[4] = q[4];
+    }
+    static __device__ __forceinline__ void load(regs & r, const char * __restrict__ x, const int kbx0, const int i_max, const int stride) {
+        const int t  = threadIdx.x % threads_per_row;
+        const int h  = t / 4;          // 128-element half of the superblock
+        const int r0 = 4*(t % 4);      // first ql int of the run within the half
+#pragma unroll
+        for (int n = 0; n < NQ; ++n) {
+            const block_q6_K * bxi = (const block_q6_K *) x + kbx0 + row_q(n, i_max)*stride;
+            load5(bxi->ql + 4*(16*h + r0),     r.ql[n], r.sh_l[n]);
+            load5(bxi->qh + 4*(8*h + r0 % 8),  r.qh[n], r.sh_h[n]);
+            if (t < 4) {
+                r.sc[n] = get_int_b2(bxi->scales, t);
+            } else if (t == 4) {
+                r.d[n] = bxi->d;
+            }
+        }
+    }
+    static __device__ __forceinline__ void store(const regs & r, int * __restrict__ x_tile, const int i_max) {
+        int   * x_qs = (int   *)  x_tile;
+        float * x_df = (float *) (x_qs + MMQ_TILE_NE_K*2);
+        int   * x_sc = (int   *) (x_df + MMQ_TILE_NE_K/QI6_K);
+        const int t  = threadIdx.x % threads_per_row;
+        const int h  = t / 4;
+        const int r0 = 4*(t % 4);
+        const int shift = (r0 & 8) >> 2;
+#pragma unroll
+        for (int n = 0; n < NQ; ++n) {
+            const int i = row_q(n, i_max);
+            int lo[4], hi[4];
+#pragma unroll
+            for (int c = 0; c < 4; ++c) {
+                const int ql  = __builtin_amdgcn_alignbyte(r.ql[n][c + 1], r.ql[n][c], r.sh_l[n]);
+                const int qh  = __builtin_amdgcn_alignbyte(r.qh[n][c + 1], r.qh[n][c], r.sh_h[n]);
+                const int qh0 = ((qh >> shift) << 4) & 0x30303030;
+                const int qh1 =  (qh >> shift)       & 0x30303030;
+                // q - 32 per byte for q in [0, 63]: (q + 0x60) ^ 0x80 (q + 0x60 <= 159, no carry into the next byte);
+                // the same bytes as __vsubss4(q, 32), which is a per-byte loop on gfx908
+                lo[c] = (((ql >> 0) & 0x0F0F0F0F) + qh0 + 0x60606060) ^ 0x80808080;
+                hi[c] = (((ql >> 4) & 0x0F0F0F0F) + qh1 + 0x60606060) ^ 0x80808080;
+            }
+            *((int4 *) (x_qs + i*sram_stride + 32*h + r0))      = make_int4(lo[0], lo[1], lo[2], lo[3]);
+            *((int4 *) (x_qs + i*sram_stride + 32*h + r0 + 16)) = make_int4(hi[0], hi[1], hi[2], hi[3]);
+            if (t < 4) {
+                x_sc[i*sram_stride + t] = r.sc[n];
+            } else if (t == 4) {
+                x_df[i*sram_stride] = r.d[n];
+            }
+        }
+    }
+};
+#endif // defined(AMD_MFMA_AVAILABLE)
+
+#if defined(AMD_MFMA_AVAILABLE)
 // The pre-scaled K-quant tiles (ggml_cuda_mmq_load_tiles_q{2,3}_K_ps): the register half fetches a row's qs / hmask /
 // scales / d, the store half does the unpack-and-scale into LDS exactly as the fused loaders do.
 template <int J, bool fallback> struct mmq_x_prefetch<GGML_TYPE_Q2_K, J, fallback> {

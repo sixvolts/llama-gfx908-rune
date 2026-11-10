@@ -11,11 +11,12 @@
 // (row, token) for ~10 dp4a of real work, and every token re-reads its experts. At 3 tokens the kernel is VALU/latency
 // bound (~49% VALU busy, ~640 GB/s) rather than bandwidth bound.
 //
-// Here a lane owns whole quant blocks of a row (Q4_K: a 64-weight half-superblock pair, 16-byte loads of header and
-// quants; Q5_1: one 32-weight block), unpacks them once, and applies them to every token routed to that expert:
-// per token only the dp4a chain and two FMAs per 32 weights remain. Each 32-weight block is scaled after its integer
-// dot product, so the summation order differs from the reference mmvq (tolerance class, KL-gated); the Q4_K min term
-// uses d8*sum(q8) from the exact integer sum as the reference does, Q5_1 uses ds.y as its reference does. The batch's routing is read with one load + ballot: the first
+// Here a lane owns whole quant blocks of a row (Q4_K/Q5_K: a 64-weight sub-block pair, 16-byte loads of header and
+// quants; Q6_K: a 128-weight half superblock; Q5_1: one 32-weight block), unpacks them once, and applies them to every
+// token routed to that expert: per token only the dp4a chain and two FMAs per 32 weights remain. Each 32-weight block
+// (Q6_K: 16-weight group) is scaled after its integer dot product, so the summation order differs from the reference
+// mmvq (tolerance class, KL-gated); the Q4_K min term uses d8*sum(q8) from the exact integer sum as the reference does,
+// Q5_1 uses ds.y as its reference does. The batch's routing is read with one load + ballot: the first
 // (token, slot) pair that selects an expert computes it for all later tokens, the other pairs exit, so each distinct
 // expert is read once. GGML_MOE_V2=0 disables the path; GGML_MOE_DEDUP_STATS=1 counts distinct experts.
 
@@ -59,10 +60,11 @@ static __device__ __forceinline__ void moe_count(unsigned int * stats, const int
 }
 
 // the activations (q8_1 rows) of every token routed to e, staged in shared memory: one cooperative copy. With S8, also
-// each block's d8*sum(q8) in fp32 from the exact integer sum (the reference Q4_K dot product does not use the fp16 ds.y)
-template <int NTMAX, int NI, bool S8 = false, int NBY = 1>
+// each block's d8*sum(q8) in fp32 from the exact integer sum (the reference Q4_K dot product does not use the fp16 ds.y);
+// with NS = 2 instead 32*d8*sum(q8) of each 16-value half (Q6_K: quants are applied unsigned, the -32 offset as this term)
+template <int NTMAX, int NI, bool S8 = false, int NBY = 1, int NS = 1>
 static __device__ __forceinline__ void moe_stage_y(int (&y_sh)[NTMAX][NI], const void * __restrict__ vy, const int (&sl)[NTMAX],
-        const int nchannels_y, const int stride_channel_y, const int stride_col_y, float (*s8_sh)[NBY] = nullptr) {
+        const int nchannels_y, const int stride_channel_y, const int stride_col_y, float (*s8_sh)[NBY*NS] = nullptr) {
     const int nthreads = blockDim.x*blockDim.y;
     const int tid      = threadIdx.y*blockDim.x + threadIdx.x;
 #pragma unroll
@@ -78,12 +80,23 @@ static __device__ __forceinline__ void moe_stage_y(int (&y_sh)[NTMAX][NI], const
             for (int ib = tid; ib < NBY; ib += nthreads) {
                 const block_q8_1 * b = (const block_q8_1 *) ysrc + ib;
                 const int * q = (const int *) b->qs;
-                int sum = 0;
+                if constexpr (NS == 1) {
+                    int sum = 0;
 #pragma unroll
-                for (int k = 0; k < QK8_1/4; ++k) {
-                    sum = ggml_cuda_dp4a(0x01010101, q[k], sum);
+                    for (int k = 0; k < QK8_1/4; ++k) {
+                        sum = ggml_cuda_dp4a(0x01010101, q[k], sum);
+                    }
+                    s8_sh[t][ib] = __low2float(b->ds) * sum;
+                } else {
+                    int s0 = 0, s1 = 0;
+#pragma unroll
+                    for (int k = 0; k < QK8_1/8; ++k) {
+                        s0 = ggml_cuda_dp4a(0x01010101, q[k],             s0);
+                        s1 = ggml_cuda_dp4a(0x01010101, q[k + QK8_1/8], s1);
+                    }
+                    s8_sh[t][2*ib]     = 32.0f*__low2float(b->ds) * s0;
+                    s8_sh[t][2*ib + 1] = 32.0f*__low2float(b->ds) * s1;
                 }
-                s8_sh[t][ib] = __low2float(b->ds) * sum;
             }
         }
     }
@@ -94,6 +107,8 @@ static __device__ __forceinline__ void moe_stage_y(int (&y_sh)[NTMAX][NI], const
 // Q4_K (gate/up, optionally both with SWIGLU): 8 lanes per row, a wave covers 8 rows, a lane owns pairs p = l8 + 8k of
 // the row (pair = 32 qs bytes = sub-blocks 2(p%4), 2(p%4)+1 of superblock p/4). NSB superblocks per row, NSB even.
 struct moe_q4K_pair {
+    static constexpr int IPS = 4; // items (lane work units) per superblock
+    static constexpr int NS8 = 1; // staged activation sums per q8_1 block (moe_stage_y)
     int   q[8];                 // 32 qs bytes
     float dsc_lo, dsc_hi;       // d*sc
     float dmm_lo, dmm_hi;       // dmin*m
@@ -148,6 +163,8 @@ static __device__ __forceinline__ float moe_q4K_dot(const moe_q4K_pair & w, cons
 // Q5_K (GLM-5.3-Flash down): the Q4_K layout plus qh[32], the 5th bit of every weight; pair pp takes bit 2pp (low
 // sub-block) and 2pp+1 (high) of qh[l] for element l, as dequantize_row_q5_K. Quants are unpacked to 5-bit bytes once.
 struct moe_q5K_pair {
+    static constexpr int IPS = 4;
+    static constexpr int NS8 = 1;
     int   lo[8], hi[8];         // 32 + 32 5-bit quants as bytes
     float dsc_lo, dsc_hi;       // d*sc
     float dmm_lo, dmm_hi;       // dmin*m
@@ -206,11 +223,89 @@ static __device__ __forceinline__ float moe_q5K_dot(const moe_q5K_pair & w, cons
     return (w.dsc_lo*d8l*dl - w.dmm_lo*s8[0]) + (w.dsc_hi*d8h*dh - w.dmm_hi*s8[1]);
 }
 
-// overloads so one kernel body serves both K-quants
+// Q6_K (GLM-5.3-Flash XL+ down, K = 2048, and up/gate, K = 4096): a lane owns half h of a superblock (128 weights,
+// sub-blocks 4h..4h+3), the unit dequantize_row_q6_K works in: ql[64h..64h+63], qh[32h..32h+31], scales[8h..8h+7].
+// Sub-block 4h + j takes the low (j < 2) or high nibbles of ql[64h + 32(j%2) + l] and the 2 bits of qh[32h + l] at 2j.
+// Quants are unpacked once to unsigned 6-bit bytes and scales folded into d*sc; the -32 offset is applied per 16-weight
+// group as 32*d8*sum(q8) staged with the activations (a packed signed-byte subtract is a per-byte loop on gfx908).
+// (Lanes owning 64-weight pairs as Q4_K/Q5_K do would both read the whole 64-byte ql half: 1.5x the load bytes.)
+// block_q6_K is 210 bytes, so every other block is only 2-byte aligned; unaligned 16-byte loads cost ~25 % of the
+// kernel, so the quants are loaded from the dword boundary below with one extra dword and shifted into place (alignbyte).
+struct moe_q6K_half {
+    static constexpr int IPS = 2;
+    static constexpr int NS8 = 2;
+    int   q[4][8];              // sub-block j: 32 6-bit quants as bytes
+    float dsc[8];               // d*scales[8h + i], i = 16-weight group
+};
+
+// N dwords from a 2-byte aligned address: N + 1 dword-aligned loads (N % 4 == 0: 16-byte vectors at dword alignment)
+// shifted by the address' byte offset. The extra dword stays inside the block for every use below.
+template <int N>
+static __device__ __forceinline__ void moe_load_a2(const uint8_t * p, int (&out)[N]) {
+    const uintptr_t a  = (uintptr_t) p;
+    const int     * q  = (const int *) (a & ~(uintptr_t) 3);
+    const int       sh = a & 3;
+    int raw[N + 1];
+#pragma unroll
+    for (int i = 0; i < N/4; ++i) {
+        const int4 v = *((const int4 *) (q + 4*i));
+        raw[4*i] = v.x; raw[4*i + 1] = v.y; raw[4*i + 2] = v.z; raw[4*i + 3] = v.w;
+    }
+    raw[N] = q[N];
+#pragma unroll
+    for (int k = 0; k < N; ++k) {
+        out[k] = __builtin_amdgcn_alignbyte(raw[k + 1], raw[k], sh);
+    }
+}
+
+static __device__ __forceinline__ void moe_q6K_load(const block_q6_K * __restrict__ b, const int h, moe_q6K_half & w) {
+    int ql_a[8], ql_b[8], qh[8];
+    moe_load_a2<8>(b->ql + 64*h,      ql_a);
+    moe_load_a2<8>(b->ql + 64*h + 32, ql_b);
+    moe_load_a2<8>(b->qh + 32*h,      qh);
+    // scales[8h..8h+7] as 2-byte loads (an extra dword could run past the tensor's last block)
+    const uint16_t * s2 = (const uint16_t *) (b->scales + 8*h);
+    const int2 sc  = make_int2(s2[0] | (s2[1] << 16), s2[2] | (s2[3] << 16));
+    const float d  = __half2float(b->d);
+#pragma unroll
+    for (int k = 0; k < 8; ++k) {
+        w.q[0][k] = ( ql_a[k]       & 0x0F0F0F0F) | (((qh[k] >> 0) & 0x03030303) << 4);
+        w.q[1][k] = ( ql_b[k]       & 0x0F0F0F0F) | (((qh[k] >> 2) & 0x03030303) << 4);
+        w.q[2][k] = ((ql_a[k] >> 4) & 0x0F0F0F0F) | (((qh[k] >> 4) & 0x03030303) << 4);
+        w.q[3][k] = ((ql_b[k] >> 4) & 0x0F0F0F0F) | (((qh[k] >> 6) & 0x03030303) << 4);
+    }
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+        w.dsc[i]     = d*(float) (int8_t) (sc.x >> (8*i));
+        w.dsc[i + 4] = d*(float) (int8_t) (sc.y >> (8*i));
+    }
+}
+
+// y: the 4 q8_1 blocks of the half; s16: their 8 staged 32*d8*sum(q8) terms
+static __device__ __forceinline__ float moe_q6K_dot(const moe_q6K_half & w, const block_q8_1 * __restrict__ y, const float * s16) {
+    float r = 0.0f;
+#pragma unroll
+    for (int j = 0; j < 4; ++j) {
+        const int * u = (const int *) y[j].qs;
+        int d0 = 0, d1 = 0;
+#pragma unroll
+        for (int k = 0; k < 4; ++k) {
+            d0 = ggml_cuda_dp4a(w.q[j][k],     u[k],     d0);
+            d1 = ggml_cuda_dp4a(w.q[j][k + 4], u[k + 4], d1);
+        }
+        const float d8 = __low2float(y[j].ds);
+        r += w.dsc[2*j]*(d8*d0 - s16[2*j]) + w.dsc[2*j + 1]*(d8*d1 - s16[2*j + 1]);
+    }
+    return r;
+}
+
+// overloads so one kernel body serves the three K-quants
 static __device__ __forceinline__ void  moe_kq_load(const block_q4_K * b, const int pp, moe_q4K_pair & w) { moe_q4K_load(b, pp, w); }
 static __device__ __forceinline__ void  moe_kq_load(const block_q5_K * b, const int pp, moe_q5K_pair & w) { moe_q5K_load(b, pp, w); }
+static __device__ __forceinline__ void  moe_kq_load(const block_q6_K * b, const int h,  moe_q6K_half & w) { moe_q6K_load(b, h, w); }
 static __device__ __forceinline__ float moe_kq_dot(const moe_q4K_pair & w, const block_q8_1 * y, const float * s8) { return moe_q4K_dot(w, y, s8); }
 static __device__ __forceinline__ float moe_kq_dot(const moe_q5K_pair & w, const block_q8_1 * y, const float * s8) { return moe_q5K_dot(w, y, s8); }
+static __device__ __forceinline__ float moe_kq_dot(const moe_q6K_half & w, const block_q8_1 * y, const float * s8) { return moe_q6K_dot(w, y, s8); }
 
 template <int NSB, int NW, int RG, int NTMAX, bool GLU, typename block_t = block_q4_K, typename pair_t = moe_q4K_pair>
 static __global__ void __launch_bounds__(NW*moe_warp_size, 1) mmvq_moe_q4K(
@@ -221,12 +316,15 @@ static __global__ void __launch_bounds__(NW*moe_warp_size, 1) mmvq_moe_q4K(
         const int stride_col_dst, const int stride_channel_dst,
         const int n_used, const int ncols_dst, const int ids_stride, unsigned int * __restrict__ stats,
         const bool glu_clamp, const float glu_limit) {
-    static_assert(NSB % 2 == 0, "8 lanes per row need an even superblock count");
-    constexpr int NP  = NSB/2;                              // pairs per lane and row
+    constexpr int IPS = pair_t::IPS;                        // items per superblock: 4 pairs (Q4_K/Q5_K), 2 halves (Q6_K)
+    constexpr int QPI = (QK_K/QK8_1)/IPS;                   // q8_1 blocks per item
+    static_assert((NSB*IPS) % 8 == 0, "8 lanes per row need a multiple of 8 items per row");
+    constexpr int NP  = NSB*IPS/8;                          // items per lane and row
     constexpr int NBY = NSB*(QK_K/QK8_1);
     constexpr int NI  = NBY*(int) (sizeof(block_q8_1)/sizeof(int));
     __shared__ int   y_sh[NTMAX][NI];
-    __shared__ float s8_sh[NTMAX][NBY];
+    constexpr int NS  = pair_t::NS8;                        // staged sums per q8_1 block
+    __shared__ float s8_sh[NTMAX][NBY*NS];
 
     int e;
     int sl[NTMAX];
@@ -247,16 +345,16 @@ static __global__ void __launch_bounds__(NW*moe_warp_size, 1) mmvq_moe_q4K(
         const int row = row_base + (i / NP)*8;
         const int p   = l8 + 8*(i % NP);
         if (row < nrows) {
-            moe_kq_load(bx + row*stride_row_x + p/4, p%4, wu);
+            moe_kq_load(bx + row*stride_row_x + p/IPS, p%IPS, wu);
             if constexpr (GLU) {
-                moe_kq_load(bg + row*stride_row_x + p/4, p%4, wg);
+                moe_kq_load(bg + row*stride_row_x + p/IPS, p%IPS, wg);
             }
         }
     };
 
     pair_t cu, cg, nu, ng;
     load_item(0, cu, cg);
-    moe_stage_y<NTMAX, NI, true, NBY>(y_sh, vy, sl, nchannels_y, stride_channel_y, stride_col_y, s8_sh);
+    moe_stage_y<NTMAX, NI, true, NBY, NS>(y_sh, vy, sl, nchannels_y, stride_channel_y, stride_col_y, s8_sh);
 
     float acc[NTMAX], accg[NTMAX];
 #pragma unroll
@@ -276,11 +374,11 @@ static __global__ void __launch_bounds__(NW*moe_warp_size, 1) mmvq_moe_q4K(
             if (sl[t] < 0) {
                 continue;
             }
-            const int ib = (p/4)*(QK_K/QK8_1) + 2*(p%4);
+            const int ib = (p/IPS)*(QK_K/QK8_1) + QPI*(p%IPS);
             const block_q8_1 * ylo = (const block_q8_1 *) y_sh[t] + ib;
-            acc[t] += moe_kq_dot(cu, ylo, &s8_sh[t][ib]);
+            acc[t] += moe_kq_dot(cu, ylo, &s8_sh[t][NS*ib]);
             if constexpr (GLU) {
-                accg[t] += moe_kq_dot(cg, ylo, &s8_sh[t][ib]);
+                accg[t] += moe_kq_dot(cg, ylo, &s8_sh[t][NS*ib]);
             }
         }
         if (k == NP - 1) {
@@ -594,6 +692,50 @@ bool ggml_cuda_mmvq_moe_dedup(
                 mmvq_moe_q4K<8, NW, RG, 8, false, block_q5_K, moe_q5K_pair><<<block_nums, block_dims, 0, stream>>>(vx, vx, vy, ids, dst,
                     nrows_x, stride_row_x, stride_channel_x, stride_col_y, stride_channel_y, nchannels_y,
                     stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats, false, 0.0f);
+            }
+            return true;
+        }
+        case GGML_TYPE_Q6_K: {
+            // GLM-5.3-Flash XL+ (Q6_K experts in the quant-sensitive layers): down K = 2048 (8 superblocks), no GLU;
+            // up K = 4096 (16), with SWIGLU when gate is Q6_K too, else alone (the graph does not fuse mixed types)
+            static const bool q6k_on = !getenv("GGML_MOE_V2_Q6K") || atoi(getenv("GGML_MOE_V2_Q6K")) != 0;
+            if (!q6k_on || (ncols_x != 8*QK_K && ncols_x != 16*QK_K) || (glu && ncols_x != 16*QK_K)) {
+                return false;
+            }
+            auto launch = [&](auto nw_tag, auto rg_tag, auto nsb_tag, auto nt_tag) {
+                constexpr int NW  = decltype(nw_tag)::value;
+                constexpr int RG  = decltype(rg_tag)::value;
+                constexpr int NSB = decltype(nsb_tag)::value;
+                constexpr int NT  = decltype(nt_tag)::value;
+                const dim3 block_dims(moe_warp_size, NW, 1);
+                const dim3 block_nums((nrows_x + 8*RG*NW - 1) / (8*RG*NW), n_used*ncols_dst, 1);
+                if (glu) {
+                    mmvq_moe_q4K<NSB, NW, RG, NT, true, block_q6_K, moe_q6K_half><<<block_nums, block_dims, 0, stream>>>(vx, fusion.gate, vy, ids, dst,
+                        nrows_x, stride_row_x, stride_channel_x, stride_col_y, stride_channel_y, nchannels_y,
+                        stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats, glu_clamp, glu_limit);
+                } else {
+                    mmvq_moe_q4K<NSB, NW, RG, NT, false, block_q6_K, moe_q6K_half><<<block_nums, block_dims, 0, stream>>>(vx, vx, vy, ids, dst,
+                        nrows_x, stride_row_x, stride_channel_x, stride_col_y, stride_channel_y, nchannels_y,
+                        stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats, false, 0.0f);
+                }
+            };
+            using I1 = std::integral_constant<int, 1>; using I2 = std::integral_constant<int, 2>;
+            using I4 = std::integral_constant<int, 4>; using I8 = std::integral_constant<int, 8>;
+            // waves x row groups per wave, from a sweep on rune (288 experts, 8 used; vs mul_mat_vec_q_moe):
+            // down (2 items per lane and row group, so 2 groups keep the prefetch fed) 1 tok 2x2 77 us (96), 3 tok 2x2
+            // 186 us (225), 6 tok 4x2 370 us (523); up 1 tok 4x1 80 us (84), 3 tok 4x1 197 us (218), 6 tok 8x2 365 us (479)
+            if (ncols_x == 8*QK_K) {
+                if (ncols_dst <= 4) {
+                    launch(std::integral_constant<int, 2>{}, I2{}, I8{}, I4{});
+                } else {
+                    launch(I4{}, I2{}, I8{}, I8{});
+                }
+            } else {
+                if (ncols_dst <= 4) {
+                    launch(I4{}, I1{}, std::integral_constant<int, 16>{}, I4{});
+                } else {
+                    launch(I8{}, I2{}, std::integral_constant<int, 16>{}, I8{});
+                }
             }
             return true;
         }

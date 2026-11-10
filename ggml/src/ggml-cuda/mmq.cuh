@@ -838,7 +838,11 @@ static constexpr __device__ ggml_cuda_mmq_util_funcs ggml_cuda_mmq_get_util_func
             return ggml_cuda_mmq_util_funcs(
                 -1,
                 ggml_cuda_mmq_load_tiles_q6_K<type, J, fallback>,
+#if defined(AMD_MFMA_AVAILABLE) && GGML_MMQ_Q6K_CDNA
+                ggml_cuda_mmq_vec_dot_q6_K_q8_1_cdna<type, J, fallback>,
+#else
                 ggml_cuda_mmq_vec_dot_q6_K_q8_1_mma<type, J, fallback>,
+#endif // defined(AMD_MFMA_AVAILABLE) && GGML_MMQ_Q6K_CDNA
                 ggml_cuda_mmq_write_back_mma<type, J, fallback>);
 // ---------------------------------------------------------------------------------------------
         case GGML_TYPE_IQ1_S:
