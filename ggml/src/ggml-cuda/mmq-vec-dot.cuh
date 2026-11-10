@@ -723,6 +723,14 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_ps_mma_impl(
 
     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
 
+    // local accumulators, all sum elements written back for every NJ (see ggml_cuda_mmq_vec_dot_q6_K_q8_1_cdna_impl)
+    constexpr int NSUM = (J/tile_C::J)*tile_C::ne; // 0 for the J values without a config (never launched)
+    float acc[NSUM > 0 ? NSUM : 1];
+#pragma unroll
+    for (int l = 0; l < NSUM; ++l) {
+        acc[l] = sum[l];
+    }
+
     // per-row factors of the C rows this lane holds, read once per tile
     float dA [ntx][tile_C::ne];
     float dmA[ntx][tile_C::ne];
@@ -787,10 +795,15 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_ps_mma_impl(
                     if (MINS) {
                         v -= Cm.x[l]*dmA[n][l];
                     }
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += v*dB;
+                    acc[(j0/tile_C::J + n)*tile_C::ne + l] += v*dB;
                 }
             }
         }
+    }
+
+#pragma unroll
+    for (int l = 0; l < NSUM; ++l) {
+        sum[l] = acc[l];
     }
 #else
     GGML_UNUSED_VARS(x, y, sum, k00);
@@ -1255,6 +1268,15 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q6_K_q8_1_cdna_impl
 
     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
 
+    // Local accumulators, all sum elements written back for every NJ: stores to different elements at the end of the
+    // dispatcher variants get merged behind a pointer phi, which keeps sum in scratch memory.
+    constexpr int NSUM = (J/tile_C::J)*tile_C::ne; // 0 for the J values without a config (never launched)
+    float acc[NSUM > 0 ? NSUM : 1];
+#pragma unroll
+    for (int l = 0; l < NSUM; ++l) {
+        acc[l] = sum[l];
+    }
+
     float dA[ntx][tile_C::ne];
 #pragma unroll
     for (int n = 0; n < ntx; ++n) {
@@ -1300,10 +1322,15 @@ static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q6_K_q8_1_cdna_impl
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
                     const int t = __mul24(C0.x[l], s0[n][l]) + __mul24(C1.x[l], s1[n][l]);
-                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += (float) t * dA[n][l] * dB;
+                    acc[(j0/tile_C::J + n)*tile_C::ne + l] += (float) t * dA[n][l] * dB;
                 }
             }
         }
+    }
+
+#pragma unroll
+    for (int l = 0; l < NSUM; ++l) {
+        sum[l] = acc[l];
     }
 #else
     GGML_UNUSED_VARS(x, y, sum, k00);

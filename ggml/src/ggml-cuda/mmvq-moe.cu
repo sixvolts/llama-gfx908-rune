@@ -265,7 +265,7 @@ static __device__ __forceinline__ void moe_q6K_load(const block_q6_K * __restric
     moe_load_a2<8>(b->qh + 32*h,      qh);
     // scales[8h..8h+7] as 2-byte loads (an extra dword could run past the tensor's last block)
     const uint16_t * s2 = (const uint16_t *) (b->scales + 8*h);
-    const int2 sc  = make_int2(s2[0] | (s2[1] << 16), s2[2] | (s2[3] << 16));
+    const int2 sc  = make_int2((int) (s2[0] | ((uint32_t) s2[1] << 16)), (int) (s2[2] | ((uint32_t) s2[3] << 16)));
     const float d  = __half2float(b->d);
 #pragma unroll
     for (int k = 0; k < 8; ++k) {
