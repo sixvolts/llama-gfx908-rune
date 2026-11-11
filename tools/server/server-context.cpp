@@ -3572,6 +3572,30 @@ private:
             }
         }
 
+        // LLAMA_SPEC_NMAX_BY_GEN="2,1,1,0": draft length cap by number of generating slots (1, 2, 3, >= 4). The last value
+        // covers all higher counts, 0 = no drafting. When set it replaces LLAMA_SPEC_MAX_GEN. Unset = no change.
+        int spec_n_max_gen = -1;
+        if (spec) {
+            static const std::vector<int> nmax_by_gen = [] {
+                std::vector<int> v;
+                const char * e = getenv("LLAMA_SPEC_NMAX_BY_GEN");
+                for (const auto & part : string_split<std::string>(e ? e : "", ',')) {
+                    if (!part.empty()) {
+                        v.push_back(std::max(0, atoi(part.c_str())));
+                    }
+                }
+                return v;
+            }();
+            if (!nmax_by_gen.empty()) {
+                int n_gen = 0;
+                for (const auto & s : slots) {
+                    n_gen += s.state == SLOT_STATE_GENERATING;
+                }
+                spec_n_max_gen = n_gen > 0 ? nmax_by_gen[std::min((size_t) n_gen, nmax_by_gen.size()) - 1] : 0;
+                spec_allowed   = spec_n_max_gen > 0;
+            }
+        }
+
         // determine which slots are generating and drafting
         iterate(slots, [&](server_slot & slot) {
             if (slot.state != SLOT_STATE_GENERATING) {
@@ -3593,7 +3617,10 @@ private:
                 const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
                 const bool use_ckpt_dft = ctx_dft_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
-                const int n_draft_max = spec_allowed ? slot.get_n_draft_max() : 0;
+                int n_draft_max = spec_allowed ? slot.get_n_draft_max() : 0;
+                if (spec_n_max_gen > 0) {
+                    n_draft_max = std::min(n_draft_max, spec_n_max_gen);
+                }
 
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
