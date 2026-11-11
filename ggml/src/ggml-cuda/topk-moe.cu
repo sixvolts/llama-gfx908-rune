@@ -215,6 +215,37 @@ __global__ void topk_moe_cuda(const float *         logits,
         int   max_expert = threadIdx.x;
 
         if constexpr (has_bias) {
+#ifdef TOPK_MOE_FAST_SELECT
+            // as the no-bias fast path, on the biased selection value: group max, lowest expert index holding it
+            // (== the reference tie-break), then the winner's unbiased weight broadcast from its owner lane
+            float lmax = selection_wt[0];
+#pragma unroll
+            for (int i = 1; i < experts_per_thread; i++) {
+                lmax = fmaxf(lmax, selection_wt[i]);
+            }
+            const float gmax = topk_moe_max32(lmax);
+            int lidx = INT_MAX;
+#pragma unroll
+            for (int i = experts_per_thread - 1; i >= 0; i--) {
+                const int expert = threadIdx.x + i * WARP_SIZE;
+                if ((n_experts % WARP_SIZE == 0 || expert < n_experts) && selection_wt[i] == gmax) {
+                    lidx = expert;
+                }
+            }
+            max_expert = topk_moe_min32(lidx);
+
+            float lval = -INFINITY;
+            if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
+#pragma unroll
+                for (int i = 0; i < experts_per_thread; i++) {
+                    if (i == max_expert / WARP_SIZE) {
+                        lval            = wt[i];
+                        selection_wt[i] = -INFINITY;
+                    }
+                }
+            }
+            max_val = topk_moe_max32(lval);
+#else
             float max_val_s = selection_wt[0];
 
 #pragma unroll
@@ -242,6 +273,7 @@ __global__ void topk_moe_cuda(const float *         logits,
             if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
                 selection_wt[max_expert / WARP_SIZE] = -INFINITY;
             }
+#endif // TOPK_MOE_FAST_SELECT
         } else {
 #ifdef TOPK_MOE_FAST_SELECT
             // value max over the group, then the lowest expert index holding it (== the reference tie-break)
