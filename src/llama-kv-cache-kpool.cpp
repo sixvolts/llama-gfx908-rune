@@ -1236,7 +1236,7 @@ bool llm_graph_input_kpool::can_reuse(const llm_graph_params & params) {
     const int64_t n_pools  = llama_kpool_n_pools(n_kv, kpool, n_ps);
 
     // a step that must re-emit every pool uses a different n_new_max: rebuild the graph for it (rare)
-    const bool rebuild_now = mctx_attn->get_kv()->get_kpool_dirty();
+    const bool rebuild_now = mctx_attn->get_kv()->get_kpool_dirty(ub);
 
     res &= !rebuild && !rebuild_now;
     res &= n_new_max == (uint32_t) (n_tps/kpool + n_ps);
@@ -1284,6 +1284,6 @@ void llm_graph_input_kpool::set_input(const llama_ubatch * ubatch) {
 
     // cleared here, not in build_inp_kpool: a graph built but not evaluated must not clear it
     if (rebuild) {
-        mctx_attn->get_kv()->clear_kpool_dirty();
+        mctx_attn->get_kv()->clear_kpool_dirty(*ubatch);
     }
 }

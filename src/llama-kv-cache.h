@@ -162,9 +162,11 @@ public:
 
     // GLM-5-Next pooled-key cache: seq_add/seq_div regroup pools while every cached key still
     // looks complete. sticky by design, a flag that clears too early is silently wrong
-    void set_kpool_dirty();
-    bool get_kpool_dirty() const;
-    void clear_kpool_dirty() const;
+    // per stream: a multi-ubatch step (decode groups, split prompts) must not clear the flag of
+    // streams the ubatch that rebuilt did not hold. seq_id < 0 = every stream
+    void set_kpool_dirty(llama_seq_id seq_id);
+    bool get_kpool_dirty(const llama_ubatch & ubatch) const;   // any stream of the ubatch
+    void clear_kpool_dirty(const llama_ubatch & ubatch) const; // the ubatch's streams only
 
     ggml_type type_k() const;
     ggml_type type_v() const;
@@ -277,7 +279,7 @@ private:
     bool v_trans = true;  // the value tensor is transposed
 
     // see set_kpool_dirty. mutable: its only consumer runs from set_input, holding a const cache
-    mutable bool kpool_dirty = false;
+    mutable std::vector<uint8_t> kpool_dirty; // [n_stream]
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;

@@ -3780,7 +3780,7 @@ llm_graph_input_kpool * llm_graph_context::build_inp_kpool(
         // n_new_max is an exact bound (a contiguous run of L tokens closes at most L/kpool + 1
         // pools), FIXED for the decode phase so the graph shape does not track pools-closed-this-
         // step; after a position mutation every cached key is stale, so it must re-emit all
-        const bool     rebuild   = mctx_attn->get_kv()->get_kpool_dirty();
+        const bool     rebuild   = mctx_attn->get_kv()->get_kpool_dirty(ubatch);
         const int64_t  n_new_max = rebuild ? n_pools : n_tps/kpool + n_ps;
 
         inp->n_new_max = (uint32_t) n_new_max;

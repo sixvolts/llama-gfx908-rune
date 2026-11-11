@@ -208,7 +208,7 @@ void llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p
                                  (p1 <  0 || p1 % r == 0);
 
         if (!whole_pools) {
-            mem_attn->set_kpool_dirty();
+            mem_attn->set_kpool_dirty(seq_id);
         }
     }
     mem_attn->seq_add(seq_id, p0, p1, shift);
@@ -218,7 +218,7 @@ void llama_memory_hybrid::seq_add(llama_seq_id seq_id, llama_pos p0, llama_pos p
 
 void llama_memory_hybrid::seq_div(llama_seq_id seq_id, llama_pos p0, llama_pos p1, int d) {
     if (mem_idx && hparams.indexer_kpool > 0 && d != 1) {
-        mem_attn->set_kpool_dirty();
+        mem_attn->set_kpool_dirty(seq_id);
     }
     mem_attn->seq_div(seq_id, p0, p1, d);
     if (mem_idx) mem_idx->seq_div(seq_id, p0, p1, d);
