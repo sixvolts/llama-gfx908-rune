@@ -9,3 +9,11 @@ bool ggml_cuda_mmvq_q8_v2(
         const void * vx, const void * vy, float * dst, int ncols_x, int nrows_x, int ncols_dst,
         int stride_row_x, int stride_col_y, int stride_col_dst,
         int nchannels_x, int nchannels_y, int nchannels_dst, int nsamples_x, int nsamples_dst, cudaStream_t stream);
+
+// Short rows (K = 128 / 256 / 512), 1..8 columns, optional channels (batched matmul): several rows per wave, bit-identical
+// to mul_mat_vec_q<Q8_0> (see mmvq-q8.cu). Returns false for other shapes. GGML_MMVQ_Q8_SMALLK=0 disables.
+bool ggml_cuda_mmvq_q8_smallk(
+        const void * vx, const void * vy, float * dst, int ncols_x, int nrows_x, int ncols_dst,
+        int stride_row_x, int stride_col_y, int stride_col_dst,
+        int nchannels_x, int nchannels_y, int nchannels_dst,
+        int stride_channel_x, int stride_channel_y, int stride_channel_dst, cudaStream_t stream);

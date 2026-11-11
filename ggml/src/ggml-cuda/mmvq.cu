@@ -1089,6 +1089,11 @@ static void mul_mat_vec_q_switch_ncols_dst(
     if constexpr (type == GGML_TYPE_Q8_0) {
         const bool fused = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+        if (!has_ids && !fused && nsamples_x == 1 && nsamples_dst == 1 &&
+            ggml_cuda_mmvq_q8_smallk(vx, vy, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+                nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, stream)) {
+            return;
+        }
         if (!has_ids && !fused && ggml_cuda_mmvq_q8_v2(vx, vy, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y,
                 stride_col_dst, nchannels_x, nchannels_y, nchannels_dst, nsamples_x, nsamples_dst, stream)) {
             return;
