@@ -845,6 +845,307 @@ static bool lightning_indexer_use_decode(const ggml_tensor * k, int64_t n_batch)
 }
 #endif // defined(GGML_USE_HIP)
 
+#if defined(GGML_USE_HIP)
+// rune gfx908: f32 MFMA indexer for prompt batches. TOLERANCE class: the dot over D is summed in MFMA order, not in the vec kernel's tree order.
+// One wave = one (32 query x 32 key) tile on v_mfma_f32_32x32x2f32: A = Q of one head, B = K (in registers for all heads).
+// Lane l: column c = l % 32 (query for A, key for B and D), half = l / 32. MFMA step 4u + e contracts d = 8u + e (k-slot 0) and d = 8u + 4 + e (k-slot 1).
+// D element r of lane l is row 8*(r/4) + 4*half + r%4, column c.
+namespace li_mfma {
+
+constexpr int BQ = 32;
+constexpr int BP = 32;
+constexpr int NT = 64;
+
+typedef float f16v __attribute__((ext_vector_type(16)));
+
+} // namespace li_mfma
+
+template <int64_t N_HEAD>
+static __global__ void __launch_bounds__(li_mfma::NT) lightning_indexer_kernel_mfma_f32(
+        const float * Q, const char * K, const float * W, const half * M, float * dst,
+        int64_t n_stream, int64_t n_batch, int64_t n_kv,
+        size_t nb1, size_t nb2, size_t nb3,
+        size_t nbq1, size_t nbq2, size_t nbq3,
+        size_t nbk1, size_t nbk2, size_t nbk3,
+        size_t nbw1, size_t nbw2, size_t nbw3,
+        size_t nbm1, size_t nbm2, size_t nbm3,
+        int64_t nem3) {
+#if defined(AMD_MFMA_AVAILABLE)
+    using namespace li_mfma;
+    GGML_UNUSED_VARS(n_stream, nb2, nbk1, nbw2, nbm2);
+
+    const int lane     = threadIdx.x;
+    const int c        = lane % 32;
+    const int half_id  = lane / 32;
+    const int p0       = blockIdx.x * BP;
+    const int q0       = blockIdx.y * BQ;
+    const int i_stream = blockIdx.z;
+    const int ip       = p0 + c;
+
+    float mval[16];
+    int visible = 0;
+#pragma unroll
+    for (int r = 0; r < 16; ++r) {
+        const int iq = q0 + 8*(r/4) + 4*half_id + r%4;
+        float mv = -INFINITY;
+        if (iq < n_batch && ip < n_kv) {
+            mv = __half2float(((const half *) ((const char *) M + (int64_t) iq*nbm1 + (i_stream % nem3)*nbm3))[ip]);
+        }
+        mval[r] = mv;
+        visible |= !(isinf(mv) && mv < 0.0f);
+    }
+    if (!__syncthreads_or(visible)) {
+#pragma unroll
+        for (int r = 0; r < 16; ++r) {
+            const int iq = q0 + 8*(r/4) + 4*half_id + r%4;
+            if (iq < n_batch && ip < n_kv) {
+                ((float *) ((char *) dst + (int64_t) iq*nb1 + i_stream*nb3))[ip] = mval[r];
+            }
+        }
+        return;
+    }
+
+    __shared__ float w_s[BQ][N_HEAD];
+    for (int e = lane; e < BQ*N_HEAD; e += NT) {
+        const int r  = e / N_HEAD;
+        const int h  = e % N_HEAD;
+        const int iq = q0 + r;
+        w_s[r][h] = iq < n_batch ? ((const float *) ((const char *) W + (int64_t) iq*nbw1 + i_stream*nbw3))[h] : 0.0f;
+    }
+
+    // K of this lane's key: 16 float4, d = 8u + 4*half .. + 3
+    float4 kv[16];
+#pragma unroll
+    for (int u = 0; u < 16; ++u) {
+        kv[u] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (ip < n_kv) {
+            kv[u] = ((const float4 *) (K + (int64_t) ip*nbk2 + i_stream*nbk3))[2*u + half_id];
+        }
+    }
+
+    const int    iqa   = q0 + c;
+    const bool   q_ok  = iqa < n_batch;
+    const char * q_row = (const char *) Q + i_stream*nbq3 + (int64_t) (q_ok ? iqa : 0)*nbq2;
+
+    float4 qn[16];
+#pragma unroll
+    for (int u = 0; u < 16; ++u) {
+        qn[u] = ((const float4 *) q_row)[2*u + half_id];
+    }
+
+    float score[16];
+#pragma unroll
+    for (int r = 0; r < 16; ++r) {
+        score[r] = 0.0f;
+    }
+    __syncthreads();
+
+    for (int h = 0; h < N_HEAD; ++h) {
+        float4 qv[16];
+#pragma unroll
+        for (int u = 0; u < 16; ++u) {
+            qv[u] = q_ok ? qn[u] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+        // next head's Q is loaded while this head's MFMAs run
+        if (h + 1 < N_HEAD) {
+#pragma unroll
+            for (int u = 0; u < 16; ++u) {
+                qn[u] = ((const float4 *) (q_row + (int64_t) (h + 1)*nbq1))[2*u + half_id];
+            }
+        }
+
+        f16v acc = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+        for (int u = 0; u < 16; ++u) {
+            acc = __builtin_amdgcn_mfma_f32_32x32x2f32(qv[u].x, kv[u].x, acc, 0, 0, 0);
+            acc = __builtin_amdgcn_mfma_f32_32x32x2f32(qv[u].y, kv[u].y, acc, 0, 0, 0);
+            acc = __builtin_amdgcn_mfma_f32_32x32x2f32(qv[u].z, kv[u].z, acc, 0, 0, 0);
+            acc = __builtin_amdgcn_mfma_f32_32x32x2f32(qv[u].w, kv[u].w, acc, 0, 0, 0);
+        }
+
+#pragma unroll
+        for (int r = 0; r < 16; ++r) {
+            const float w_val = w_s[8*(r/4) + 4*half_id + r%4][h];
+            float sum = acc[r];
+            sum = (sum > 0.0f) ? sum : 0.0f;
+            score[r] += sum * w_val;
+        }
+    }
+
+#pragma unroll
+    for (int r = 0; r < 16; ++r) {
+        const int iq = q0 + 8*(r/4) + 4*half_id + r%4;
+        if (iq < n_batch && ip < n_kv) {
+            ((float *) ((char *) dst + (int64_t) iq*nb1 + i_stream*nb3))[ip] = score[r] + mval[r];
+        }
+    }
+#else
+    GGML_UNUSED_VARS(Q, K, W, M, dst, n_stream, n_batch, n_kv, nb1, nb2, nb3, nbq1, nbq2, nbq3, nbk1, nbk2, nbk3, nbw1, nbw2, nbw3, nbm1, nbm2, nbm3, nem3);
+    NO_DEVICE_CODE;
+#endif // defined(AMD_MFMA_AVAILABLE)
+}
+
+// v2: a block is 4 waves = 4 query tiles over the same P*32 keys. K is staged once in LDS for the block, so a head's Q (global) is read once per P key tiles.
+template <int64_t N_HEAD, int P>
+static __global__ void __launch_bounds__(256, 1) lightning_indexer_kernel_mfma2_f32(
+        const float * Q, const char * K, const float * W, const half * M, float * dst,
+        int64_t n_stream, int64_t n_batch, int64_t n_kv,
+        size_t nb1, size_t nb2, size_t nb3,
+        size_t nbq1, size_t nbq2, size_t nbq3,
+        size_t nbk1, size_t nbk2, size_t nbk3,
+        size_t nbw1, size_t nbw2, size_t nbw3,
+        size_t nbm1, size_t nbm2, size_t nbm3,
+        int64_t nem3) {
+#if defined(AMD_MFMA_AVAILABLE)
+    using namespace li_mfma;
+    GGML_UNUSED_VARS(n_stream, nb2, nbk1, nbw2, nbm2);
+    constexpr int ROW = 128 + 4;
+
+    const int tid      = threadIdx.x;
+    const int wave     = tid / 64;
+    const int lane     = tid % 64;
+    const int c        = lane % 32;
+    const int half_id  = lane / 32;
+    const int p0       = blockIdx.x * (P*BP);
+    const int q0       = (blockIdx.y*4 + wave) * BQ;
+    const int i_stream = blockIdx.z;
+
+    int visible = 0;
+#pragma unroll
+    for (int t = 0; t < P; ++t) {
+        const int ip = p0 + BP*t + c;
+#pragma unroll
+        for (int r = 0; r < 16; ++r) {
+            const int iq = q0 + 8*(r/4) + 4*half_id + r%4;
+            if (iq < n_batch && ip < n_kv) {
+                const float mv = __half2float(((const half *) ((const char *) M + (int64_t) iq*nbm1 + (i_stream % nem3)*nbm3))[ip]);
+                visible |= !(isinf(mv) && mv < 0.0f);
+            }
+        }
+    }
+    if (!__syncthreads_or(visible)) {
+#pragma unroll
+        for (int t = 0; t < P; ++t) {
+            const int ip = p0 + BP*t + c;
+#pragma unroll
+            for (int r = 0; r < 16; ++r) {
+                const int iq = q0 + 8*(r/4) + 4*half_id + r%4;
+                if (iq < n_batch && ip < n_kv) {
+                    ((float *) ((char *) dst + (int64_t) iq*nb1 + i_stream*nb3))[ip] = -INFINITY;
+                }
+            }
+        }
+        return;
+    }
+
+    __shared__ __align__(16) float k_s[P*BP*ROW];
+    __shared__ float w_s[4*BQ][N_HEAD];
+
+    for (int e = tid; e < P*BP*32; e += 256) {
+        const int r  = e / 32;
+        const int c4 = e % 32;
+        const int ip = p0 + r;
+        float4 v = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        if (ip < n_kv) {
+            v = ((const float4 *) (K + (int64_t) ip*nbk2 + i_stream*nbk3))[c4];
+        }
+        *(float4 *) (k_s + r*ROW + 4*c4) = v;
+    }
+    for (int e = tid; e < 4*BQ*N_HEAD; e += 256) {
+        const int r  = e / N_HEAD;
+        const int h  = e % N_HEAD;
+        const int iq = blockIdx.y*4*BQ + r;
+        w_s[r][h] = iq < n_batch ? ((const float *) ((const char *) W + (int64_t) iq*nbw1 + i_stream*nbw3))[h] : 0.0f;
+    }
+
+    const int    iqa   = q0 + c;
+    const bool   q_ok  = iqa < n_batch;
+    const char * q_row = (const char *) Q + i_stream*nbq3 + (int64_t) (q_ok ? iqa : 0)*nbq2;
+
+    float4 qn[16];
+#pragma unroll
+    for (int u = 0; u < 16; ++u) {
+        qn[u] = ((const float4 *) q_row)[2*u + half_id];
+    }
+
+    float score[P][16];
+#pragma unroll
+    for (int t = 0; t < P; ++t) {
+#pragma unroll
+        for (int r = 0; r < 16; ++r) {
+            score[t][r] = 0.0f;
+        }
+    }
+    __syncthreads();
+
+    for (int h = 0; h < N_HEAD; ++h) {
+        float4 qv[16];
+#pragma unroll
+        for (int u = 0; u < 16; ++u) {
+            qv[u] = q_ok ? qn[u] : make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+        if (h + 1 < N_HEAD) {
+#pragma unroll
+            for (int u = 0; u < 16; ++u) {
+                qn[u] = ((const float4 *) (q_row + (int64_t) (h + 1)*nbq1))[2*u + half_id];
+            }
+        }
+        float w_val[16];
+#pragma unroll
+        for (int r = 0; r < 16; ++r) {
+            w_val[r] = w_s[BQ*wave + 8*(r/4) + 4*half_id + r%4][h];
+        }
+
+#pragma unroll
+        for (int t = 0; t < P; ++t) {
+            const float * k_row = k_s + (BP*t + c)*ROW + 4*half_id;
+            f16v acc = {0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f};
+#pragma unroll
+            for (int u = 0; u < 16; ++u) {
+                const float4 kv = *(const float4 *) (k_row + 8*u);
+                acc = __builtin_amdgcn_mfma_f32_32x32x2f32(qv[u].x, kv.x, acc, 0, 0, 0);
+                acc = __builtin_amdgcn_mfma_f32_32x32x2f32(qv[u].y, kv.y, acc, 0, 0, 0);
+                acc = __builtin_amdgcn_mfma_f32_32x32x2f32(qv[u].z, kv.z, acc, 0, 0, 0);
+                acc = __builtin_amdgcn_mfma_f32_32x32x2f32(qv[u].w, kv.w, acc, 0, 0, 0);
+            }
+#pragma unroll
+            for (int r = 0; r < 16; ++r) {
+                float sum = acc[r];
+                sum = (sum > 0.0f) ? sum : 0.0f;
+                score[t][r] += sum * w_val[r];
+            }
+        }
+    }
+
+#pragma unroll
+    for (int t = 0; t < P; ++t) {
+        const int ip = p0 + BP*t + c;
+#pragma unroll
+        for (int r = 0; r < 16; ++r) {
+            const int iq = q0 + 8*(r/4) + 4*half_id + r%4;
+            if (iq < n_batch && ip < n_kv) {
+                const float mv = __half2float(((const half *) ((const char *) M + (int64_t) iq*nbm1 + (i_stream % nem3)*nbm3))[ip]);
+                ((float *) ((char *) dst + (int64_t) iq*nb1 + i_stream*nb3))[ip] = score[t][r] + mv;
+            }
+        }
+    }
+#else
+    GGML_UNUSED_VARS(Q, K, W, M, dst, n_stream, n_batch, n_kv, nb1, nb2, nb3, nbq1, nbq2, nbq3, nbk1, nbk2, nbk3, nbw1, nbw2, nbw3, nbm1, nbm2, nbm3, nem3);
+    NO_DEVICE_CODE;
+#endif // defined(AMD_MFMA_AVAILABLE)
+}
+
+// GGML_CUDA_LI_MFMA=1: f32 MFMA kernel for f32 K and >= 32 queries (default off, changes the summation order)
+static int lightning_indexer_mfma_mode() {
+    static const int mode = [] { const char * e = getenv("GGML_CUDA_LI_MFMA"); return e != nullptr ? atoi(e) : 0; }();
+    return mode;
+}
+
+static bool lightning_indexer_use_mfma(const ggml_tensor * k, int64_t n_batch) {
+    return lightning_indexer_mfma_mode() != 0 && k->type == GGML_TYPE_F32 && n_batch >= 32;
+}
+#endif // defined(GGML_USE_HIP)
+
 // GGML_CUDA_LI_TILED: unset/1 = tiled kernel for f32 K when the batch has >= GGML_CUDA_LI_TILED_MIN queries (default 32;
 // MI100, 8192 pools: vec/tiled = 0.20x at 1 query, 0.58x at 8, 0.99x at 16, 1.80x at 32, 2.84x at 128), 0 = never,
 // 2 = always
@@ -922,6 +1223,40 @@ void ggml_cuda_lightning_indexer(ggml_backend_cuda_context & ctx, ggml_tensor * 
 
     const int device = ggml_cuda_get_device();
     const int cc     = ggml_cuda_info().devices[device].cc;
+
+#if defined(GGML_USE_HIP)
+    if (n_embd == 128 && (n_head == 64 || n_head == 32) && lightning_indexer_use_mfma(k, n_batch)) {
+        dim3 block(li_mfma::NT, 1, 1);
+        if (getenv("GGML_CUDA_LI_MFMA_LOG")) { static bool once = false; if (!once) { once = true; fprintf(stderr, "LI_MFMA fired n_kv=%d n_batch=%d\n", n_kv, n_batch); } }
+        dim3 grid((n_kv + li_mfma::BP - 1) / li_mfma::BP, (n_batch + li_mfma::BQ - 1) / li_mfma::BQ, n_stream);
+        auto launch = [&](auto kern) {
+            kern<<<grid, block, 0, ctx.stream()>>>(
+                q_d, k_d, w_d, m_d, dst_d,
+                n_stream, n_batch, n_kv,
+                nb1, nb2, nb3,
+                nbq1, nbq2, nbq3,
+                nbk1, nbk2, nbk3,
+                nbw1, nbw2, nbw3,
+                nbm1, nbm2, nbm3,
+                nem3);
+        };
+        const int mode = lightning_indexer_mfma_mode();
+        if (mode >= 2 && n_head == 32) {
+            // v2: 4 query tiles x 2 key tiles per block (LDS: 34 KB of K + 16 KB of W)
+            constexpr int P = 2;
+            block = dim3(256, 1, 1);
+            grid  = dim3((n_kv + P*li_mfma::BP - 1) / (P*li_mfma::BP), (n_batch + 4*li_mfma::BQ - 1) / (4*li_mfma::BQ), n_stream);
+            launch(lightning_indexer_kernel_mfma2_f32<32, 2>);
+            return;
+        }
+        if (n_head == 64) {
+            launch(lightning_indexer_kernel_mfma_f32<64>);
+        } else {
+            launch(lightning_indexer_kernel_mfma_f32<32>);
+        }
+        return;
+    }
+#endif // defined(GGML_USE_HIP)
 
     if (n_embd == 128 && (n_head == 64 || n_head == 32) && lightning_indexer_use_tiled(k, n_batch)) {
         dim3 block(li_tiled::NT, 1, 1);
