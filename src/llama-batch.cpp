@@ -518,6 +518,38 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
 
     llama_seq_id last_seq_id = -1;
 
+    // rune: decode groups (set_decode_groups, pipeline-parallel contexts only). A decode step of N streams is one
+    // ubatch, so the stages run it serially and every GPU idles most of the step. Cut into n equal ubatches, the
+    // ubatches follow each other through the stages. Only for decode-sized batches whose sequences are consecutive
+    // and equally long: equal ubatches have the same graph topology, so the scheduler does not re-plan (a re-plan
+    // drains every device).
+    uint32_t seq_cap = 0;
+    if (n_decode_groups > 1 && sequential && !has_cpl && n_used == 0) {
+        static const int max_tokens = getenv("LLAMA_DECODE_GROUPS_MAX_TOKENS") ? atoi(getenv("LLAMA_DECODE_GROUPS_MAX_TOKENS")) : 32;
+        // LLAMA_DECODE_GROUPS_MIN_SEQS: fewest streams that are cut (default 2 per ubatch)
+        static const int min_seqs = getenv("LLAMA_DECODE_GROUPS_MIN_SEQS") ? atoi(getenv("LLAMA_DECODE_GROUPS_MIN_SEQS")) : 0;
+        const uint32_t n_sets = (uint32_t) seq_set_map.size();
+        const uint32_t n_min  = min_seqs > 0 ? (uint32_t) min_seqs : 2*n_decode_groups;
+        bool ok = batch.n_tokens <= max_tokens && n_sets >= n_min && n_sets % n_decode_groups == 0 &&
+                  (uint32_t) batch.n_tokens % n_sets == 0;
+        llama_seq_id id_min = LLAMA_MAX_SEQ, id_max = -1;
+        for (const auto & it : seq_set_map) {
+            ok = ok && it.second.size() == (size_t) batch.n_tokens / n_sets;
+        }
+        for (int32_t i = 0; ok && i < batch.n_tokens; ++i) {
+            id_min = std::min(id_min, batch.seq_id[i][0]);
+            id_max = std::max(id_max, batch.seq_id[i][0]);
+        }
+        if (ok && (uint32_t) (id_max - id_min + 1) == n_sets) {
+            decode_seq_cap = n_sets / n_decode_groups;
+        } else {
+            decode_seq_cap = 0;
+        }
+    }
+    if (n_decode_groups > 1 && sequential) {
+        seq_cap = decode_seq_cap;
+    }
+
     // determine the non-overlapping sequence sets participating in this ubatch
     for (int32_t i = 0; i < batch.n_tokens; ++i) {
         if (used[i]) {
@@ -545,6 +577,10 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
             last_seq_id = batch.seq_id[i][0];
 
             if (cur_seq_set.size() > n_ubatch) {
+                break;
+            }
+
+            if (seq_cap > 0 && cur_seq_set.size() >= seq_cap) {
                 break;
             }
         }

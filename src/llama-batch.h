@@ -110,6 +110,11 @@ public:
     // sequence-set-wise split - each ubatch contains a single sequence-set
     llama_ubatch split_seq(uint32_t n_ubatch);
 
+    // rune: cut a decode-sized batch of N sequences into n equal ubatches (0/1 = off), see split_equal
+    void set_decode_groups(uint32_t n) { n_decode_groups = n; }
+    // number of ubatches the current batch was cut into by decode groups (0 = not cut); valid after the splits
+    uint32_t get_decode_groups_active() const { return decode_seq_cap > 0 ? n_decode_groups : 0; }
+
     // a helper method for creating a well-defined ubatch of tokens
     // TODO: support embeddings if needed in the future
     llama_ubatch ubatch_reserve(uint32_t n_seq_tokens, uint32_t n_seqs);
@@ -136,6 +141,9 @@ private:
     uint32_t n_embd;
     uint32_t n_seq_max;
     uint32_t n_outputs;
+
+    uint32_t n_decode_groups = 0;
+    uint32_t decode_seq_cap  = 0; // sequences per ubatch of the current batch (0 = no cap)
 
     std::array<llama_seq_id, 1> seq_id_0 = {{ 0 }}; // default sequence id
 

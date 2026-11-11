@@ -657,6 +657,9 @@ void llama_context::sched_reserve() {
     gf_res_prev.reset(new llm_graph_result(max_nodes));
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
+    decode_lanes.clear();   // synchronized above; lanes are rebuilt on first use
+    decode_lane_nodes = max_nodes;
+
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.sched_copies, cparams.op_offload));
 
     llama_memory_context_ptr mctx;
@@ -885,6 +888,7 @@ bool llama_context::memory_update(bool optimize) {
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
         //       reset the graph result only if the memory module did reset the scheduler
         gf_res_prev->reset();
+        decode_lanes_reset_graphs();
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1429,6 +1433,37 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
+bool llama_context::decode_lane_swap(uint32_t lane) {
+    if (lane >= decode_lanes.size()) {
+        decode_lanes.resize(lane + 1);
+    }
+    auto & l = decode_lanes[lane];
+    if (!l.sched) {
+        // same construction as the main scheduler; its buffers are reserved by the first graph it allocates
+        l.res.reset(new llm_graph_result(decode_lane_nodes));
+        l.sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), decode_lane_nodes, cparams.sched_copies, cparams.op_offload));
+        if (!l.sched) {
+            l.res.reset();
+            return false;
+        }
+        LLAMA_LOG_WARN("%s: decode lane %u created\n", __func__, lane);
+    }
+    std::swap(sched,       l.sched);
+    std::swap(gf_res_prev, l.res);
+    return true;
+}
+
+void llama_context::decode_lanes_reset_graphs() {
+    for (auto & l : decode_lanes) {
+        if (l.res) {
+            l.res->reset();
+        }
+        if (l.sched) {
+            ggml_backend_sched_reset(l.sched.get());
+        }
+    }
+}
+
 llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
     // LLAMA_GRAPH_TIMING=1 (below) also reports the memory apply and the host time between consecutive process_ubatch calls
     static const bool graph_timing_ap = getenv("LLAMA_GRAPH_TIMING") && atoi(getenv("LLAMA_GRAPH_TIMING")) != 0;
@@ -1886,6 +1921,16 @@ int llama_context::decode(const llama_batch & batch_inp) {
         return -1;
     }
 
+    // rune: LLAMA_DECODE_GROUPS=n cuts a decode step of N >= 2n streams into n equal ubatches that follow each other
+    // through the pipeline stages (llama_batch_allocr::split_equal). Pipeline-parallel contexts only: on one device
+    // the ubatches would just run one after the other.
+    {
+        static const int decode_groups = getenv("LLAMA_DECODE_GROUPS") ? atoi(getenv("LLAMA_DECODE_GROUPS")) : 0;
+        // LLAMA_DECODE_GROUPS_FORCE=1: also without pipeline parallelism (tests of the split / lane logic on one device)
+        static const bool decode_groups_force = getenv("LLAMA_DECODE_GROUPS_FORCE") && atoi(getenv("LLAMA_DECODE_GROUPS_FORCE")) == 1;
+        balloc->set_decode_groups((cparams.pipeline_parallel || decode_groups_force) && decode_groups > 1 ? (uint32_t) decode_groups : 0);
+    }
+
     const uint32_t n_tokens_all  = balloc->get_n_tokens();
     const uint32_t n_outputs_all = balloc->get_n_outputs();
 
@@ -1986,8 +2031,24 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const uint64_t nextn_cur = nextn_seq + 1;
     ggml_backend_t nextn_backend_cur = nullptr;
 
+    // decode groups: ubatch g of a cut step uses lane g - 1 (ubatch 0 stays on the main scheduler)
+    static const bool decode_lanes_on = !(getenv("LLAMA_DECODE_LANES") && atoi(getenv("LLAMA_DECODE_LANES")) == 0);
+    const uint32_t n_groups_active = decode_lanes_on ? balloc->get_decode_groups_active() : 0;
+    uint32_t i_ubatch = 0;
+
     do {
         const auto & ubatch = mctx->get_ubatch();
+
+        // swap the lane in for this ubatch (graph, compute, output copies) and back at the end of the iteration
+        struct lane_guard {
+            llama_context * ctx; uint32_t lane; bool on = false;
+            ~lane_guard() { if (on) { ctx->decode_lane_swap(lane); } }
+        } lane_g = { this, 0 };
+        if (n_groups_active > 1 && i_ubatch > 0 && i_ubatch < n_groups_active) {
+            lane_g.lane = i_ubatch - 1;
+            lane_g.on   = decode_lane_swap(lane_g.lane);
+        }
+        i_ubatch++;
 
         // count the outputs in this ubatch
         {
@@ -2675,6 +2736,7 @@ ggml_cgraph * llama_context::graph_reserve(
 
     // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
     gf_res_prev->reset();
+    decode_lanes_reset_graphs();
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this

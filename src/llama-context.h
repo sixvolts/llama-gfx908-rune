@@ -372,6 +372,20 @@ private:
 
     ggml_backend_sched_ptr sched;
 
+    // rune decode groups: ubatch g > 0 of a cut decode step runs on its own scheduler and graph result (lane g - 1),
+    // swapped into sched / gf_res_prev for that ubatch. Each group then reuses its graph (graph reuse needs the same
+    // sequence ids, and one scheduler holds one graph) and has its own compute buffers, so groups in flight on
+    // different devices do not alias.
+    struct decode_lane {
+        ggml_backend_sched_ptr sched;
+        llm_graph_result_ptr   res;
+    };
+    std::vector<decode_lane> decode_lanes;
+    size_t                   decode_lane_nodes = 0;
+
+    bool decode_lane_swap(uint32_t lane); // swap lane <-> sched/gf_res_prev; creates the lane on first use
+    void decode_lanes_reset_graphs();     // no lane may reuse its graph (memory module changed)
+
     bool sched_need_reserve = true;
 
     ggml_backend_t backend_cpu = nullptr;
