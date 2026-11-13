@@ -2672,6 +2672,73 @@ static void ggml_backend_cuda_get_tensor_2d_async(ggml_backend_t backend, const 
         data, stride_data, (const char *) tensor->data + offset, stride_tensor, size, n_copies, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
 }
 
+// GGML_CUDA_SPLIT_TIMING=<path> (diagnostics, rune prefill pipeline): GPU time of every graph compute and staged-ring
+// push / pull, from timing events around them on the device's stream. An entry is written when its slot is reused
+// (lag <= K entries per device): "t_host_us dev kind n busy_us gap_after_us", kind 0 = graph compute (n = nodes),
+// 1 = ring push (n = bytes), 2 = ring pull (n = bytes; starts after the cross-device wait); gap_after = stream time from
+// the entry's end to the next entry's start on that device (idle, waits, or untimed work such as peer blits / output
+// copies), -1 if unknown. Off: one static check per call.
+struct ggml_cuda_split_timing {
+    static constexpr int K = 128;
+    struct entry { cudaEvent_t s = nullptr, e = nullptr; int64_t t_us = 0, n = 0; int kind = 0; bool used = false; };
+    entry      ent[GGML_CUDA_MAX_DEVICES][K];
+    int        next[GGML_CUDA_MAX_DEVICES] = {};
+    FILE *     f = nullptr;
+    std::mutex mtx;
+};
+static ggml_cuda_split_timing * ggml_cuda_split_timing_get() {
+    static ggml_cuda_split_timing * st = [] () -> ggml_cuda_split_timing * {
+        const char * p = getenv("GGML_CUDA_SPLIT_TIMING");
+        FILE * f = p && *p ? fopen(p, "a") : nullptr;
+        if (!f) {
+            return nullptr;
+        }
+        auto * s = new ggml_cuda_split_timing;
+        s->f = f;
+        return s;
+    }();
+    return st;
+}
+// records the start event on `stream` (current device must be `device`); returns the slot for _end, -1 when off
+static int ggml_cuda_split_timing_begin(int device, cudaStream_t stream, int kind, int64_t n) {
+    ggml_cuda_split_timing * st = ggml_cuda_split_timing_get();
+    if (!st) {
+        return -1;
+    }
+    std::lock_guard<std::mutex> lock(st->mtx);
+    constexpr int K = ggml_cuda_split_timing::K;
+    const int j = st->next[device];
+    st->next[device] = (j + 1) % K;
+    auto & en = st->ent[device][j];
+    if (en.used) {
+        // harvest the oldest entry; its successor (the next oldest) gives the gap
+        auto & nx = st->ent[device][(j + 1) % K];
+        float busy = -1.0f, gap = -1.0f;
+        CUDA_CHECK(cudaEventSynchronize(en.e));
+        CUDA_CHECK(cudaEventElapsedTime(&busy, en.s, en.e));
+        if (nx.used) {
+            CUDA_CHECK(cudaEventSynchronize(nx.s));
+            CUDA_CHECK(cudaEventElapsedTime(&gap, en.e, nx.s));
+        }
+        fprintf(st->f, "%lld %d %d %lld %.0f %.0f\n", (long long) en.t_us, device, en.kind, (long long) en.n, busy * 1e3f, gap * 1e3f);
+    }
+    if (!en.s) {
+        CUDA_CHECK(cudaEventCreateWithFlags(&en.s, cudaEventDefault));
+        CUDA_CHECK(cudaEventCreateWithFlags(&en.e, cudaEventDefault));
+    }
+    en.t_us = ggml_time_us(); en.n = n; en.kind = kind; en.used = true;
+    CUDA_CHECK(cudaEventRecord(en.s, stream));
+    return j;
+}
+static void ggml_cuda_split_timing_end(int device, cudaStream_t stream, int j) {
+    if (j < 0) {
+        return;
+    }
+    ggml_cuda_split_timing * st = ggml_cuda_split_timing_get();
+    std::lock_guard<std::mutex> lock(st->mtx);
+    CUDA_CHECK(cudaEventRecord(st->ent[device][j].e, stream));
+}
+
 // Device pairs without peer access (rune's PCIe-only "orphan" GPUs): hipMemcpyPeerAsync faults there, so the copy is staged
 // through a small ring of pinned host buffers per (src, dst) pair: D2H on the src stream, H2D on the dst stream after an
 // event, slot reuse gated by an event recorded after its H2D. Both streams stay asynchronous (pipeline parallelism keeps
@@ -2852,19 +2919,34 @@ static void ggml_cuda_cpy_host_staged(ggml_backend_cuda_context * ctx_src, ggml_
         // to the exact size every few steps (w74 trace: ~1.5 per decode step, all GPUs idle). Grow by 1.5x in 1 MiB
         // steps instead (GGML_CUDA_STAGE_RING_GROW=0: exact size). The trailer check keys on the sequence number, so
         // bytes past nbytes in a larger slot are never read as data.
-        static const bool grow = !(getenv("GGML_CUDA_STAGE_RING_GROW") && atoi(getenv("GGML_CUDA_STAGE_RING_GROW")) == 0);
-        const size_t alloc = grow ? GGML_PAD(std::max(slot_bytes, r.size[i] + r.size[i] / 2), (size_t) 1 << 20) : slot_bytes;
+        // A regrow under prefill load is a pipeline drain (cudaFreeHost waits for the queued work: w84 trace 315-345 ms
+        // for the first slot, ~90 ms = one stage for each further pair), paid once per slot per size step (16 slots x
+        // 7 pairs; the stage-0 n_kv-sized input steps 8 -> 16 -> 24 MiB at 32k/64k/96k cells: 25 s of a cold 98k).
+        // GGML_CUDA_STAGE_RING_MIN_MB=<n>: allocate every slot with at least n MiB (33 covers prompt copies of -ub 512
+        // up to 128k cells: no regrow). GGML_CUDA_STAGE_RING_GROW=2: a regrow resizes every allocated smaller slot of
+        // the ring at once (one drain per ring and size step instead of one per slot).
+        static const int  grow_mode = getenv("GGML_CUDA_STAGE_RING_GROW") ? atoi(getenv("GGML_CUDA_STAGE_RING_GROW")) : 1;
+        static const size_t min_slot = getenv("GGML_CUDA_STAGE_RING_MIN_MB") ? (size_t) std::max(0, atoi(getenv("GGML_CUDA_STAGE_RING_MIN_MB"))) << 20 : 0;
+        const size_t alloc = std::max(min_slot, grow_mode != 0 ? GGML_PAD(std::max(slot_bytes, r.size[i] + r.size[i] / 2), (size_t) 1 << 20) : slot_bytes);
         static const bool alloc_log = getenv("GGML_CUDA_ALLOC_LOG") && atoi(getenv("GGML_CUDA_ALLOC_LOG")) != 0;
-        if (alloc_log) {
-            GGML_LOG_WARN("[ring] dev%d->dev%d slot %d regrow %zu -> %zu (copy %zu bytes)\n",
-                ctx_src->device, ctx_dst->device, i, r.size[i], alloc, nbytes);
+        for (int j = 0; j < n_slots; ++j) {
+            if (j != i && !(grow_mode == 2 && r.buf[j] != nullptr && r.size[j] < alloc)) {
+                continue;
+            }
+            if (j != i && r.used[j]) {
+                CUDA_CHECK(cudaEventSynchronize(r.h2d_done[j]));   // slot j's in-flight copy has consumed its buffer
+            }
+            if (alloc_log) {
+                GGML_LOG_WARN("[ring] dev%d->dev%d slot %d regrow %zu -> %zu (copy %zu bytes)\n",
+                    ctx_src->device, ctx_dst->device, j, r.size[j], alloc, nbytes);
+            }
+            if (r.buf[j]) {
+                CUDA_CHECK(cudaFreeHost(r.buf[j]));
+            }
+            CUDA_CHECK(cudaMallocHost(&r.buf[j], alloc));
+            memset(r.buf[j], 0, alloc);
+            r.size[j] = alloc;
         }
-        if (r.buf[i]) {
-            CUDA_CHECK(cudaFreeHost(r.buf[i]));
-        }
-        CUDA_CHECK(cudaMallocHost(&r.buf[i], alloc));
-        memset(r.buf[i], 0, alloc);
-        r.size[i] = alloc;
     }
     if (!r.d2h_done[i]) {
         ggml_cuda_set_device(ctx_src->device);
@@ -2893,17 +2975,21 @@ static void ggml_cuda_cpy_host_staged(ggml_backend_cuda_context * ctx_src, ggml_
         ggml_cuda_set_device(sd);
         void * slot_src = nullptr;
         CUDA_CHECK(cudaHostGetDevicePointer(&slot_src, r.buf[i], 0));
+        const int tm_push = ggml_cuda_split_timing_begin(sd, ctx_src->stream(), 1, (int64_t) nbytes);
         ggml_cuda_ring_copy_kernel<<<nblk, 256, 0, ctx_src->stream()>>>((const uint32_t *) src, (uint32_t *) slot_src, nwords, g_ring_pull.partial_src[sd][dd]);
         ggml_cuda_ring_push_fin<<<1, 256, 0, ctx_src->stream()>>>(g_ring_pull.partial_src[sd][dd], nblk, seq, (volatile uint64_t *) ((char *) slot_src + tr_off));
+        ggml_cuda_split_timing_end(sd, ctx_src->stream(), tm_push);
         CUDA_CHECK(cudaEventRecord(r.d2h_done[i], ctx_src->stream()));
         // consumer: pull + validate (the event keeps the fast path ordered; the finisher covers late data)
         ggml_cuda_set_device(dd);
         void * slot_dst = nullptr;
         CUDA_CHECK(cudaHostGetDevicePointer(&slot_dst, r.buf[i], 0));
         CUDA_CHECK(cudaStreamWaitEvent(ctx_dst->stream(), r.d2h_done[i], 0));
+        const int tm_pull = ggml_cuda_split_timing_begin(dd, ctx_dst->stream(), 2, (int64_t) nbytes);
         ggml_cuda_ring_copy_kernel<<<nblk, 256, 0, ctx_dst->stream()>>>((const uint32_t *) slot_dst, (uint32_t *) dst, nwords, g_ring_pull.partial_dst[sd][dd]);
         ggml_cuda_ring_pull_fin<<<1, 256, 0, ctx_dst->stream()>>>(g_ring_pull.partial_dst[sd][dd], nblk, seq, (const volatile uint64_t *) ((char *) slot_dst + tr_off),
             (const volatile uint32_t *) slot_dst, (uint32_t *) dst, nwords, g_ring_pull.stats[dd]);
+        ggml_cuda_split_timing_end(dd, ctx_dst->stream(), tm_pull);
         CUDA_CHECK(cudaEventRecord(r.h2d_done[i], ctx_dst->stream()));
         r.used[i] = true;
         ggml_cuda_set_device(sd);
@@ -5850,6 +5936,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     }
 #endif // USE_CUDA_GRAPH
 
+    // outside any capture: the events bracket the graph launch / eager kernels on the stream
+    const int tm_graph = ggml_cuda_split_timing_begin(cuda_ctx->device, cuda_ctx->stream(), 0, cgraph->n_nodes);
+
     if (use_cuda_graph && cuda_graph_update_required) {
         // Start CUDA graph capture
         {
@@ -5880,6 +5969,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     static double  gs_t[GGML_CUDA_MAX_DEVICES][3] = {};
     const int64_t gs_t0 = graph_stats ? ggml_time_us() : 0;
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+    ggml_cuda_split_timing_end(cuda_ctx->device, cuda_ctx->stream(), tm_graph);
     if (ggml_host_trace_on()) {
         // 0 = replayed instance, 1 = (re)captured, 2 = eager (warmup / not graph-compatible)
         ggml_host_trace("g_kind", cuda_ctx->device, !use_cuda_graph ? 2 : (cuda_graph_update_required ? 1 : 0));
