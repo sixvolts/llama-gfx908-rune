@@ -3,6 +3,8 @@
 #include "llama.h"
 #include "llama-cparams.h"
 
+#include <array>
+#include <atomic>
 #include <bitset>
 #include <cassert>
 #include <cstring>
@@ -31,11 +33,54 @@ struct llama_kv_cell_ext {
     }
 };
 
+// rune: ring of the last cell changes (cell + a position it had before or after), for inputs that update
+// incrementally (LLAMA_KPOOL_INC). gen is unique per object state: reset, resize, copy and assign give a new one,
+// so a reader that saw another gen or fell more than N entries behind must rebuild from scratch
+struct llama_kv_cells_mut_log {
+    struct entry { uint32_t i; llama_pos p; };
+    static constexpr uint64_t N = 512;
+
+    uint64_t gen = new_gen();
+    uint64_t n   = 0;
+    std::array<entry, N> ring;
+
+    llama_kv_cells_mut_log() = default;
+    llama_kv_cells_mut_log(const llama_kv_cells_mut_log &) : gen(new_gen()) {}
+    llama_kv_cells_mut_log & operator=(const llama_kv_cells_mut_log &) { gen = new_gen(); n = 0; return *this; }
+
+    void add(uint32_t i, llama_pos p) { ring[n % N] = { i, p }; ++n; }
+    void clear() { gen = new_gen(); n = 0; }
+
+    static uint64_t new_gen() {
+        static std::atomic<uint64_t> next{1};
+        return next.fetch_add(1, std::memory_order_relaxed);
+    }
+};
+
+// rune LLAMA_KPOOL_INC: state of one stream's incrementally updated input, valid while the cells keep gen and the
+// reader is at most llama_kv_cells_mut_log::N entries behind
+struct llama_kv_inc_state {
+    bool         valid   = false;
+    uint64_t     gen     = 0;  // cells mut_gen() at the last update
+    uint64_t     n_mut   = 0;  // cells mut_n() at the last update
+    llama_seq_id seq     = -1;
+    int64_t      n_kv    = 0;
+    int64_t      n_pools = 0;
+    int64_t      b_base  = 0;
+    int64_t      n_run   = 0;
+
+    std::vector<int32_t> pool_cells; // kpool: [kpool*n_pools], as in the output
+    std::vector<int32_t> pool_reps;  // kpool: [n_pools], as in the output
+    std::vector<int32_t> filled;     // kpool: [n_pools] cells per pool, 0 outside the run
+    std::vector<float>   vals;       // kpool: pool_bias row of a query that sees every pool; kv_pos: [n_kv] output
+};
+
 // meta information about KV cells that can be part of multiple sequences at the same time
 // TODO: add unit tests
 class llama_kv_cells {
 public:
     using seq_set_t = std::bitset<LLAMA_MAX_SEQ>;
+    using mut_log_t = llama_kv_cells_mut_log;
 
     void reset() {
         for (uint32_t i = 0; i < pos.size(); ++i) {
@@ -51,6 +96,24 @@ public:
 
         for (uint32_t s = 0; s < LLAMA_MAX_SEQ; ++s) {
             seq_pos[s].clear();
+        }
+
+        mut.clear();
+    }
+
+    // the change log (see llama_kv_cells_mut_log); entry k is valid for n - N <= k < n
+    uint64_t mut_gen() const { return mut.gen; }
+    uint64_t mut_n()   const { return mut.n; }
+    const mut_log_t::entry & mut_at(uint64_t k) const { return mut.ring[k % mut_log_t::N]; }
+
+    // f(pos, cell) for each cell of seq_id with pos in [p0, p1), in (pos, cell) order
+    template <typename F>
+    void seq_pos_each(llama_seq_id seq_id, llama_pos p0, llama_pos p1, F && f) const {
+        assert(seq_id >= 0 && seq_id < LLAMA_MAX_SEQ);
+
+        const auto & sp = seq_pos[seq_id];
+        for (auto it = sp.lower_bound({ p0, 0u }); it != sp.end() && it->first < p1; ++it) {
+            f(it->first, it->second);
         }
     }
 
@@ -181,6 +244,9 @@ public:
                 seq_pos_rm(i + j);
             }
 
+            mut.add(idx, pos[idx]);
+            mut.add(idx, other.pos[j]);
+
             pos[idx] = other.pos[j];
             ext[idx] = other.ext[j];
             seq[idx] = other.seq[j];
@@ -212,6 +278,9 @@ public:
                 seq_pos_rm(idx);
             }
 
+            mut.add(idx, pos[idx]);
+            mut.add(idx, other.pos[j]);
+
             pos[idx] = other.pos[j];
             ext[idx] = other.ext[j];
             seq[idx] = other.seq[j];
@@ -228,6 +297,8 @@ public:
     void rm(uint32_t i) {
         assert(i < pos.size());
         assert(pos[i] != -1);
+
+        mut.add(i, pos[i]);
 
         seq_pos_rm(i);
         seq[i].reset();
@@ -246,6 +317,8 @@ public:
         assert(seq[i].test(seq_id));
         assert(pos[i] != -1);
         assert(seq_id >= 0);
+
+        mut.add(i, pos[i]);
 
         seq[i].reset(seq_id);
         seq_pos_dec(seq_id, i);
@@ -266,6 +339,10 @@ public:
     // return true if the cell becomes empty (i.e. it did not contain seq_id before the call)
     bool seq_keep(uint32_t i, llama_seq_id seq_id) {
         assert(i < pos.size());
+
+        if (pos[i] != -1) {
+            mut.add(i, pos[i]);
+        }
 
         if (seq[i].test(seq_id)) {
             seq_pos_rm(i);
@@ -341,6 +418,8 @@ public:
         assert(i < pos.size());
         assert(pos[i] != -1);
         assert(!seq[i].test(seq_id));
+
+        mut.add(i, pos[i]);
 
         seq[i].set(seq_id);
         seq_pos_inc(seq_id, i);
@@ -424,6 +503,8 @@ public:
         assert(pos[i] == -1);
         assert(seq[i].none());
 
+        mut.add(i, p);
+
         pos[i] = p;
 
         used.insert(i);
@@ -442,6 +523,9 @@ public:
         assert(pos[i] != -1);
 
         seq_pos_rm(i);
+
+        mut.add(i, pos[i]);
+        mut.add(i, pos[i] + d < 0 ? -1 : pos[i] + d);
 
         pos[i]   += d;
         shift[i] += d;
@@ -473,6 +557,9 @@ public:
         const llama_pos p_old = pos[i];
 
         seq_pos_rm(i);
+
+        mut.add(i, pos[i]);
+        mut.add(i, pos[i]/d);
 
         pos[i]   /= d;
         shift[i] += p_old - pos[i];
@@ -523,6 +610,8 @@ private:
     //
     std::set<std::pair<llama_pos, uint32_t>> seq_pos[LLAMA_MAX_SEQ];
 
+    mut_log_t mut;
+
     // helper functions for updating `seq_pos`, once cell at a time:
 
     void seq_pos_dec(llama_seq_id s, uint32_t i) {
@@ -555,3 +644,36 @@ private:
 };
 
 using llama_kv_cells_vec = std::vector<llama_kv_cells>;
+
+// every cell's position, 1e9 for an empty cell (llama_kv_cache::set_input_kv_pos). With st (LLAMA_KPOOL_INC) only the
+// cells logged since the last call re-read; a new gen, another n_kv or a log overflow re-reads all
+static inline void llama_kv_cells_set_kv_pos(const llama_kv_cells & cells, int64_t n_kv, llama_kv_inc_state * st, float * out) {
+    if (st == nullptr) {
+        for (int64_t j = 0; j < n_kv; ++j) {
+            out[j] = cells.is_empty(j) ? 1e9f : (float) cells.pos_get(j);
+        }
+        return;
+    }
+
+    const uint64_t n_mut = cells.mut_n();
+
+    if (st->valid && st->gen == cells.mut_gen() && st->n_kv == n_kv && n_mut - st->n_mut <= llama_kv_cells::mut_log_t::N) {
+        for (uint64_t k = st->n_mut; k < n_mut; ++k) {
+            const uint32_t j = cells.mut_at(k).i;
+            if (j < (uint64_t) n_kv) {
+                st->vals[j] = cells.is_empty(j) ? 1e9f : (float) cells.pos_get(j);
+            }
+        }
+    } else {
+        st->vals.resize(n_kv);
+        for (int64_t j = 0; j < n_kv; ++j) {
+            st->vals[j] = cells.is_empty(j) ? 1e9f : (float) cells.pos_get(j);
+        }
+        st->valid = true;
+        st->gen   = cells.mut_gen();
+        st->n_kv  = n_kv;
+    }
+    st->n_mut = n_mut;
+
+    memcpy(out, st->vals.data(), n_kv*sizeof(float));
+}

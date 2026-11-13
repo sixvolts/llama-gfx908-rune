@@ -144,6 +144,9 @@ llama_kv_cache::llama_kv_cache(
         v_cells[s].resize(kv_size);
     }
 
+    inc_kpool .resize(n_stream);
+    inc_kv_pos.resize(n_stream);
+
     // by default, all sequence ids are mapped to the 0th stream
     seq_to_stream.resize(LLAMA_MAX_SEQ, 0);
 
@@ -1226,6 +1229,17 @@ void llama_kv_cache::set_kpool_dirty(llama_seq_id seq_id) {
     }
 }
 
+bool llama_kv_cache::inc_inputs() {
+    static const bool v = getenv("LLAMA_KPOOL_INC") && atoi(getenv("LLAMA_KPOOL_INC")) != 0;
+    return v;
+}
+
+llama_kv_inc_state & llama_kv_cache::get_inc_kpool(llama_seq_id seq_id) const {
+    GGML_ASSERT(seq_id >= 0 && (size_t) seq_id < seq_to_stream.size());
+
+    return inc_kpool[seq_to_stream[seq_id]];
+}
+
 bool llama_kv_cache::get_kpool_dirty(const llama_ubatch & ubatch) const {
     if (kpool_dirty.empty()) {
         return false;
@@ -1894,13 +1908,26 @@ void llama_kv_cache::set_input_kv_pos(ggml_tensor * dst, const llama_ubatch * ub
 
     float * data = (float *) dst->data;
 
+    static const bool verify = getenv("LLAMA_KPOOL_VERIFY") && atoi(getenv("LLAMA_KPOOL_VERIFY"));
+
     for (int64_t s = 0; s < n_stream; ++s) {
-        const auto & cells = v_cells[seq_to_stream[ubatch->seq_id[s*n_tps][0]]];
+        const uint32_t strm  = seq_to_stream[ubatch->seq_id[s*n_tps][0]];
+        const auto   & cells = v_cells[strm];
 
         GGML_ASSERT((uint32_t) n_kv <= cells.size());
 
-        for (int64_t j = 0; j < n_kv; ++j) {
-            data[s*n_kv + j] = cells.is_empty(j) ? 1e9f : (float) cells.pos_get(j);
+        float * out = data + s*n_kv;
+
+        llama_kv_cells_set_kv_pos(cells, n_kv, inc_inputs() ? &inc_kv_pos[strm] : nullptr, out);
+
+        if (verify) {
+            for (int64_t j = 0; j < n_kv; ++j) {
+                const float ref = cells.is_empty(j) ? 1e9f : (float) cells.pos_get(j);
+                if (memcmp(&ref, &out[j], sizeof(float)) != 0) {
+                    LLAMA_LOG_ERROR("%s: incremental kv_pos differs at stream %u cell %lld\n", __func__, strm, (long long) j);
+                    GGML_ABORT("LLAMA_KPOOL_VERIFY kv_pos mismatch");
+                }
+            }
         }
     }
 }
