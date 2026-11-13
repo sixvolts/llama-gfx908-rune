@@ -265,6 +265,23 @@ struct server_batch {
     }
 };
 
+// (rune) LLAMA_CKPT_LOG_MS (default 50): context checkpoints and prompt cache updates slower than this are logged
+static int64_t host_op_log_us() {
+    static const int64_t us = getenv("LLAMA_CKPT_LOG_MS") ? 1000 * (int64_t) atoll(getenv("LLAMA_CKPT_LOG_MS")) : 50000;
+    return us;
+}
+
+// LLAMA_CKPT_RECYCLE: state buffers reused / freshly allocated so far, bytes kept for reuse (empty when off)
+static std::string state_recycle_stats() {
+    if (!common_state_blob::recycle()) {
+        return "";
+    }
+    uint64_t n_hit = 0, n_miss = 0;
+    size_t pooled = 0;
+    common_state_blob::stats(n_hit, n_miss, pooled);
+    return string_format(" [recycle: %" PRIu64 " reused, %" PRIu64 " new, %.0f MiB pooled]", n_hit, n_miss, pooled / 1048576.0);
+}
+
 // (rune) LLAMA_CKPT_ASYNC=1: context checkpoints are taken with queued state copies into pinned staging buffers instead
 // of a full synchronize + blocking copy (which drained the 9-stage prompt pipeline for ~0.8 s per checkpoint, twice
 // per prompt). A pending checkpoint is copied into its data_tgt after the next synchronize of the target context.
@@ -356,7 +373,7 @@ struct server_slot {
             for (auto & c : prompt.checkpoints) {
                 if (c.async_id == p.id) {
                     const uint8_t * src = ckpt_pool->bufs[p.staging].ptr;
-                    c.data_tgt.assign(src, src + p.size);
+                    memcpy(c.data_tgt.alloc(p.size), src, p.size);
                     c.async_id = 0;
                     break;
                 }
@@ -2083,8 +2100,8 @@ private:
                 prompt_cache->update();
 
                 const double t_ms = (ggml_time_us() - t_start) / 1000.0;
-                if (t_ms > 50.0) {
-                    SRV_INF("prompt cache update took %.2f ms\n", t_ms);
+                if (t_ms > host_op_log_us() / 1e3) {
+                    SRV_INF("prompt cache update took %.2f ms%s\n", t_ms, state_recycle_stats().c_str());
                 } else {
                     SRV_TRC("prompt cache update took %.2f ms\n", t_ms);
                 }
@@ -2843,9 +2860,10 @@ private:
         // stash the draft's speculative state with the checkpoint
         common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
         const int64_t t_ckpt2 = ggml_time_us();
-        if (t_ckpt2 - t_ckpts > 50000) {
-            SLT_INF(slot, "context checkpoint at n_tokens = %" PRId64 " took %.1f ms (target %.1f ms, %.1f MiB; sync wait before it %.1f ms)\n",
-                    cur.n_tokens, (t_ckpt2 - t_ckpt0)/1e3, (t_ckpt1 - t_ckpt0)/1e3, (float) cur.size() / 1024 / 1024, (t_ckpt0 - t_ckpts)/1e3);
+        if (t_ckpt2 - t_ckpts > host_op_log_us()) {
+            SLT_INF(slot, "context checkpoint at n_tokens = %" PRId64 " took %.1f ms (target %.1f ms, %.1f MiB; sync wait before it %.1f ms)%s\n",
+                    cur.n_tokens, (t_ckpt2 - t_ckpt0)/1e3, (t_ckpt1 - t_ckpt0)/1e3, (float) cur.size() / 1024 / 1024, (t_ckpt0 - t_ckpts)/1e3,
+                    state_recycle_stats().c_str());
         }
 
         SLT_TRC(slot,

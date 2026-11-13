@@ -22,6 +22,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <mutex>
 #include <regex>
 #include <sstream>
 #include <string>
@@ -2258,6 +2259,135 @@ bool common_prompt_batch_decode(
     return true;
 }
 
+//
+// common_state_blob (LLAMA_CKPT_RECYCLE)
+//
+
+namespace {
+struct state_blob_pool {
+    std::mutex mtx;
+    std::list<std::vector<uint8_t>> free;   // oldest first
+    size_t   bytes  = 0;
+    size_t   budget = 0;
+    uint64_t n_hit  = 0;
+    uint64_t n_miss = 0;
+};
+}
+
+static state_blob_pool & state_blob_pool_get() {
+    // never destroyed: blobs in static objects may be freed after it at exit
+    static state_blob_pool * p = [] {
+        auto * r = new state_blob_pool;
+        const char * e = getenv("LLAMA_CKPT_RECYCLE_MIB");
+        r->budget = (e ? (size_t) std::max(0LL, atoll(e)) : 4096) * 1024 * 1024;
+        return r;
+    }();
+    return *p;
+}
+
+static void state_blob_give(std::vector<uint8_t> * v) {
+    auto & pool = state_blob_pool_get();
+    std::list<std::vector<uint8_t>> drop;
+    if (v->capacity() >= 4096 && v->capacity() <= pool.budget) {
+        std::lock_guard<std::mutex> lock(pool.mtx);
+        pool.bytes += v->capacity();
+        pool.free.push_back(std::move(*v));
+        while (pool.bytes > pool.budget) {
+            pool.bytes -= pool.free.front().capacity();
+            drop.splice(drop.end(), pool.free, pool.free.begin());
+        }
+    }
+    delete v;
+}
+
+// n bytes, taken from a freed buffer whose capacity is at most 1/8 larger if there is one (no page faults)
+static std::shared_ptr<std::vector<uint8_t>> state_blob_take(size_t n) {
+    auto & pool = state_blob_pool_get();
+    std::vector<uint8_t> v;
+    {
+        std::lock_guard<std::mutex> lock(pool.mtx);
+        auto best = pool.free.end();
+        for (auto it = pool.free.begin(); it != pool.free.end(); ++it) {
+            const size_t cap = it->capacity();
+            if (cap >= n && cap - n <= n / 8 && (best == pool.free.end() || cap < best->capacity())) {
+                best = it;
+            }
+        }
+        if (best != pool.free.end()) {
+            pool.bytes -= best->capacity();
+            v = std::move(*best);
+            pool.free.erase(best);
+            pool.n_hit++;
+        } else {
+            pool.n_miss++;
+        }
+    }
+    v.resize(n);
+    return std::shared_ptr<std::vector<uint8_t>>(new std::vector<uint8_t>(std::move(v)), state_blob_give);
+}
+
+bool common_state_blob::recycle() {
+    static const bool on = getenv("LLAMA_CKPT_RECYCLE") && atoi(getenv("LLAMA_CKPT_RECYCLE")) != 0;
+    return on;
+}
+
+void common_state_blob::stats(uint64_t & n_hit, uint64_t & n_miss, size_t & pooled) {
+    auto & pool = state_blob_pool_get();
+    std::lock_guard<std::mutex> lock(pool.mtx);
+    n_hit  = pool.n_hit;
+    n_miss = pool.n_miss;
+    pooled = pool.bytes;
+}
+
+common_state_blob::common_state_blob(const common_state_blob & other) {
+    *this = other;
+}
+
+common_state_blob & common_state_blob::operator=(const common_state_blob & other) {
+    if (this == &other) {
+        return *this;
+    }
+    if (recycle() || !other.buf) {
+        buf = other.buf;
+    } else {
+        buf = std::make_shared<std::vector<uint8_t>>(*other.buf);
+    }
+    return *this;
+}
+
+uint8_t * common_state_blob::alloc(size_t n) {
+    if (!recycle()) {
+        if (!buf) {
+            buf = std::make_shared<std::vector<uint8_t>>();
+        }
+        buf->resize(n);
+        return buf->data();
+    }
+    if (buf && buf.use_count() == 1 && buf->size() == n) {
+        return buf->data();   // rewritten in place (e.g. the speculative checkpoint)
+    }
+    buf.reset();
+    if (n == 0) {
+        return nullptr;
+    }
+    buf = state_blob_take(n);
+    return buf->data();
+}
+
+void common_state_blob::clear() {
+    if (!recycle()) {
+        if (buf) {
+            buf->clear();
+        }
+        return;
+    }
+    buf.reset();
+}
+
+void common_state_blob::release() {
+    buf.reset();
+}
+
 size_t common_prompt_checkpoint::size() const {
     return data_tgt.size() + data_dft.size() + data_spec.size();
 }
@@ -2296,9 +2426,9 @@ void common_prompt_checkpoint::update_tgt(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
-    data_tgt.resize(ckpt_size);
+    uint8_t * dst = data_tgt.alloc(ckpt_size);
 
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
+    const size_t n = llama_state_seq_get_data_ext(ctx, dst, ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }
@@ -2314,9 +2444,9 @@ void common_prompt_checkpoint::update_dft(
 
     const size_t ckpt_size = llama_state_seq_get_size_ext(ctx, seq_id, flags);
 
-    data_dft.resize(ckpt_size);
+    uint8_t * dst = data_dft.alloc(ckpt_size);
 
-    const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
+    const size_t n = llama_state_seq_get_data_ext(ctx, dst, ckpt_size, seq_id, flags);
     if (n != ckpt_size) {
         GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
     }
