@@ -3674,6 +3674,30 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
 }
 
 // returns whether the write (out) nodes overwrite the read nodes in operation
+// fusions declined by an allocation-dependent check (memory ranges / aliasing), per pattern: printed at exit with
+// GGML_CUDA_FUSE_MOE_STATS=1 (same counters as the fuse-moe diagnostics)
+static void ggml_cuda_fusion_decline_count(const char * what, int n) {
+    static const bool stats = getenv("GGML_CUDA_FUSE_MOE_STATS") && atoi(getenv("GGML_CUDA_FUSE_MOE_STATS")) != 0;
+    if (!stats) {
+        return;
+    }
+    static std::mutex mtx;
+    static std::map<std::string, int64_t> * counts = [] {
+        auto * m = new std::map<std::string, int64_t>();
+        atexit([] {
+            std::lock_guard<std::mutex> lock(mtx);
+            fprintf(stderr, "fusion declines (layout-dependent):");
+            for (auto & kv : *counts) {
+                fprintf(stderr, " %s=%lld", kv.first.c_str(), (long long) kv.second);
+            }
+            fprintf(stderr, "\n");
+        });
+        return m;
+    }();
+    std::lock_guard<std::mutex> lock(mtx);
+    (*counts)[std::string(what) + "/" + std::to_string(n)]++;
+}
+
 static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                                                  const int           node_idx,
                                                  const int           node_count,
@@ -3729,6 +3753,13 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                     }
 
                     if (!found) {
+                        static int diag = getenv("GGML_CUDA_DIAG_FUSE_OVERLAP") ? atoi(getenv("GGML_CUDA_DIAG_FUSE_OVERLAP")) : 0;
+                        if (diag > 0) {
+                            diag--;
+                            GGML_LOG_INFO("fusion overlap: rows %lld start %s (%s, %d nodes): out %s [%s] overlaps src %s [%s] of node %s\n",
+                                (long long) ggml_nrows(cgraph->nodes[node_idx]), cgraph->nodes[node_idx]->name, ggml_op_desc(cgraph->nodes[node_idx]), node_count, dst->name,
+                                ggml_op_desc(dst), src->name, ggml_op_desc(src), cgraph->nodes[j]->name);
+                        }
                         is_ok = false;
                         break;
                     }
@@ -3737,6 +3768,9 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
         }
     }
 
+    if (!is_ok) {
+        ggml_cuda_fusion_decline_count(ggml_op_name(cgraph->nodes[node_idx]->op), node_count);
+    }
     return is_ok;
 }
 
@@ -4266,6 +4300,7 @@ static int ggml_cuda_try_fuse_hc_norm(ggml_backend_cuda_context * cuda_ctx, ggml
             dsv4_hc_disjoint(post, px) && dsv4_hc_disjoint(post, pr) && dsv4_hc_disjoint(post, pp) && dsv4_hc_disjoint(post, pc) &&
             dsv4_hc_disjoint(mix, px) && dsv4_hc_disjoint(mix, pr) && dsv4_hc_disjoint(mix, pp) && dsv4_hc_disjoint(mix, pc);
         if (!ok) {
+            ggml_cuda_fusion_decline_count("hc_post_check", 0);
             return 0;
         }
     }
@@ -4279,7 +4314,7 @@ static int ggml_cuda_try_fuse_hc_norm(ggml_backend_cuda_context * cuda_ctx, ggml
         ggml_tensor * m = cgraph->nodes[ir + 1];
         const ggml_tensor * v  = r->src[0];
         const ggml_tensor * wv = m->src[0] == r ? m->src[1] : (m->src[1] == r ? m->src[0] : nullptr);
-        const bool ok = v->view_src == mix && v->view_offs == 0 && v->ne[0] == n_embd && v->ne[1] == nt &&
+        bool ok = v->view_src == mix && v->view_offs == 0 && v->ne[0] == n_embd && v->ne[1] == nt &&
             v->ne[2] == 1 && v->ne[3] == 1 && v->nb[0] == sizeof(float) && v->nb[1] == mix->nb[1] &&
             r->type == GGML_TYPE_F32 && dsv4_hc_uses1(cgraph, ir) &&
             wv && wv->type == GGML_TYPE_F32 && ggml_is_contiguous(wv) && wv->ne[0] == n_embd && ggml_nrows(wv) == 1 &&
@@ -4287,6 +4322,14 @@ static int ggml_cuda_try_fuse_hc_norm(ggml_backend_cuda_context * cuda_ctx, ggml
             dsv4_hc_disjoint(m, x) && dsv4_hc_disjoint(m, mix) && dsv4_hc_disjoint(m, wv) &&
             (!post || (dsv4_hc_disjoint(m, post->src[0]) && dsv4_hc_disjoint(m, post->src[1]) &&
                        dsv4_hc_disjoint(m, post->src[2]) && dsv4_hc_disjoint(m, post->src[3])));
+        if (!ok && wv && dsv4_hc_uses1(cgraph, ir) && !(dsv4_hc_disjoint(m, x) && dsv4_hc_disjoint(m, mix) && dsv4_hc_disjoint(m, wv))) {
+            ggml_cuda_fusion_decline_count("hc_norm_alias", 0);
+        }
+        // rune diagnostics: GGML_CUDA_DIAG_NO_HC_NORM_TAIL=1 takes the hc_norm_alias decline path everywhere (A/B)
+        static const bool diag_no_tail = getenv("GGML_CUDA_DIAG_NO_HC_NORM_TAIL") && atoi(getenv("GGML_CUDA_DIAG_NO_HC_NORM_TAIL")) != 0;
+        if (diag_no_tail) {
+            ok = false;
+        }
         if (ok) {
             rn = r; mul = m;
             for (int q = im + 1; q < ir; ++q) {
@@ -4392,6 +4435,7 @@ static int ggml_cuda_try_fuse_kda_conv_l2(ggml_backend_cuda_context * cuda_ctx, 
             logged = true;
             GGML_LOG_INFO("%s: %s aliases its conv input or outputs, KDA conv-l2 fusion declined\n", __func__, silu->name);
         }
+        ggml_cuda_fusion_decline_count("kda_conv_l2_alias", 0);
         return 0;
     }
 
@@ -4596,6 +4640,7 @@ static int ggml_cuda_try_fuse_kda_conv_rows(ggml_backend_cuda_context * cuda_ctx
             logged = true;
             GGML_LOG_INFO("%s: %s: conv_input or a slot overlaps q/k/v, unfused path (logged once)\n", __func__, m.c3->name);
         }
+        ggml_cuda_fusion_decline_count("kda_conv_rows_alias", 0);
         return 0;
     }
     // v's GEMV (no hoist: it sits between the two concats) runs first, as in the graph; the check above made sure
@@ -4630,6 +4675,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     ggml_tensor * node = cgraph->nodes[i];
+
+    // rune diagnostics: GGML_CUDA_FUSE_SKIP_OPS=",OP1,OP2," skips every fusion that starts at a node of those ops
+    // (ggml_op_desc names, e.g. ",RMS_NORM,ADD,"), for bisecting a layout-dependent fused/unfused difference
+    static const char * skip_ops = getenv("GGML_CUDA_FUSE_SKIP_OPS");
+    if (skip_ops) {
+        const std::string key = std::string(",") + ggml_op_desc(node) + ",";
+        if (strstr(skip_ops, key.c_str())) {
+            return 0;
+        }
+    }
 
     if (node->op == GGML_OP_DSV4_HC_POST || node->op == GGML_OP_DSV4_HC_MIX) {
         const int skip = ggml_cuda_try_fuse_hc_norm(cuda_ctx, cgraph, i);
@@ -5279,8 +5334,13 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         return bias_node->src[1];
     };
 
+    // rune diagnostics: GGML_CUDA_NO_MMV_FUSE=1 skips the mul_mat(_vec) + glu / bias / scale fusions below (A/B of
+    // the fused path against the unfused graph; a layout-dependent memory-range decline takes the unfused path)
+    static const bool no_mmv_fuse = getenv("GGML_CUDA_NO_MMV_FUSE") && atoi(getenv("GGML_CUDA_NO_MMV_FUSE")) != 0;
+    static const std::vector<ggml_op> mmv_fuse_ops = no_mmv_fuse ? std::vector<ggml_op>{} : std::vector<ggml_op>{ GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID };
+
     // gate + glu + up, with optional scale/bias on both lanes.
-    for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
+    for (ggml_op op : mmv_fuse_ops) {
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
 
         if (op == GGML_OP_MUL_MAT) {
@@ -5576,7 +5636,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     fused_node_count  = 0;
 
     // mul_mat + scale + optional bias
-    for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
+    for (ggml_op op : mmv_fuse_ops) {
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
 
         for (const bool with_bias : { false, true }) {
@@ -5664,7 +5724,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     }
 
     // mul_mat + add
-    for (ggml_op op : { GGML_OP_MUL_MAT, GGML_OP_MUL_MAT_ID }) {
+    for (ggml_op op : mmv_fuse_ops) {
         const ggml_op bias_op = op == GGML_OP_MUL_MAT ? GGML_OP_ADD : GGML_OP_ADD_ID;
 
         if (!ggml_can_fuse(cgraph, i, { op, bias_op })) {
@@ -6188,6 +6248,49 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
 
     if (!disable_fusion) {
         ggml_cuda_fd_alloc_deps(*cuda_ctx, cgraph, params);
+    }
+
+    // rune: GGML_CUDA_FUSE_DEPS=1 (default off) keeps the inputs of fusions whose fused and unfused results differ
+    // (topk-moe; the gate/up/GLU mat-vec) alive until their outputs are allocated, so the memory-range check never
+    // declines them and the numerics no longer depend on the compute-buffer layout (which LLAMA_PP_RESERVE_FULL,
+    // GGML_CUDA_FUSE_DENSE's own alloc deps, the reservation history ... all change).
+    //   topk-moe: the weights/ids outputs overlapped ffn_moe_logits (allowed only up to TOPK_MOE_ROWS_PER_BLOCK rows)
+    //   gate/up/GLU (MUL_MAT, MUL_MAT, GLU): the GLU output overlapped the shared activation (measured exact either
+    //   way; kept so the decline counters stay quiet)
+    //   hc_mix + norm tail: the MUL output overlapping x / mix (not seen on rune yet; the fallback is not exact)
+    static const bool fuse_deps = getenv("GGML_CUDA_FUSE_DEPS") && atoi(getenv("GGML_CUDA_FUSE_DEPS")) != 0;
+    if (!disable_fusion && fuse_deps) {
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            ggml_tensor * node = cgraph->nodes[i];
+            if (node->op == GGML_OP_UNARY || node->op == GGML_OP_SOFT_MAX) {
+                ggml_cuda_topk_moe_args args;
+                if (ggml_cuda_topk_moe_fusion(cgraph, i, args) && !args.delayed_softmax) {
+                    const int n_act  = args.sigmoid ? 1 : args.sqrt_softplus ? 2 : 1;
+                    const int i_prob = i + n_act - 1;
+                    const int i_ids  = args.prob_bias ? i_prob + 4 : i_prob + 3;
+                    const int n_ops  = n_act + (args.prob_bias ? 5 : 4) + (args.norm ? 5 : 0) + (args.scale ? 1 : 0);
+                    const int i_w    = i + n_ops - 1;
+                    if (i_w < cgraph->n_nodes && node->src[0] != nullptr) {
+                        params->add_alloc_dep(params->user_data, node->src[0], cgraph->nodes[i_ids]);
+                        params->add_alloc_dep(params->user_data, node->src[0], cgraph->nodes[i_w]);
+                    }
+                }
+            }
+            // hc_mix + its pre-mix row's RMS_NORM -> MUL (ggml_cuda_try_fuse_hc_norm): the fused norm is not the
+            // standalone rms_norm bit for bit, and the tail is declined when the MUL output lands on x / mix
+            if (node->op == GGML_OP_DSV4_HC_MIX) {
+                const int ir = dsv4_hc_next(cgraph, i + 1);
+                if (ir + 1 < cgraph->n_nodes && cgraph->nodes[ir]->op == GGML_OP_RMS_NORM && cgraph->nodes[ir + 1]->op == GGML_OP_MUL &&
+                        cgraph->nodes[ir]->src[0]->view_src == node) {
+                    params->add_alloc_dep(params->user_data, node->src[0], cgraph->nodes[ir + 1]);
+                    params->add_alloc_dep(params->user_data, node, cgraph->nodes[ir + 1]);
+                }
+            }
+            if (node->op == GGML_OP_MUL_MAT && i + 2 < cgraph->n_nodes && cgraph->nodes[i + 1]->op == GGML_OP_MUL_MAT &&
+                    cgraph->nodes[i + 2]->op == GGML_OP_GLU && node->src[1] == cgraph->nodes[i + 1]->src[1]) {
+                params->add_alloc_dep(params->user_data, node->src[1], cgraph->nodes[i + 2]);
+            }
+        }
     }
 
     // keep q/k/v of the KDA conv-input assembly alive until conv_input is allocated, so the fused kernel

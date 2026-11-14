@@ -11,17 +11,21 @@
 // ---- fire counters (GGML_CUDA_FD_STATS=1 prints them at exit) ---------------------------------------
 
 static const char * fd_names[FD_N] = { "kpool", "topk_mask", "conv_ms", "kda_gate", "kda_beta", "kda_tail" };
-static int64_t fd_fired[FD_N];
+static int64_t fd_fired[2*FD_N];   // fired, then declined at run time (layout-dependent checks)
 
 static void fd_print_stats() {
     fprintf(stderr, "fuse-dense fired:");
     for (int k = 0; k < FD_N; ++k) {
         fprintf(stderr, " %s %lld", fd_names[k], (long long) fd_fired[k]);
     }
+    fprintf(stderr, " | declined:");
+    for (int k = 0; k < FD_N; ++k) {
+        fprintf(stderr, " %s %lld", fd_names[k], (long long) fd_fired[FD_N + k]);
+    }
     fprintf(stderr, "\n");
 }
 
-void ggml_cuda_fd_count(int which) {
+void ggml_cuda_fd_count(int which) {   // which >= FD_N: a run-time decline of fusion which - FD_N
     static const bool stats = getenv("GGML_CUDA_FD_STATS") && atoi(getenv("GGML_CUDA_FD_STATS")) != 0;
     if (!stats) {
         return;
@@ -267,6 +271,7 @@ int ggml_cuda_fd_try_topk_mask(ggml_backend_cuda_context & ctx, ggml_cgraph * cg
                 GGML_LOG_INFO("%s: %s overlaps input %s (%s), unfused path (logged once)\n", __func__, m.mask->name, t->name,
                         fd_overlap(t, m.idx) ? "idx" : "mask");
             }
+            ggml_cuda_fd_count(FD_N + FD_TOPK_MASK);
             return 0;
         }
     }
@@ -479,6 +484,7 @@ int ggml_cuda_fd_try_conv_ms(ggml_backend_cuda_context & ctx, ggml_cgraph * cgra
             logged = true;
             GGML_LOG_INFO("%s: %s overlaps q/k/v/states or a slot, unfused path (logged once)\n", __func__, m.c3->name);
         }
+        ggml_cuda_fd_count(FD_N + FD_CONV_MS);
         return 0;
     }
     if (m.mid && !fwd(ctx, m.mid)) {
@@ -779,6 +785,7 @@ int ggml_cuda_fd_try_kda_gate(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
             logged = true;
             GGML_LOG_INFO("%s: %s overlaps its input, unfused path (logged once)\n", __func__, m.out->name);
         }
+        ggml_cuda_fd_count(FD_N + FD_KDA_GATE);
         return 0;
     }
     const int nrows = (int) m.wfb->ne[1];
@@ -883,6 +890,7 @@ int ggml_cuda_fd_try_kda_tail(ggml_backend_cuda_context & ctx, ggml_cgraph * cgr
             logged = true;
             GGML_LOG_INFO("%s: %s overlaps its inputs, unfused path (logged once)\n", __func__, m.out->name);
         }
+        ggml_cuda_fd_count(FD_N + FD_KDA_TAIL);
         return 0;
     }
     if (!fwd(ctx, m.ga_mm)) {
