@@ -879,6 +879,7 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
 }
 
 static bool ggml_cuda_d2h_kernel_copy(int device, cudaStream_t stream, void * host, const void * dev, size_t nbytes);
+static bool ggml_cuda_h2d_kernel_copy(int device, cudaStream_t stream, void * dev, const void * host, size_t nbytes);
 
 static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
@@ -2656,7 +2657,9 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    if (!ggml_cuda_h2d_kernel_copy(cuda_ctx->device, cuda_ctx->stream(), (char *) tensor->data + offset, data, size)) {
+        CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    }
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -2796,6 +2799,32 @@ static __global__ void ggml_cuda_d2h_copy_bytes(const uint8_t * __restrict__ src
     }
     __threadfence_system();
 }
+// GGML_CUDA_H2D_KERNEL=1 (default off): async host -> device tensor writes from host-mapped pinned memory (the scheduler's
+// staged inputs) by a copy kernel instead of SDMA, the same transfer class the 12th build moved off SDMA for the staged
+// crossings / logits on the second-switch GPUs. Returns false (caller uses cudaMemcpyAsync) when off or not mapped.
+static bool ggml_cuda_h2d_kernel_copy(int device, cudaStream_t stream, void * dev, const void * host, size_t nbytes) {
+    static const bool on = getenv("GGML_CUDA_H2D_KERNEL") && atoi(getenv("GGML_CUDA_H2D_KERNEL")) != 0;
+    if (!on || nbytes == 0) {
+        return false;
+    }
+    void * hd = nullptr;
+    if (cudaHostGetDevicePointer(&hd, const_cast<void *>(host), 0) != cudaSuccess || hd == nullptr) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    ggml_cuda_set_device(device);
+    if ((nbytes % 4) == 0 && ((uintptr_t) dev % 4) == 0 && ((uintptr_t) hd % 4) == 0) {
+        const size_t nwords = nbytes / 4;
+        const int nblk = (int) std::min<size_t>(1024, (nwords + 2047) / 2048);
+        ggml_cuda_d2h_copy_words<<<nblk, 256, 0, stream>>>((const uint32_t *) hd, (uint32_t *) dev, nwords);
+    } else {
+        const int nblk = (int) std::min<size_t>(1024, (nbytes + 2047) / 2048);
+        ggml_cuda_d2h_copy_bytes<<<nblk, 256, 0, stream>>>((const uint8_t *) hd, (uint8_t *) dev, nbytes);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 static bool ggml_cuda_d2h_kernel_copy(int device, cudaStream_t stream, void * host, const void * dev, size_t nbytes) {
     static const bool on = !(getenv("GGML_CUDA_D2H_KERNEL") && atoi(getenv("GGML_CUDA_D2H_KERNEL")) == 0);
     if (!on || nbytes == 0) {

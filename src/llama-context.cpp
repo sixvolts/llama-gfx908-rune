@@ -1546,6 +1546,34 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     } else {
         res->reset();
 
+        // LLAMA_PP_RESERVE_FULL=1 (pipeline parallelism): when the scheduler's reservation is not one made for prompt
+        // graphs at the full KV size (a decode graph or another shape re-reserved it since), reserve with this
+        // ubatch's graph built at the full KV size (set_n_kv_min: same topology, larger n_kv) before allocating it.
+        // The allocation would have re-reserved here anyway (that synchronizes every stage first), so the cost is one
+        // extra graph build; later prompt graphs whose n_kv grows (each LLAMA_KV_PAD_PREFILL step: rune GLM-5.3,
+        // 9 stages, ~0.7 s drain per 32k cells) then fit without a re-reserve. Only tensor placement changes, not the
+        // computation. A shape whose graph does not fit the reservation is not tried again.
+        // =2 also without pipeline parallelism (single-device / CPU tests of the same allocator path).
+        static const int resv_full = getenv("LLAMA_PP_RESERVE_FULL") ? atoi(getenv("LLAMA_PP_RESERVE_FULL")) : 0;
+        const std::pair<uint32_t, uint32_t> resv_shape = { ubatch.n_tokens, ubatch.n_seqs };
+        bool resv_full_pre = false;
+        if (resv_full > 0 && (cparams.sched_copies || resv_full == 2) && mctx && ubatch.n_seqs > 0 && ubatch.n_tokens / ubatch.n_seqs > 32 &&
+            !(resv_full_sched == sched.get() && resv_full_n == ggml_backend_sched_get_n_reserves(sched.get())) &&
+            std::find(resv_full_bad.begin(), resv_full_bad.end(), resv_shape) == resv_full_bad.end()) {
+            mctx->set_n_kv_min(UINT32_MAX);
+            ggml_backend_sched_reset(sched.get());
+            auto * res_rsv = gf_res_reserve.get();
+            res_rsv->reset();
+            ggml_cgraph * gf_rsv = model.build_graph(graph_params(res_rsv, ubatch, mctx, gtype));
+            mctx->set_n_kv_min(0);
+            if (gf_rsv && ggml_backend_sched_reserve(sched.get(), gf_rsv)) {
+                resv_full_sched = sched.get();
+                resv_full_n     = ggml_backend_sched_get_n_reserves(sched.get());
+                resv_full_pre   = true;
+            }
+            res_rsv->reset();
+        }
+
         ggml_backend_sched_reset(sched.get());
         ggml_backend_sched_set_eval_callback(sched.get(), cparams.cb_eval, cparams.cb_eval_user_data);
 
@@ -1562,49 +1590,18 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         }
 
         if (graph_timing) { gt_t[1] = ggml_time_us(); }
-        // LLAMA_PP_RESERVE_FULL=1 (pipeline parallelism): when a prompt graph had to re-reserve the compute buffers
-        // (ggml_backend_sched_alloc_graph synchronizes every stage first: rune GLM-5.3, 9 stages, ~0.7 s per
-        // LLAMA_KV_PAD_PREFILL step), reserve once more, now with this ubatch's graph built at the full KV size
-        // (set_n_kv_min: same topology, larger n_kv; the stages are already idle, so no second drain), and allocate the
-        // rebuilt graph in it. Later prompt graphs whose n_kv grows then fit without a re-reserve. Only tensor
-        // placement changes, not the computation. A shape whose graph does not fit is not tried again.
-        // =2 also without pipeline parallelism (single-device / CPU tests of the same allocator path).
-        static const int resv_full = getenv("LLAMA_PP_RESERVE_FULL") ? atoi(getenv("LLAMA_PP_RESERVE_FULL")) : 0;
-        const int64_t n_resv0 = resv_full > 0 ? ggml_backend_sched_get_n_reserves(sched.get()) : 0;
         if (!ggml_backend_sched_alloc_graph(sched.get(), gf)) {
             LLAMA_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
-        const std::pair<uint32_t, uint32_t> resv_shape = { ubatch.n_tokens, ubatch.n_seqs };
-        if (resv_full > 0 && (cparams.sched_copies || resv_full == 2) && mctx && ubatch.n_seqs > 0 && ubatch.n_tokens / ubatch.n_seqs > 32 &&
-            (ggml_backend_sched_get_n_reserves(sched.get()) != n_resv0 || resv_full == 2) &&
-            std::find(resv_full_bad.begin(), resv_full_bad.end(), resv_shape) == resv_full_bad.end() &&
-            !(resv_full_sched == sched.get() && resv_full_n == ggml_backend_sched_get_n_reserves(sched.get()))) {
-            mctx->set_n_kv_min(UINT32_MAX);
-            ggml_backend_sched_reset(sched.get());
-            auto * res_rsv = gf_res_reserve.get();
-            res_rsv->reset();
-            ggml_cgraph * gf_rsv = model.build_graph(graph_params(res_rsv, ubatch, mctx, gtype));
-            mctx->set_n_kv_min(0);
-            const bool ok_rsv = gf_rsv && ggml_backend_sched_reserve(sched.get(), gf_rsv);
-            res_rsv->reset();
-            // rebuild and allocate the real graph (the reserve reset the scheduler)
-            res->reset();
-            ggml_backend_sched_reset(sched.get());
-            gf = model.build_graph(gparams);
-            const int64_t n_resv1 = ggml_backend_sched_get_n_reserves(sched.get());
-            if (!gf || !ggml_backend_sched_alloc_graph(sched.get(), gf)) {
-                LLAMA_LOG_ERROR("%s: failed to allocate graph after the full-size reserve\n", __func__);
-                ret = GGML_STATUS_ALLOC_FAILED;
-                return nullptr;
-            }
-            if (ok_rsv && ggml_backend_sched_get_n_reserves(sched.get()) == n_resv1) {
-                resv_full_sched = sched.get();
-                resv_full_n     = n_resv1;
+        if (resv_full_pre) {
+            if (ggml_backend_sched_get_n_reserves(sched.get()) == resv_full_n) {
                 if (ht) { ggml_host_trace("resv_full", ubatch.n_tokens, ubatch.n_seqs); }
             } else {
+                // the prompt graph did not fit its full-size reservation (other topology): fall back for this shape
                 resv_full_bad.push_back(resv_shape);
+                resv_full_sched = nullptr;
                 LLAMA_LOG_WARN("%s: LLAMA_PP_RESERVE_FULL: prompt graph (n_tokens %u, n_seqs %u) does not fit its full-size reservation, disabled for this shape\n",
                     __func__, ubatch.n_tokens, ubatch.n_seqs);
             }
