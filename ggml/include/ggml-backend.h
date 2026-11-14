@@ -329,6 +329,8 @@ extern "C" {
     // Get the number of splits of the last graph
     GGML_API int                  ggml_backend_sched_get_n_splits(ggml_backend_sched_t sched);
     GGML_API int                  ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched);
+    // number of compute-buffer (re)reservations so far (explicit reserves + re-reserves inside alloc_graph)
+    GGML_API int64_t              ggml_backend_sched_get_n_reserves(ggml_backend_sched_t sched);
     // Advance an already allocated (reused) graph to the next pipeline copy of its split inputs (no-op with 1 copy)
     GGML_API void                 ggml_backend_sched_rotate_copy(ggml_backend_sched_t sched);
 

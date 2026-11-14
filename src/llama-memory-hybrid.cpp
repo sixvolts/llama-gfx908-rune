@@ -378,6 +378,19 @@ llama_memory_status llama_memory_hybrid_context::get_status() const {
     return status;
 }
 
+void llama_memory_hybrid_context::set_n_kv_min(uint32_t n) {
+    // attention and indexer caches must keep the same n_kv (see apply)
+    ctx_attn->set_n_kv_min(n);
+    if (ctx_idx) {
+        ctx_idx->set_n_kv_min(n);
+        if (n > 0 && get_idx()->get_n_kv() != get_attn()->get_n_kv()) {
+            const uint32_t m = std::min(get_idx()->get_n_kv(), get_attn()->get_n_kv());
+            ctx_attn->set_n_kv_min(m);
+            ctx_idx->set_n_kv_min(m);
+        }
+    }
+}
+
 const llama_ubatch & llama_memory_hybrid_context::get_ubatch() const {
     assert(status == LLAMA_MEMORY_STATUS_SUCCESS);
     return ubatches[i_next];

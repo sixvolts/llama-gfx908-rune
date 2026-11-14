@@ -331,6 +331,18 @@ struct ckpt_staging_pool {
     }
 };
 
+// LLAMA_CKPT_HASH_LOG=1 (diagnostics, state oracle): log a hash of each checkpoint part when it is complete, so two
+// servers' checkpoint contents can be compared byte for byte (sorted log lines)
+static void ckpt_hash_log(const char * part, int slot_id, int64_t n_tokens, const uint8_t * p, size_t n) {
+    static const bool on = getenv("LLAMA_CKPT_HASH_LOG") && atoi(getenv("LLAMA_CKPT_HASH_LOG")) != 0;
+    if (!on) {
+        return;
+    }
+    uint64_t h = 1469598103934665603ull;
+    for (size_t i = 0; i < n; ++i) { h = (h ^ p[i]) * 1099511628211ull; }
+    LOG_WRN("ckpt-hash slot %d n_tokens %lld %s bytes %zu hash %016llx\n", slot_id, (long long) n_tokens, part, n, (unsigned long long) h);
+}
+
 struct server_slot {
     int id;
 
@@ -375,6 +387,7 @@ struct server_slot {
                     const uint8_t * src = ckpt_pool->bufs[p.staging].ptr;
                     memcpy(c.data_tgt.alloc(p.size), src, p.size);
                     c.async_id = 0;
+                    ckpt_hash_log("tgt", id, c.n_tokens, c.data_tgt.data(), c.data_tgt.size());
                     break;
                 }
             }
@@ -431,6 +444,12 @@ struct server_slot {
             return false;
         }
         const_cast<server_slot *>(this)->ckpt_finalize(true);   // the saved copy must carry the checkpoint data
+        {
+            // LLAMA_CKPT_SPEC_MARKER: a checkpoint still waiting for its draft part is not saved (the draft queue is
+            // flushed before any task, so this is a guard only)
+            auto & v = const_cast<server_slot *>(this)->prompt.checkpoints;
+            v.erase(std::remove_if(v.begin(), v.end(), [](const common_prompt_checkpoint & ck) { return ck.dft_id != 0; }), v.end());
+        }
 
         const size_t cur_size_tgt =           llama_state_seq_get_size_ext(ctx_tgt, id, LLAMA_STATE_SEQ_FLAGS_NONE);
         const size_t cur_size_dft = ctx_dft ? llama_state_seq_get_size_ext(ctx_dft, id, LLAMA_STATE_SEQ_FLAGS_NONE) : 0;
@@ -1068,6 +1087,11 @@ private:
     struct spec_view_copy {
         llama_batch batch = {};
         uint64_t    seq   = 0;
+        // LLAMA_CKPT_SPEC_MARKER: a checkpoint marker instead of a view (batch empty): when the draft catch-up reaches
+        // it, the draft is exactly at the checkpoint's position and its state is copied into that checkpoint
+        int         marker_slot = -1;
+        uint64_t    marker_id   = 0;
+        bool        marker_late = false;   // LLAMA_CKPT_SPEC_MARKER=2 (test)
     };
     std::deque<spec_view_copy> spec_q;
 
@@ -1123,13 +1147,89 @@ private:
     void spec_clear() {
         spec_pending.valid = false;
         for (auto & c : spec_q) {
+            if (c.marker_id != 0) {
+                spec_marker_drop(c);
+                continue;
+            }
             llama_batch_free(c.batch);
         }
         spec_q.clear();
     }
 
+    // 1 = on; 2 = oracle sensitivity test only: the draft part is taken one view late (wrong state)
+    static int spec_ckpt_marker_mode() {
+        static const int m = getenv("LLAMA_CKPT_SPEC_MARKER") ? atoi(getenv("LLAMA_CKPT_SPEC_MARKER")) : 0;
+        return m;
+    }
+    static bool spec_ckpt_marker_on() {
+        return spec_ckpt_marker_mode() != 0;
+    }
+
+    int spec_q_views() const {
+        int n = 0;
+        for (const auto & c : spec_q) {
+            n += c.marker_id == 0;
+        }
+        return n;
+    }
+
+    common_prompt_checkpoint * spec_marker_ckpt(const spec_view_copy & c) {
+        server_slot * slot = c.marker_slot >= 0 && c.marker_slot < (int) slots.size() ? &slots[c.marker_slot] : nullptr;
+        if (!slot) {
+            return nullptr;
+        }
+        for (auto & ck : slot->prompt.checkpoints) {
+            if (ck.dft_id == c.marker_id) {
+                return &ck;
+            }
+        }
+        return nullptr;   // erased meanwhile
+    }
+
+    // the draft caught up to a checkpoint marker: take the draft part of that checkpoint now
+    void spec_marker_run(const spec_view_copy & c) {
+        common_prompt_checkpoint * ck = spec_marker_ckpt(c);
+        if (ggml_host_trace_on()) { ggml_host_trace("ckpt_mr", c.marker_slot, ck ? 1 : 0); }
+        if (ck) {
+            ck->update_dft(ctx_dft, c.marker_slot, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            common_speculative_get_state(spec.get(), c.marker_slot, ck->data_spec);
+            ck->dft_id = 0;
+            ckpt_hash_log("dft", c.marker_slot, ck->n_tokens, ck->data_dft.data(), ck->data_dft.size());
+            ckpt_hash_log("spec", c.marker_slot, ck->n_tokens, ck->data_spec.data(), ck->data_spec.size());
+        }
+    }
+
+    // the queue is dropped (abort): a checkpoint whose draft part never arrived cannot be restored
+    void spec_marker_drop(const spec_view_copy & c) {
+        server_slot * slot = c.marker_slot >= 0 && c.marker_slot < (int) slots.size() ? &slots[c.marker_slot] : nullptr;
+        if (!slot) {
+            return;
+        }
+        auto & v = slot->prompt.checkpoints;
+        v.erase(std::remove_if(v.begin(), v.end(), [&](const common_prompt_checkpoint & ck) { return ck.dft_id == c.marker_id; }), v.end());
+    }
+
+    // markers at the queue head run right away: the draft state is exactly theirs until the next view runs
+    void spec_run_markers() {
+        if (spec_ckpt_marker_mode() == 2 && !spec_q.empty() && spec_q.front().marker_id != 0 && spec_q.size() > 1 &&
+                !spec_q.front().marker_late) {
+            spec_q.front().marker_late = true;   // sensitivity test: run it after the next view
+            std::swap(spec_q[0], spec_q[1]);
+            return;
+        }
+        while (!spec_q.empty() && spec_q.front().marker_id != 0) {
+            spec_view_copy c = spec_q.front();
+            spec_q.pop_front();
+            spec_marker_run(c);
+        }
+    }
+
     // on a draft decode failure the remaining views are dropped (the caller aborts the slots; the draft only lags)
     void spec_run_front() {
+        spec_run_markers();
+        if (spec_q.empty()) {
+            return;
+        }
         spec_view_copy c = spec_q.front();
         spec_q.pop_front();
         try {
@@ -1140,6 +1240,7 @@ private:
             throw;
         }
         llama_batch_free(c.batch);
+        spec_run_markers();
     }
 
     void spec_flush() {
@@ -1160,7 +1261,7 @@ private:
             return;
         }
         spec_q.push_back(spec_copy_view(view, seq));
-        while ((int) spec_q.size() > spec_defer_depth()) {
+        while (spec_q_views() > spec_defer_depth()) {   // markers do not count: they hold no export region
             spec_run_front();
         }
     }
@@ -2769,7 +2870,12 @@ private:
         // anyway, so this costs no extra drain: the draft's catch-up of the batch's views overlaps the target's last
         // ubatches instead of running after the next (tail) decode. (draft-mtp's partial state is ~20 bytes; the
         // flush is about timing, not checkpoint contents.)
-        if (spec_busy() && ctx_dft) {
+        // LLAMA_CKPT_SPEC_MARKER=1 (with LLAMA_SPEC_DEFER >= 2): do not drain here; the draft part of the checkpoint
+        // is taken when the deferred catch-up reaches this point (a marker queued behind the pending views), i.e. from
+        // exactly the draft state the flush would have produced. With LLAMA_CKPT_ASYNC the target part is also queued,
+        // so a mid-prompt checkpoint no longer empties the pipeline (rune GLM-5.3 32k: ~0.85 s per far checkpoint).
+        const bool dft_marker = spec_ckpt_marker_on() && ctx_dft && spec && spec_defer_depth() >= 2 && !spec_pending.valid && spec_busy();
+        if (spec_busy() && ctx_dft && !dft_marker) {
             spec_flush();
         }
 
@@ -2856,9 +2962,23 @@ private:
             cur.update_tgt(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
         }
         const int64_t t_ckpt1 = ggml_time_us();
-        cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
-        // stash the draft's speculative state with the checkpoint
-        common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+        if (dft_marker) {
+            cur.dft_id = ++ckpt_serial;
+            spec_view_copy m;
+            m.marker_slot = slot.id;
+            m.marker_id   = cur.dft_id;
+            spec_q.push_back(m);
+            if (ggml_host_trace_on()) { ggml_host_trace("ckpt_mk", slot.id, spec_q_views()); }
+        } else {
+            cur.update_dft(ctx_dft, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+            // stash the draft's speculative state with the checkpoint
+            common_speculative_get_state(spec.get(), slot.id, cur.data_spec);
+            ckpt_hash_log("dft", slot.id, cur.n_tokens, cur.data_dft.data(), cur.data_dft.size());
+            ckpt_hash_log("spec", slot.id, cur.n_tokens, cur.data_spec.data(), cur.data_spec.size());
+        }
+        if (!queued) {
+            ckpt_hash_log("tgt", slot.id, cur.n_tokens, cur.data_tgt.data(), cur.data_tgt.size());
+        }
         const int64_t t_ckpt2 = ggml_time_us();
         if (t_ckpt2 - t_ckpts > host_op_log_us()) {
             SLT_INF(slot, "context checkpoint at n_tokens = %" PRId64 " took %.1f ms (target %.1f ms, %.1f MiB; sync wait before it %.1f ms)%s\n",
@@ -4051,6 +4171,11 @@ private:
                                             SLT_TRC(slot, "checking checkpoint with [%d, %d] against %d...\n", cur.pos_min, cur.pos_max, pos_min_thold);
                                             // workaround for [TAG_CHECKPOINTS_FIX_POS_MIN]
                                             if (cur.pos_max > pos_next) {
+                                                return false;
+                                            }
+                                            // LLAMA_CKPT_SPEC_MARKER: never restore a checkpoint whose draft part is
+                                            // missing (cannot happen: the draft queue is flushed before any restore)
+                                            if (cur.dft_id != 0) {
                                                 return false;
                                             }
                                             return cur.pos_min < pos_min_thold || cur.pos_min == 0;

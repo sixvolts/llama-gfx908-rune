@@ -64,6 +64,10 @@ struct llama_memory_context_i {
 
     // get the status of the memory context - used for error handling and checking if any updates would be applied
     virtual llama_memory_status get_status() const = 0;
+
+    // graphs built from this context use at least n KV cells (clamped to the cache size; 0 = off). Only for building
+    // a reservation graph of the current ubatch's topology at a larger n_kv (LLAMA_PP_RESERVE_FULL); never for compute.
+    virtual void set_n_kv_min(uint32_t n) { (void) n; }
 };
 
 using llama_memory_context_ptr = std::unique_ptr<llama_memory_context_i>;

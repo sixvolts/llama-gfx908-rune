@@ -2869,6 +2869,9 @@ const llama_ubatch & llama_kv_cache_context::get_ubatch() const {
 }
 
 uint32_t llama_kv_cache_context::get_n_kv() const {
+    if (n_kv_min > (uint32_t) n_kv && kv) {
+        return std::min(n_kv_min, kv->get_size());
+    }
     return n_kv;
 }
 
@@ -2897,11 +2900,11 @@ const llama_kv_cache * llama_kv_cache_context::get_kv() const {
 }
 
 ggml_tensor * llama_kv_cache_context::get_k(ggml_context * ctx, int32_t il) const {
-    return kv->get_k(ctx, il, n_kv, sinfos[i_cur]);
+    return kv->get_k(ctx, il, get_n_kv(), sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::get_v(ggml_context * ctx, int32_t il) const {
-    return kv->get_v(ctx, il, n_kv, sinfos[i_cur]);
+    return kv->get_v(ctx, il, get_n_kv(), sinfos[i_cur]);
 }
 
 ggml_tensor * llama_kv_cache_context::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il) const {

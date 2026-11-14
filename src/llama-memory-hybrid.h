@@ -128,6 +128,8 @@ public:
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
 
+    void set_n_kv_min(uint32_t n) override;
+
     //
     // llama_memory_hybrid_context
     //

@@ -908,6 +908,7 @@ struct ggml_backend_sched {
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
     // ref: https://github.com/ggml-org/llama.cpp/pull/17617
     int debug_realloc;
+    int64_t n_reserves; // see ggml_backend_sched_get_n_reserves
     int debug_graph_size;
     int debug_prev_graph_size;
 };
@@ -1701,11 +1702,16 @@ static bool ggml_backend_sched_alloc_splits(ggml_backend_sched_t sched) {
 
         // the re-allocation may cause the split inputs to be moved to a different address
         // synchronize without ggml_backend_sched_synchronize to avoid changing cur_copy
+        const bool ht = ggml_host_trace_on();
+        if (ht) { ggml_host_trace("resv_b", backend_ids_changed ? 1 : 0, sched->graph.n_nodes); }
+        sched->n_reserves++;
         for (int i = 0; i < sched->n_backends; i++) {
             ggml_backend_synchronize(sched->backends[i]);
         }
+        if (ht) { ggml_host_trace("resv_s", 0, 0); }   // drained
 
         ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids);
+        if (ht) { ggml_host_trace("resv_e", 0, 0); }
         if (!ggml_gallocr_alloc_graph(sched->galloc, &sched->graph)) {
             GGML_LOG_ERROR("%s: failed to allocate graph\n", __func__);
             return false;
@@ -1756,6 +1762,7 @@ static const void * ggml_backend_sched_stage_input(ggml_backend_sched_t sched, c
             }
         }
         if (st->buf[c] == NULL || ggml_backend_buffer_get_size(st->buf[c]) < nbytes) {
+            if (ggml_host_trace_on()) { ggml_host_trace("stg_a", c, (int64_t) nbytes); }   // regrow (pinned free = device sync)
             if (st->buf[c] != NULL) {
                 ggml_backend_buffer_free(st->buf[c]);
                 st->buf[c] = NULL;
@@ -1769,6 +1776,7 @@ static const void * ggml_backend_sched_stage_input(ggml_backend_sched_t sched, c
                 return nullptr;
             }
         }
+        if (ggml_host_trace_on()) { ggml_host_trace("stg_m", c, (int64_t) nbytes); }
         memcpy(ggml_backend_buffer_get_base(st->buf[c]), input->data, nbytes);
         st->gen[c]   = sched->compute_gen;
         st->input[c] = input;
@@ -1852,12 +1860,42 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         static const bool sync_inputs  = getenv("GGML_SCHED_SYNC_INPUTS")  != NULL && atoi(getenv("GGML_SCHED_SYNC_INPUTS"))  != 0;
         static const bool async_inputs = getenv("GGML_SCHED_ASYNC_INPUTS") != NULL && atoi(getenv("GGML_SCHED_ASYNC_INPUTS")) != 0;
         bool waited_for_split = false;
+        int64_t t_in_prev = 0;
         for (int input_id = 0; input_id < split->n_inputs; input_id++) {
-            if (ht) { ggml_host_trace("in_b", split_id, input_id); }
+            if (ht) {
+                // name the input whose copy took > 50 ms (wrong place for a wait; diagnostics, trace mode only)
+                const int64_t t_now = ggml_time_us();
+                if (input_id > 0 && t_now - t_in_prev > 50000) {
+                    ggml_tensor *   pin = split->inputs[input_id - 1];
+                    ggml_backend_t  pbe = ggml_backend_sched_get_tensor_backend(sched, pin);
+                    GGML_LOG_WARN("[sched] slow input copy: split %d input %d '%s' %zu bytes flags 0x%x from %s: %.1f ms\n", split_id, input_id - 1,
+                        pin->name, ggml_nbytes(pin), (unsigned) pin->flags, pbe ? ggml_backend_name(pbe) : "?", (t_now - t_in_prev) / 1e3);
+                }
+                t_in_prev = t_now;
+                ggml_host_trace("in_b", split_id, input_id);
+            }
             ggml_backend_t input_backend = ggml_backend_sched_get_tensor_backend(sched, split->inputs[input_id]);
             struct ggml_tensor * input = split->inputs[input_id];
             struct ggml_tensor * input_cpy = tensor_copy(input, split_backend_id, sched->cur_copy);
 
+            // GGML_SCHED_STAGE_VIEWS=1: a host-resident view of a user input (rune GLM-5.3: 'kpool_pool_cells (reshaped)',
+            // a reshape the scheduler keeps on the CPU) is not flagged INPUT and took the generic path below: a wait for
+            // the split's previous use plus a synchronous H2D on the per-thread stream, which blocked the host for
+            // ~0.4 s at some prompt ubatches (w89: last stage, 128-256 KB) and drained the pipeline. Stage it like the
+            // user input it views: the same bytes, snapshotted now and copied in the split stream's order.
+            static const bool stage_views = getenv("GGML_SCHED_STAGE_VIEWS") && atoi(getenv("GGML_SCHED_STAGE_VIEWS")) != 0;
+            if (stage_views && !(input->flags & GGML_TENSOR_FLAG_INPUT) && input->view_src != nullptr &&
+                (input->view_src->flags & GGML_TENSOR_FLAG_INPUT) && stage_inputs && sched->rotating && !sync_inputs &&
+                input->buffer != nullptr && ggml_backend_buffer_is_host(input->buffer) && split_backend->iface.set_tensor_async != NULL &&
+                ggml_is_contiguous(input) && ggml_is_contiguous(input_cpy) &&
+                ggml_backend_dev_type(ggml_backend_get_device(split_backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
+                const void * staged = ggml_backend_sched_stage_input(sched, input, split_backend_id);
+                if (staged != nullptr) {
+                    if (ht) { ggml_host_trace("stg_v", split_id, (int64_t) ggml_nbytes(input)); }
+                    ggml_backend_tensor_set_async(split_backend, input_cpy, staged, 0, ggml_nbytes(input));
+                    continue;
+                }
+            }
             if (input->flags & GGML_TENSOR_FLAG_INPUT) {
                 if (stage_inputs && sched->rotating && !sync_inputs && ggml_backend_buffer_is_host(input->buffer) &&
                     split_backend->iface.set_tensor_async != NULL && ggml_is_contiguous(input) && ggml_is_contiguous(input_cpy) &&
@@ -2226,6 +2264,8 @@ bool ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph *
 
     ggml_backend_sched_split_graph(sched, measure_graph);
 
+    sched->n_reserves++;
+    if (ggml_host_trace_on()) { ggml_host_trace("resv_x", measure_graph->n_nodes, 0); }   // explicit reserve
     if (!ggml_gallocr_reserve_n(sched->galloc, &sched->graph, sched->node_backend_ids, sched->leaf_backend_ids)) {
         return false;
     }
@@ -2393,6 +2433,11 @@ void ggml_backend_sched_rotate_copy(ggml_backend_sched_t sched) {
         }
         sched->splits[i].graph.uid = uid;
     }
+}
+
+int64_t ggml_backend_sched_get_n_reserves(ggml_backend_sched_t sched) {
+    GGML_ASSERT(sched);
+    return sched->n_reserves;
 }
 
 int ggml_backend_sched_get_n_copies(ggml_backend_sched_t sched) {

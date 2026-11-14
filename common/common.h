@@ -1215,6 +1215,10 @@ struct common_prompt_checkpoint {
     // (rune) LLAMA_CKPT_ASYNC: nonzero while data_tgt is still being copied asynchronously (see server ckpt_finalize)
     uint64_t async_id = 0;
 
+    // (rune) LLAMA_CKPT_SPEC_MARKER: nonzero while data_dft / data_spec wait for the deferred draft catch-up to reach
+    // this checkpoint's position (filled by its marker in the server's draft queue)
+    uint64_t dft_id = 0;
+
     size_t size() const;
 
     bool empty() const;

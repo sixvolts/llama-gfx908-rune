@@ -437,4 +437,10 @@ private:
     mutable int32_t n_eval   = 0; // number of eval calls
 
     mutable int32_t n_reused = 0; // number of times the previous graph was reused
+
+    // LLAMA_PP_RESERVE_FULL: the scheduler whose compute buffers were last reserved for a full-n_kv prompt graph, the
+    // scheduler's reserve count right after it, and prompt shapes (n_tokens, n_seqs) for which that did not hold
+    const void * resv_full_sched = nullptr;
+    int64_t      resv_full_n     = -1;
+    std::vector<std::pair<uint32_t, uint32_t>> resv_full_bad;
 };

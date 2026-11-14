@@ -421,6 +421,8 @@ public:
 
     uint32_t get_n_kv() const;
 
+    void set_n_kv_min(uint32_t n) override { n_kv_min = n; }
+
     // the stream RANGE s1 - s0 + 1 that get_k/get_v use as `ns`, not n_seqs_unq
     uint32_t get_n_stream() const;
 
@@ -503,4 +505,5 @@ private:
     // a heuristic, to avoid attending the full cache if it is not yet utilized
     // as the cache gets filled, the benefit from this heuristic disappears
     int32_t n_kv;
+    uint32_t n_kv_min = 0;   // see llama_memory_context_i::set_n_kv_min
 };
