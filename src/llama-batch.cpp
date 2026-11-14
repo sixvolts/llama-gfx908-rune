@@ -528,9 +528,20 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         static const int max_tokens = getenv("LLAMA_DECODE_GROUPS_MAX_TOKENS") ? atoi(getenv("LLAMA_DECODE_GROUPS_MAX_TOKENS")) : 32;
         // LLAMA_DECODE_GROUPS_MIN_SEQS: fewest streams that are cut (default 2 per ubatch)
         static const int min_seqs = getenv("LLAMA_DECODE_GROUPS_MIN_SEQS") ? atoi(getenv("LLAMA_DECODE_GROUPS_MIN_SEQS")) : 0;
+        // LLAMA_DECODE_GROUPS_BY_SEQ=1: n = LLAMA_DECODE_GROUPS is a cap, not a divisor - one stream per ubatch up to n
+        // streams, beyond that n near-equal groups (see plan_decode_groups_by_seq)
+        static const bool by_seq = getenv("LLAMA_DECODE_GROUPS_BY_SEQ") && atoi(getenv("LLAMA_DECODE_GROUPS_BY_SEQ")) == 1;
+        decode_group_caps.clear();
+        decode_group_i = 0;
+        if (by_seq) {
+            decode_seq_cap = 0;
+            if (batch.n_tokens <= max_tokens) {
+                plan_decode_groups_by_seq(n_ubatch, (uint32_t) std::max(2, min_seqs));
+            }
+        }
         const uint32_t n_sets = (uint32_t) seq_set_map.size();
         const uint32_t n_min  = min_seqs > 0 ? (uint32_t) min_seqs : 2*n_decode_groups;
-        bool ok = batch.n_tokens <= max_tokens && n_sets >= n_min && n_sets % n_decode_groups == 0 &&
+        bool ok = !by_seq && batch.n_tokens <= max_tokens && n_sets >= n_min && n_sets % n_decode_groups == 0 &&
                   (uint32_t) batch.n_tokens % n_sets == 0;
         llama_seq_id id_min = LLAMA_MAX_SEQ, id_max = -1;
         for (const auto & it : seq_set_map) {
@@ -547,7 +558,19 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         }
     }
     if (n_decode_groups > 1 && sequential) {
-        seq_cap = decode_seq_cap;
+        if (!decode_group_caps.empty()) {
+            seq_cap = decode_group_i < decode_group_caps.size() ? decode_group_caps[decode_group_i] : 0;
+        } else {
+            seq_cap = decode_seq_cap;
+        }
+    }
+
+    // LLAMA_UBATCH_SEQ_CAP=n (test hook): at most n sequences per ubatch in every other sequential split (prompts, and
+    // the batches of contexts without decode groups such as the MTP drafter). With n = 1 every stream is computed as
+    // if it ran alone, which makes "N concurrent streams == each stream alone" an exact oracle. Slow; tests only.
+    if (seq_cap == 0 && sequential) {
+        static const int ubatch_seq_cap = getenv("LLAMA_UBATCH_SEQ_CAP") ? atoi(getenv("LLAMA_UBATCH_SEQ_CAP")) : 0;
+        seq_cap = (uint32_t) std::max(0, ubatch_seq_cap);
     }
 
     // determine the non-overlapping sequence sets participating in this ubatch
@@ -704,6 +727,18 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
         n_seqs = n_keep;
     }
 
+    // by-seq decode groups: every planned group must become exactly one ubatch, else lanes would not map to groups
+    // (not a correctness issue: the batch then just runs without lanes)
+    if (!decode_group_caps.empty()) {
+        if (n_seqs == seq_cap && decode_group_i < decode_group_caps.size()) {
+            decode_group_i++;
+        } else {
+            LLAMA_LOG_WARN("%s: decode group plan out of step (group %u: %u seqs, planned %u) - batch runs without lanes\n",
+                    __func__, decode_group_i, n_seqs, seq_cap);
+            decode_group_caps.clear();
+        }
+    }
+
     // concat the per-sequence-set lists
     std::vector<int32_t> idxs;
 
@@ -712,6 +747,52 @@ llama_ubatch llama_batch_allocr::split_equal(uint32_t n_ubatch, bool sequential,
     }
 
     return ubatch_add(idxs, n_seqs, true);
+}
+
+void llama_batch_allocr::plan_decode_groups_by_seq(uint32_t n_ubatch, uint32_t n_min) {
+    // streams in the order split_equal takes them (first unused token first) and their token counts
+    std::vector<llama_seq_id> order;
+    std::vector<uint32_t>     n_tok(LLAMA_MAX_SEQ, 0);
+    for (int32_t i = 0; i < batch.n_tokens; ++i) {
+        const llama_seq_id s = batch.seq_id[i][0];
+        if (n_tok[s]++ == 0) {
+            order.push_back(s);
+        }
+    }
+
+    const uint32_t n_sets = (uint32_t) order.size();
+    if (n_sets < n_min || n_sets != (uint32_t) seq_set_map.size()) {
+        return;
+    }
+
+    // g groups of n_sets/g streams, the last n_sets%g groups one more; group g -> lane g, so with a stable set of
+    // streams every lane sees the same streams (and shape) every step and reuses its graph
+    const uint32_t g    = std::min(n_sets, n_decode_groups);
+    const uint32_t base = n_sets / g;
+    const uint32_t rem  = n_sets % g;
+
+    std::vector<uint32_t> caps;
+    uint32_t k = 0;
+    for (uint32_t j = 0; j < g; ++j) {
+        const uint32_t c = base + (j >= g - rem ? 1 : 0);
+        uint32_t n = 0;
+        for (uint32_t q = 0; q < c; ++q) {
+            const llama_seq_id s = order[k + q];
+            // a ubatch of several streams needs consecutive ids (non-unified KV views) and equal lengths (or
+            // split_equal would leave a remainder ubatch and the groups would no longer map 1:1 to ubatches)
+            if (q > 0 && (s != order[k] + (llama_seq_id) q || n_tok[s] != n_tok[order[k]])) {
+                return;
+            }
+            n += n_tok[s];
+        }
+        if (n > n_ubatch) {
+            return;
+        }
+        caps.push_back(c);
+        k += c;
+    }
+
+    decode_group_caps = std::move(caps);
 }
 
 llama_ubatch llama_batch_allocr::split_seq(uint32_t n_ubatch) {

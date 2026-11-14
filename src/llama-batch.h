@@ -113,7 +113,12 @@ public:
     // rune: cut a decode-sized batch of N sequences into n equal ubatches (0/1 = off), see split_equal
     void set_decode_groups(uint32_t n) { n_decode_groups = n; }
     // number of ubatches the current batch was cut into by decode groups (0 = not cut); valid after the splits
-    uint32_t get_decode_groups_active() const { return decode_seq_cap > 0 ? n_decode_groups : 0; }
+    uint32_t get_decode_groups_active() const {
+        if (!decode_group_caps.empty()) {
+            return (uint32_t) decode_group_caps.size();
+        }
+        return decode_seq_cap > 0 ? n_decode_groups : 0;
+    }
 
     // a helper method for creating a well-defined ubatch of tokens
     // TODO: support embeddings if needed in the future
@@ -144,6 +149,13 @@ private:
 
     uint32_t n_decode_groups = 0;
     uint32_t decode_seq_cap  = 0; // sequences per ubatch of the current batch (0 = no cap)
+
+    // LLAMA_DECODE_GROUPS_BY_SEQ=1: sequences of each ubatch of the current batch, in order (empty = not cut)
+    std::vector<uint32_t> decode_group_caps;
+    uint32_t              decode_group_i = 0; // ubatches of the plan emitted so far
+
+    // plan decode_group_caps for the current batch (by-seq mode); leaves it empty if the batch cannot be cut
+    void plan_decode_groups_by_seq(uint32_t n_ubatch, uint32_t n_min);
 
     std::array<llama_seq_id, 1> seq_id_0 = {{ 0 }}; // default sequence id
 

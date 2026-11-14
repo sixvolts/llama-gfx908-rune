@@ -1922,8 +1922,9 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     // rune: LLAMA_DECODE_GROUPS=n cuts a decode step of N >= 2n streams into n equal ubatches that follow each other
-    // through the pipeline stages (llama_batch_allocr::split_equal). Pipeline-parallel contexts only: on one device
-    // the ubatches would just run one after the other.
+    // through the pipeline stages (llama_batch_allocr::split_equal); with LLAMA_DECODE_GROUPS_BY_SEQ=1 into
+    // min(N, n) ubatches of one stream each up to n streams. Pipeline-parallel contexts only: on one device the
+    // ubatches would just run one after the other.
     {
         static const int decode_groups = getenv("LLAMA_DECODE_GROUPS") ? atoi(getenv("LLAMA_DECODE_GROUPS")) : 0;
         // LLAMA_DECODE_GROUPS_FORCE=1: also without pipeline parallelism (tests of the split / lane logic on one device)
@@ -2031,7 +2032,8 @@ int llama_context::decode(const llama_batch & batch_inp) {
     const uint64_t nextn_cur = nextn_seq + 1;
     ggml_backend_t nextn_backend_cur = nullptr;
 
-    // decode groups: ubatch g of a cut step uses lane g - 1 (ubatch 0 stays on the main scheduler)
+    // decode groups: ubatch g of a cut step uses lane g - 1 (ubatch 0 stays on the main scheduler); lanes are created
+    // on first use, so n groups cost n - 1 extra schedulers (compute buffers sized by the decode graphs they ran)
     static const bool decode_lanes_on = !(getenv("LLAMA_DECODE_LANES") && atoi(getenv("LLAMA_DECODE_LANES")) == 0);
     const uint32_t n_groups_active = decode_lanes_on ? balloc->get_decode_groups_active() : 0;
     uint32_t i_ubatch = 0;
