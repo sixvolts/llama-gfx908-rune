@@ -17,3 +17,10 @@ bool ggml_cuda_mmvq_q8_smallk(
         int stride_row_x, int stride_col_y, int stride_col_dst,
         int nchannels_x, int nchannels_y, int nchannels_dst,
         int stride_channel_x, int stride_channel_y, int stride_channel_dst, cudaStream_t stream);
+
+// fuse-moe C: shared-expert gate + up + SWIGLU_CLAMP at 2..8 columns in one mmvq_q8_0_v2 launch (vx = up, vgate = gate),
+// bit-identical to the two GEMVs + the GLU kernel. _supported: whether the call below will take the shape.
+bool ggml_cuda_mmvq_q8_v2_glu_supported(int ncols_x, int ncols_dst);
+bool ggml_cuda_mmvq_q8_v2_glu(
+        const void * vx, const void * vgate, const void * vy, float * dst, float glu_limit, int ncols_x, int nrows_x, int ncols_dst,
+        int stride_row_x, int stride_col_y, int stride_col_dst, cudaStream_t stream);

@@ -1,6 +1,7 @@
 #include "mmvq-q8.cuh"
 #include "reduce-dpp.cuh"
 #include "vecdotq.cuh"
+#include "unary.cuh"
 
 #include <cstdlib>
 #include <cstring>
@@ -16,10 +17,13 @@
 // tuning knob (a row's order does not depend on it). CH = iterations whose loads are issued together (all of them when
 // CH >= NIT): at 5..8 columns the full set does not fit in registers; chunking changes when loads are issued, never the
 // per-accumulator order.
-template <int NB, int ncols, int RPB, int NW = 2, int CH = 1 << 20>
+// GLU (fuse-moe C): vx = up, vg = gate of a shared-expert pair, both rows run the same lane sequence as their own
+// unfused launches, then dst = swiglu_clamp(gate, up) as the GLU kernel computes it (ggml_cuda_op_swiglu_clamp_single).
+template <int NB, int ncols, int RPB, int NW = 2, int CH = 1 << 20, bool GLU = false>
 static __global__ void __launch_bounds__(64*NW, 1) mmvq_q8_0_v2(
         const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
-        const int nrows, const int stride_row_x, const int stride_col_y, const int stride_col_dst) {
+        const int nrows, const int stride_row_x, const int stride_col_y, const int stride_col_dst,
+        const void * __restrict__ vg, const float glu_limit) {
     constexpr int warp_size = 64;
     constexpr int nwarps    = NW;
     constexpr int qi        = QI8_0;                 // 8
@@ -34,12 +38,15 @@ static __global__ void __launch_bounds__(64*NW, 1) mmvq_q8_0_v2(
     const int kqs  = vdr*(tid % (qi/vdr));
 
     float tmp[ncols][RPB] = {{0.0f}};
+    float tmpg[ncols][RPB] = {{0.0f}};
 
 #pragma unroll
     for (int it0 = 0; it0 < NIT; it0 += C) {
         // loads: weights (2 ints + d per row and iteration), activations (2 ints + d per column and iteration)
         int  v[C][RPB][vdr];
         half dw[C][RPB];
+        int  vgt[C][RPB][vdr];
+        half dwg[C][RPB];
         int  u[C][ncols][vdr];
         half du[C][ncols];
 #pragma unroll
@@ -55,8 +62,19 @@ static __global__ void __launch_bounds__(64*NW, 1) mmvq_q8_0_v2(
                         v[c][i][0] = q.x;
                         v[c][i][1] = q.y;
                         dw[c][i]   = bq->d;
+                        if constexpr (GLU) {
+                            const block_q8_0 * bg = (const block_q8_0 *) vg + (row0 + i)*stride_row_x + kbx;
+                            int2 qg;
+                            __builtin_memcpy(&qg, bg->qs + 4*kqs, sizeof(qg));
+                            vgt[c][i][0] = qg.x;
+                            vgt[c][i][1] = qg.y;
+                            dwg[c][i]    = bg->d;
+                        }
                     } else {
                         v[c][i][0] = 0; v[c][i][1] = 0; dw[c][i] = __float2half(0.0f);
+                        if constexpr (GLU) {
+                            vgt[c][i][0] = 0; vgt[c][i][1] = 0; dwg[c][i] = __float2half(0.0f);
+                        }
                     }
                 }
 #pragma unroll
@@ -78,6 +96,9 @@ static __global__ void __launch_bounds__(64*NW, 1) mmvq_q8_0_v2(
 #pragma unroll
                     for (int i = 0; i < RPB; ++i) {
                         tmp[j][i] += vec_dot_q8_0_q8_1_impl<float, vdr>(v[c][i], u[c][j], dw[c][i], du[c][j]);
+                        if constexpr (GLU) {
+                            tmpg[j][i] += vec_dot_q8_0_q8_1_impl<float, vdr>(vgt[c][i], u[c][j], dwg[c][i], du[c][j]);
+                        }
                     }
                 }
             }
@@ -86,12 +107,16 @@ static __global__ void __launch_bounds__(64*NW, 1) mmvq_q8_0_v2(
 
     if constexpr (nwarps > 1) {
         __shared__ float tmp_shared[nwarps-1][ncols][RPB][warp_size];
+        __shared__ float tmpg_shared[GLU ? nwarps-1 : 1][GLU ? ncols : 1][GLU ? RPB : 1][warp_size];
         if (threadIdx.y > 0) {
 #pragma unroll
             for (int j = 0; j < ncols; ++j) {
 #pragma unroll
                 for (int i = 0; i < RPB; ++i) {
                     tmp_shared[threadIdx.y-1][j][i][threadIdx.x] = tmp[j][i];
+                    if constexpr (GLU) {
+                        tmpg_shared[threadIdx.y-1][j][i][threadIdx.x] = tmpg[j][i];
+                    }
                 }
             }
         }
@@ -104,6 +129,9 @@ static __global__ void __launch_bounds__(64*NW, 1) mmvq_q8_0_v2(
 #pragma unroll
             for (int i = 0; i < RPB; ++i) {
                 tmp[j][i] += tmp_shared[0][j][i][threadIdx.x];
+                if constexpr (GLU) {
+                    tmpg[j][i] += tmpg_shared[0][j][i][threadIdx.x];
+                }
             }
         }
     }
@@ -115,6 +143,9 @@ static __global__ void __launch_bounds__(64*NW, 1) mmvq_q8_0_v2(
 #pragma unroll
             for (int i = 0; i < RPB; ++i) {
                 tmp[j][i] += ggml_cuda_shfl_xor_td<warp_size>(tmp[j][i], offset);
+                if constexpr (GLU) {
+                    tmpg[j][i] += ggml_cuda_shfl_xor_td<warp_size>(tmpg[j][i], offset);
+                }
             }
         }
     }
@@ -124,10 +155,25 @@ static __global__ void __launch_bounds__(64*NW, 1) mmvq_q8_0_v2(
 #pragma unroll
         for (int i = 0; i < RPB; ++i) {
             if ((int) threadIdx.x == i && (RPB == 1 || row0 + i < nrows)) {
-                dst[j*stride_col_dst + i] = tmp[j][i];
+                if constexpr (GLU) {
+                    dst[j*stride_col_dst + i] = ggml_cuda_op_swiglu_clamp_single(tmpg[j][i], tmp[j][i], glu_limit);
+                } else {
+                    dst[j*stride_col_dst + i] = tmp[j][i];
+                }
             }
         }
     }
+}
+
+// GLU launches (fuse-moe C) go through the same row / chunk selection as the plain ones (thread-local vg and limit)
+static thread_local const void * mmvq_q8_glu_gate  = nullptr;
+static thread_local float        mmvq_q8_glu_limit = 0.0f;
+// rows per block of the GLU launch (exact for any value): two matrices' loads up front need registers; MI100, K = 4096 x
+// 2048 rows, us, gate + up + GLU unfused -> fused: 2 columns 32.4 -> 21.8, 3: 34.6 -> 25.2, 4: 57.9 -> 28.9, 6 (chunk 1):
+// 43.8 -> 34.6 at 1 row per block; 2 or 4 rows spill (4 columns, 4 rows: 97 us). GGML_CUDA_FUSE_MOE_C_RPB overrides.
+static int mmvq_q8_glu_rpb() {
+    static const int r = getenv("GGML_CUDA_FUSE_MOE_C_RPB") ? atoi(getenv("GGML_CUDA_FUSE_MOE_C_RPB")) : 1;
+    return r;
 }
 
 template <int NB, int ncols, int RPB, int NW = 2, int CH = 1 << 20>
@@ -135,7 +181,13 @@ static void mmvq_q8_0_v2_launch(const void * vx, const void * vy, float * dst, i
         int stride_col_dst, cudaStream_t stream) {
     const dim3 block_nums((nrows + RPB - 1)/RPB, 1, 1);
     const dim3 block_dims(64, NW, 1);
-    mmvq_q8_0_v2<NB, ncols, RPB, NW, CH><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, stride_row_x, stride_col_y, stride_col_dst);
+    if (NB == 128 && mmvq_q8_glu_gate != nullptr) {   // GLU only instantiated for K = 4096 (GLM shared expert)
+        mmvq_q8_0_v2<NB, ncols, RPB, NW, CH, true><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, stride_row_x,
+            stride_col_y, stride_col_dst, mmvq_q8_glu_gate, mmvq_q8_glu_limit);
+    } else {
+        mmvq_q8_0_v2<NB, ncols, RPB, NW, CH><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, stride_row_x, stride_col_y,
+            stride_col_dst, nullptr, 0.0f);
+    }
     CUDA_CHECK(cudaGetLastError());
 }
 
@@ -182,7 +234,10 @@ static void mmvq_q8_0_v2_wide(int nrows, const void * vx, const void * vy, float
     // 15.9 -> 12.8; 1536 rows 18.9 -> 22.0, so only up to 512 rows; 0 disables)
     static const int rpb_small = getenv("GGML_MMVQ_Q8_RPB8_SMALL") ? atoi(getenv("GGML_MMVQ_Q8_RPB8_SMALL")) : 1;
     static const int ch  = getenv("GGML_MMVQ_Q8_CH8")  ? atoi(getenv("GGML_MMVQ_Q8_CH8"))  : 1;
-    const int rpb = rpb_small > 0 && nrows <= 512 ? rpb_small : rpb_env;
+    int rpb = rpb_small > 0 && nrows <= 512 ? rpb_small : rpb_env;
+    if (mmvq_q8_glu_gate != nullptr) {
+        rpb = mmvq_q8_glu_rpb();
+    }
 #define MMVQ_Q8_WIDE(R, C) mmvq_q8_0_v2_launch<NB, ncols, R, 1, C>(vx, vy, dst, nrows, stride_row_x, stride_col_y, stride_col_dst, stream)
     if (rpb == 1) {
         MMVQ_Q8_WIDE(1, 1);
@@ -202,7 +257,7 @@ static void mmvq_q8_0_v2_ncols(int ncols, const void * vx, const void * vy, floa
     static const int rpb_env = getenv("GGML_MMVQ_Q8_RPB") ? atoi(getenv("GGML_MMVQ_Q8_RPB")) : 0;
     // measured on MI100 (bit-exact for any value): 1 row per block for one column, 4 for 2..4 columns on wide
     // matrices (6144 rows x 2560: 28.3 -> 24.0 us at 3 columns, 33.4 -> 26.6 at 4), 2 for narrow ones
-    const int rpb = rpb_env > 0 ? rpb_env : (ncols == 1 ? 1 : (nrows >= 2048 ? 4 : 2));
+    const int rpb = mmvq_q8_glu_gate != nullptr ? mmvq_q8_glu_rpb() : rpb_env > 0 ? rpb_env : (ncols == 1 ? 1 : (nrows >= 2048 ? 4 : 2));
     switch (ncols) {
         case 1: mmvq_q8_0_v2_rpb<NB, 1>(rpb, vx, vy, dst, nrows, stride_row_x, stride_col_y, stride_col_dst, stream); break;
         case 2: mmvq_q8_0_v2_rpb<NB, 2>(rpb, vx, vy, dst, nrows, stride_row_x, stride_col_y, stride_col_dst, stream); break;
@@ -416,4 +471,34 @@ bool ggml_cuda_mmvq_q8_v2(
         nchannels_dst, nsamples_x, nsamples_dst, stream);
     return false;
 #endif
+}
+
+bool ggml_cuda_mmvq_q8_v2_glu_supported(int ncols_x, int ncols_dst) {
+#if defined(GGML_USE_HIP)
+    static const bool enabled = !getenv("GGML_MMVQ_Q8_V2") || atoi(getenv("GGML_MMVQ_Q8_V2")) != 0;
+    static const bool wide    = !getenv("GGML_MMVQ_Q8_V2_WIDE") || atoi(getenv("GGML_MMVQ_Q8_V2_WIDE")) != 0;
+    const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
+    // 2..8 columns: where the unfused gate and up GEMVs both run mmvq_q8_0_v2 (1 column keeps the upstream fused kernel)
+    return ggml_cuda_fuse_moe('C') && enabled && GGML_CUDA_CC_IS_CDNA(cc) && ncols_x == 4096 &&
+        ncols_dst >= 2 && ncols_dst <= (wide ? 8 : 4);
+#else
+    GGML_UNUSED_VARS(ncols_x, ncols_dst);
+    return false;
+#endif
+}
+
+bool ggml_cuda_mmvq_q8_v2_glu(
+        const void * vx, const void * vgate, const void * vy, float * dst, float glu_limit, int ncols_x, int nrows_x, int ncols_dst,
+        int stride_row_x, int stride_col_y, int stride_col_dst, cudaStream_t stream) {
+    if (!ggml_cuda_mmvq_q8_v2_glu_supported(ncols_x, ncols_dst)) {
+        return false;
+    }
+    mmvq_q8_glu_gate  = vgate;
+    mmvq_q8_glu_limit = glu_limit;
+    const bool ok = ggml_cuda_mmvq_q8_v2(vx, vy, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
+        1, 1, 1, 1, 1, stream);
+    mmvq_q8_glu_gate = nullptr;
+    GGML_ASSERT(ok);
+    ggml_cuda_fuse_moe_count('C');
+    return true;
 }

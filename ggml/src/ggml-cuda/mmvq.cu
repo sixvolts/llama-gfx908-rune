@@ -1089,6 +1089,14 @@ static void mul_mat_vec_q_switch_ncols_dst(
     if constexpr (type == GGML_TYPE_Q8_0) {
         const bool fused = fusion.gate != nullptr || fusion.x_bias != nullptr || fusion.gate_bias != nullptr ||
                            fusion.x_scale != nullptr || fusion.gate_scale != nullptr;
+        // fuse-moe C: gate + up + SWIGLU_CLAMP (shared expert) in one v2 launch
+        if (!has_ids && fusion.gate != nullptr && fusion.x_bias == nullptr && fusion.gate_bias == nullptr &&
+            fusion.x_scale == nullptr && fusion.gate_scale == nullptr && fusion.glu_op == GGML_GLU_OP_SWIGLU_CLAMP &&
+            nchannels_x == 1 && nchannels_y == 1 && nchannels_dst == 1 && nsamples_x == 1 && nsamples_dst == 1 &&
+            ggml_cuda_mmvq_q8_v2_glu(vx, fusion.gate, vy, dst, fusion.glu_limit, ncols_x, nrows_x, ncols_dst, stride_row_x,
+                stride_col_y, stride_col_dst, stream)) {
+            return;
+        }
         if (!has_ids && !fused && nsamples_x == 1 && nsamples_dst == 1 &&
             ggml_cuda_mmvq_q8_smallk(vx, vy, dst, ncols_x, nrows_x, ncols_dst, stride_row_x, stride_col_y, stride_col_dst,
                 nchannels_x, nchannels_y, nchannels_dst, stride_channel_x, stride_channel_y, stride_channel_dst, stream)) {
@@ -1431,6 +1439,24 @@ static void mul_mat_vec_q_switch_type(
 // Per-device cache of q8_1-quantized activations, live for one graph evaluation. Every mmvq call of a graph
 // that reads the same src1 tensor (same tensor, data, shape, strides) shares one quantize launch.
 // GGML_CUDA_Q8_CACHE=0 disables it; GGML_CUDA_Q8_CACHE_STATS=1 prints hits/misses per graph.
+const ggml_tensor * ggml_cuda_q8_cache_root(const ggml_tensor * t) {
+    while (t->op == GGML_OP_RESHAPE && t->src[0]) {
+        t = t->src[0];
+    }
+    return t;
+}
+
+void ggml_cuda_q8_cache_put(const ggml_tensor * t, std::unique_ptr<ggml_cuda_pool_alloc<char>> buf) {
+    ggml_cuda_q8_cache & cache = ggml_cuda_q8_cache_get(ggml_cuda_get_device());
+    GGML_ASSERT(cache.active && ggml_is_contiguous(t) && t->ne[0] % MATRIX_ROW_PADDING == 0);
+    ggml_cuda_q8_cache_entry e;
+    e.t = t; e.data = t->data; e.bytes = ggml_nrows(t)*t->ne[0]*sizeof(block_q8_1)/QK8_1;
+    e.root = ggml_cuda_q8_cache_root(t); e.contiguous = true;
+    memcpy(e.ne, t->ne, sizeof(e.ne)); memcpy(e.nb, t->nb, sizeof(e.nb));
+    e.buf = std::move(buf);
+    cache.entries.push_back(std::move(e));
+}
+
 ggml_cuda_q8_cache & ggml_cuda_q8_cache_get(int device) {
     static ggml_cuda_q8_cache caches[GGML_CUDA_MAX_DEVICES];
     return caches[device];
@@ -1488,7 +1514,8 @@ void ggml_cuda_mul_mat_vec_q(
     if (fusion) {
         const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
         GGML_ASSERT( !ids || dst->ne[2] <= get_mmvq_mmid_max_batch(src0->type, cc));
-        GGML_ASSERT(  ids || dst->ne[1] == 1);
+        GGML_ASSERT(  ids || dst->ne[1] == 1 || (src0->type == GGML_TYPE_Q8_0 && fusion->gate &&
+                      ggml_cuda_mmvq_q8_v2_glu_supported(src0->ne[0], dst->ne[1])));
         // Scale fusion is only allowed for NVFP4 currently as the cost of checking this at run-time in the prologue is
         // non-negligible for some models such as gpt-oss-20b
         GGML_ASSERT((fusion->x_scale == nullptr && fusion->gate_scale == nullptr) || src0->type == GGML_TYPE_NVFP4);
@@ -1546,26 +1573,39 @@ void ggml_cuda_mul_mat_vec_q(
         const int64_t s12 = src1->nb[2] / ts_src1;
         const int64_t s13 = src1->nb[3] / ts_src1;
         ggml_cuda_q8_cache & cache = ggml_cuda_q8_cache_get(ctx.device);
-        if (!ids && cache.active) {
+        // fuse-moe D: the MUL_MAT_ID path shares the cache too, and a reshape does not change the data: contiguous
+        // tensors with the same reshape root, data, row length and size quantize to identical bytes (the MoE input
+        // [K,1,nt] and the shexp input [K,nt]). fuse-moe F: a GLU output whose q8_1 its producer already wrote.
+        const bool share_d = ggml_cuda_fuse_moe('D') && ggml_is_contiguous(src1);
+        const bool look    = !ids || share_d || ggml_cuda_fuse_moe('F');
+        const ggml_tensor * root = ggml_cuda_q8_cache_root(src1);
+        if (look && cache.active) {
             for (auto & e : cache.entries) {
-                if (e.t == src1 && e.data == src1->data && e.bytes == q8_bytes &&
-                    memcmp(e.ne, src1->ne, sizeof(e.ne)) == 0 && memcmp(e.nb, src1->nb, sizeof(e.nb)) == 0) {
+                const bool same = e.t == src1 && e.data == src1->data && e.bytes == q8_bytes &&
+                    memcmp(e.ne, src1->ne, sizeof(e.ne)) == 0 && memcmp(e.nb, src1->nb, sizeof(e.nb)) == 0;
+                const bool same_root = share_d && e.contiguous && e.root == root && e.data == src1->data &&
+                    e.bytes == q8_bytes && e.ne[0] == src1->ne[0];
+                if (same || same_root) {
+                    if (!same) {
+                        ggml_cuda_fuse_moe_count('D');
+                    }
                     src1_q8_1_d = e.buf->get();
                     cache.hits++;
                     break;
                 }
             }
-            if (!src1_q8_1_d) {
-                ggml_cuda_q8_cache_entry e;
-                e.t = src1; e.data = src1->data; e.bytes = q8_bytes;
-                memcpy(e.ne, src1->ne, sizeof(e.ne)); memcpy(e.nb, src1->nb, sizeof(e.nb));
-                e.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_bytes);
-                quantize_row_q8_1_cuda(src1_d, nullptr, e.buf->get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
-                src1_q8_1_d = e.buf->get();
-                cache.entries.push_back(std::move(e));
-                cache.misses++;
-            }
-        } else {
+        }
+        if (!src1_q8_1_d && (!ids || share_d) && cache.active) {
+            ggml_cuda_q8_cache_entry e;
+            e.t = src1; e.data = src1->data; e.bytes = q8_bytes;
+            e.root = root; e.contiguous = ggml_is_contiguous(src1);
+            memcpy(e.ne, src1->ne, sizeof(e.ne)); memcpy(e.nb, src1->nb, sizeof(e.nb));
+            e.buf = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_bytes);
+            quantize_row_q8_1_cuda(src1_d, nullptr, e.buf->get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
+            src1_q8_1_d = e.buf->get();
+            cache.entries.push_back(std::move(e));
+            cache.misses++;
+        } else if (!src1_q8_1_d) {
             src1_q8_1_own = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), q8_bytes);
             quantize_row_q8_1_cuda(src1_d, nullptr, src1_q8_1_own->get(), src0->type, ne10, s11, s12, s13, ne10_padded, ne11, ne12, ne13, stream);
             src1_q8_1_d = src1_q8_1_own->get();
@@ -1594,11 +1634,26 @@ void ggml_cuda_mul_mat_vec_q(
 
     const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
+    // fuse-moe F: the routed GLU kernel also writes the q8_1 of its output, which the down GEMV then takes from the cache
+    ggml_cuda_q8_cache & cache = ggml_cuda_q8_cache_get(ctx.device);
+    std::unique_ptr<ggml_cuda_pool_alloc<char>> glu_q8;
+    bool glu_q8_done = false;
+    if (ids && fusion && fusion->gate && cache.active && ggml_cuda_fuse_moe('F') && ggml_is_contiguous(dst) &&
+            dst->ne[0] % MATRIX_ROW_PADDING == 0) {
+        glu_q8 = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), ggml_nrows(dst)*dst->ne[0]*sizeof(block_q8_1)/QK8_1);
+        fusion_local.q8_out  = glu_q8->get();
+        fusion_local.q8_done = &glu_q8_done;
+    }
+
     mul_mat_vec_q_switch_type(
         src0->data, src0->type, src1_q8_1_d, ids_d, fusion_local, dst_d, ne00,
         ne01,              ncols_dst,     s01, stride_col_y,     stride_col_dst,
         ne02, nchannels_y, nchannels_dst, s02, stride_channel_y, stride_channel_dst,
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
+
+    if (glu_q8_done) {
+        ggml_cuda_q8_cache_put(dst, std::move(glu_q8));
+    }
 }
 
 void ggml_cuda_op_mul_mat_vec_q(

@@ -33,6 +33,7 @@
 #include "ggml-cuda/mm-thin-f16.cuh"
 #include "ggml-cuda/mmvf.cuh"
 #include "ggml-cuda/mmvq.cuh"
+#include "ggml-cuda/mmvq-q8.cuh"
 #include "ggml-cuda/moe-weighted-reduction.cuh"
 #include "ggml-cuda/norm.cuh"
 #include "ggml-cuda/opt-step-adamw.cuh"
@@ -1940,6 +1941,23 @@ static bool ggml_cuda_should_fuse_mul_mat_vec_q(const ggml_tensor * tensor) {
     return use_mul_mat_vec_q;
 }
 
+// fuse-moe C: dense Q8_0 gate + up + SWIGLU_CLAMP at 2..8 columns (shared expert) as one mmvq_q8_0_v2 launch
+static bool ggml_cuda_fuse_moe_c_ok(const ggml_tensor * up, const ggml_tensor * gate, const ggml_tensor * glu) {
+    const ggml_tensor * src0 = up->src[0];
+    const ggml_tensor * src1 = up->src[1];
+    return up->op == GGML_OP_MUL_MAT && gate->op == GGML_OP_MUL_MAT && src0->type == GGML_TYPE_Q8_0 &&
+        gate->src[0]->type == GGML_TYPE_Q8_0 && gate->src[1] == src1 && src1->type == GGML_TYPE_F32 &&
+        up->type == GGML_TYPE_F32 && glu->type == GGML_TYPE_F32 && ggml_is_contiguous(glu) &&
+        ggml_get_glu_op(glu) == GGML_GLU_OP_SWIGLU_CLAMP && ggml_get_op_params_i32(glu, 1) == 0 &&
+        glu->src[0] == gate && glu->src[1] == up &&
+        src0->ne[2] == 1 && src0->ne[3] == 1 && src1->ne[2] == 1 && src1->ne[3] == 1 && !src0->view_src &&
+        ggml_backend_buffer_get_usage(src0->buffer) != GGML_BACKEND_BUFFER_USAGE_COMPUTE &&
+        ggml_are_same_shape(src0, gate->src[0]) && ggml_are_same_stride(src0, gate->src[0]) &&
+        ggml_cuda_mmvq_q8_v2_glu_supported(src0->ne[0], up->ne[1]) &&
+        // only where ggml_cuda_mul_mat would run the two GEMVs on mmvq (CDNA1 Q8_0: up to 6 columns, then MMQ)
+        ggml_cuda_should_use_mmvq(src0->type, ggml_cuda_info().devices[ggml_cuda_get_device()].cc, up->ne[1]);
+}
+
 static void ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst) {
     GGML_TENSOR_BINARY_OP_LOCALS
 
@@ -3695,12 +3713,36 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
 // 31 nodes, so k <= 15; larger values use the per-operation path.
 static constexpr int MOE_WEIGHTED_REDUCTION_MAX_EXPERTS = 15;
 
+static std::atomic<int64_t> ggml_cuda_fuse_moe_counts[5];
+
+static void ggml_cuda_fuse_moe_print_counts() {
+    fprintf(stderr, "fuse-moe fired: C %lld D %lld E %lld F %lld G %lld\n",
+        (long long) ggml_cuda_fuse_moe_counts[0].load(), (long long) ggml_cuda_fuse_moe_counts[1].load(),
+        (long long) ggml_cuda_fuse_moe_counts[2].load(), (long long) ggml_cuda_fuse_moe_counts[3].load(),
+        (long long) ggml_cuda_fuse_moe_counts[4].load());
+}
+
+void ggml_cuda_fuse_moe_count(char item) {
+    static const bool stats = [] {
+        const bool on = getenv("GGML_CUDA_FUSE_MOE_STATS") && atoi(getenv("GGML_CUDA_FUSE_MOE_STATS")) != 0;
+        if (on) {
+            atexit(ggml_cuda_fuse_moe_print_counts);
+        }
+        return on;
+    }();
+    if (stats && item >= 'C' && item <= 'G') {
+        ggml_cuda_fuse_moe_counts[item - 'C']++;
+    }
+}
+
 struct ggml_cuda_moe_weighted_reduction_match {
     const ggml_tensor * experts      = nullptr;
     const ggml_tensor * expert_scale = nullptr;
     const ggml_tensor * weights      = nullptr;
     ggml_tensor *       dst          = nullptr;
     int                 node_count   = 0;
+    ggml_tensor *       add_dst      = nullptr;   // fuse-moe E: the ADD of addend to dst
+    const ggml_tensor * addend       = nullptr;
 };
 
 static bool ggml_cuda_match_moe_weighted_reduction(
@@ -3832,6 +3874,32 @@ static bool ggml_cuda_match_moe_weighted_reduction(
     match.weights      = weights;
     match.dst          = cgraph->nodes[output_idx];
     match.node_count   = node_count;
+    match.add_dst      = nullptr;
+    match.addend       = nullptr;
+
+    // fuse-moe E: the next node adds a tensor computed before the reduction (GLM: the shared expert, built first when
+    // E is on) to its sum; fold it in, the reduction's own output is then never written
+    const int add_idx = node_idx + node_count;
+    if (ggml_cuda_fuse_moe('E') && expert_scale == nullptr && n_expert_used == 8 && add_idx < cgraph->n_nodes) {
+        const ggml_tensor * add = cgraph->nodes[add_idx];
+        const ggml_tensor * red = match.dst;
+        if (add->op == GGML_OP_ADD && add->type == GGML_TYPE_F32 && ggml_is_contiguous(add) &&
+                (add->src[0] == red) != (add->src[1] == red)) {
+            const ggml_tensor * other = add->src[0] == red ? add->src[1] : add->src[0];
+            bool other_in_range = false;
+            for (int k = node_idx; k < add_idx; ++k) {
+                other_in_range |= cgraph->nodes[k] == other;
+            }
+            if (!other_in_range && other->type == GGML_TYPE_F32 && ggml_is_contiguous(other) &&
+                    ggml_are_same_shape(other, red) && ggml_are_same_shape(add, red)) {
+                ops.push_back(GGML_OP_ADD);
+                if (ggml_can_fuse_subgraph(cgraph, node_idx, node_count + 1, ops.data(), &add_idx, 1)) {
+                    match.add_dst = cgraph->nodes[add_idx];
+                    match.addend  = other;
+                }
+            }
+        }
+    }
     return true;
 }
 
@@ -4885,6 +4953,15 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     if (node->op == GGML_OP_MUL) {
         ggml_cuda_moe_weighted_reduction_match match;
         if (ggml_cuda_match_moe_weighted_reduction(cgraph, i, match)) {
+            if (match.add_dst) {
+                const int add_idx = i + match.node_count;
+                if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count + 1, &add_idx, 1, false, match.addend)) {
+                    ggml_cuda_fuse_moe_count('E');
+                    ggml_cuda_op_moe_weighted_reduction(
+                        *cuda_ctx, match.experts, match.expert_scale, match.weights, match.add_dst, match.addend);
+                    return match.node_count;
+                }
+            }
             const int output_idx = i + match.node_count - 1;
             if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
                 ggml_cuda_op_moe_weighted_reduction(
@@ -5413,7 +5490,7 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                 break;
             }
 
-            if (ggml_cuda_should_fuse_mul_mat_vec_q(up)) {
+            if (ggml_cuda_should_fuse_mul_mat_vec_q(up) || (op == GGML_OP_MUL_MAT && ggml_cuda_fuse_moe_c_ok(up, gate, glu))) {
                 ggml_cuda_mm_fusion_args_host fusion_data{};
                 fusion_data.gate      = gate->src[0];
                 fusion_data.glu_op    = ggml_get_glu_op(glu);
@@ -6036,6 +6113,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             if (match.expert_scale != nullptr) {
                 params->add_alloc_dep(
                     params->user_data, const_cast<ggml_tensor *>(match.expert_scale), match.dst);
+            }
+            if (match.add_dst != nullptr) {
+                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.experts), match.add_dst);
+                params->add_alloc_dep(params->user_data, const_cast<ggml_tensor *>(match.weights), match.add_dst);
             }
             i += match.node_count - 1;
         }

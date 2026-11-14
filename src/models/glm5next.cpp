@@ -4,6 +4,8 @@
 #include "llama-memory-hybrid.h"
 #include "llama-kv-cache-kpool.h"
 
+#include <cstdlib>
+
 // ssm_a holds -exp(A_log) (kimi-k3), not +exp(A_log) (bailingmoe3); converter checks
 
 static uint32_t glm5next_n_select(const llama_hparams & hparams) {
@@ -600,6 +602,24 @@ ggml_tensor * llama_model_glm5next::graph::build_layer_ffn(
                 nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
     }
 
+    // GGML_CUDA_FUSE_MOE(_E)=1: the shared expert is built first, so the final add directly follows the routed
+    // experts' weighted sum and the CUDA backend folds it into that kernel (same ops, only the node order changes)
+    static const bool shexp_first = [] {
+        const char * one = getenv("GGML_CUDA_FUSE_MOE_E");
+        const char * all = getenv("GGML_CUDA_FUSE_MOE");
+        return one ? atoi(one) != 0 : (all ? atoi(all) != 0 : false);
+    }();
+    ggml_tensor * shexp = nullptr;
+    if (shexp_first) {
+        shexp = build_ffn(cur,
+                layer.ffn_up_shexp,   nullptr, nullptr,
+                layer.ffn_gate_shexp, nullptr, nullptr,
+                layer.ffn_down_shexp, nullptr, nullptr,
+                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+        cb(shexp, "ffn_shexp", il);
+        ggml_build_forward_expand(gf, shexp);
+    }
+
     // noaux_tc: exp_probs_b biases top-k selection only; the weights stay unbiased
     ggml_tensor * moe_out = build_moe_ffn(cur,
             layer.ffn_gate_inp,
@@ -613,12 +633,14 @@ ggml_tensor * llama_model_glm5next::graph::build_layer_ffn(
             (llama_expert_gating_func_type) hparams.expert_gating_func,
             il);
 
-    ggml_tensor * shexp = build_ffn(cur,
-            layer.ffn_up_shexp,   nullptr, nullptr,
-            layer.ffn_gate_shexp, nullptr, nullptr,
-            layer.ffn_down_shexp, nullptr, nullptr,
-            nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
-    cb(shexp, "ffn_shexp", il);
+    if (!shexp_first) {
+        shexp = build_ffn(cur,
+                layer.ffn_up_shexp,   nullptr, nullptr,
+                layer.ffn_gate_shexp, nullptr, nullptr,
+                layer.ffn_down_shexp, nullptr, nullptr,
+                nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
+        cb(shexp, "ffn_shexp", il);
+    }
 
     // shared expert unscaled: routed_scaling_factor applies to the routed weights only
     return ggml_add(ctx0, moe_out, shexp);

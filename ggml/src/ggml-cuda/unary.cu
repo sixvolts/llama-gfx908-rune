@@ -1,5 +1,6 @@
 #include "unary.cuh"
 #include "convert.cuh"
+#include "mmvq.cuh"
 
 static __device__ __forceinline__ float op_abs(float x) {
     return fabsf(x);
@@ -443,6 +444,33 @@ static __global__ void swiglu_clamp_kernel(const T * gate, const T * up, T * dst
     dst[i] = (T) ggml_cuda_op_swiglu_clamp_single((float) gate[j0], (float) up[j1], limit);
 }
 
+// fuse-moe F: also writes the q8_1 of dst for the next GEMV, as quantize_q8_1 would (k % 256 == 0 and dst contiguous with
+// rows of a multiple of 512, so element i is quant iqs = i % 32 of block i / 32, in lane i % 32 of a 32-lane group)
+static __global__ void swiglu_clamp_q8_kernel(const float * gate, const float * up, float * dst, block_q8_1 * q8,
+        const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, float limit) {
+    const int64_t i = int64_t(blockDim.x)*blockIdx.x + threadIdx.x;
+
+    const int64_t j0 = (i / n) * o0 + (i % n);
+    const int64_t j1 = o0 == o1 ? j0 : (i / n) * o1 + (i % n);
+
+    const float xi = ggml_cuda_op_swiglu_clamp_single(gate[j0], up[j1], limit);
+    dst[i] = xi;
+
+    const int64_t ib  = i / QK8_1;
+    const int     iqs = i % QK8_1;
+    float amax = fabsf(xi);
+    float sum  = xi;
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    q8[ib].qs[iqs] = q;
+    if (iqs == 0) {
+        q8[ib].ds = make_half2(d, sum);
+    }
+    GGML_UNUSED(k);
+}
+
 template <typename T>
 static void swiglu_clamp_cuda(const T * gate, const T * up, T * dst, const int64_t k, const int64_t n, const int64_t o0, const int64_t o1, const float limit, cudaStream_t stream) {
     const int64_t num_blocks = (k + CUDA_GLU_BLOCK_SIZE - 1) / CUDA_GLU_BLOCK_SIZE;
@@ -498,6 +526,17 @@ void ggml_cuda_op_swiglu_clamp(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             src1_p += swapped ? 0 : nc;
         }
 
+        ggml_cuda_q8_cache & cache = ggml_cuda_q8_cache_get(ctx.device);
+        const int64_t k = ggml_nelements(dst);
+        if (ggml_cuda_fuse_moe('F') && cache.active && dst->ne[0] % MATRIX_ROW_PADDING == 0 && ggml_nrows(dst) <= 64 &&
+                k % CUDA_GLU_BLOCK_SIZE == 0) {
+            auto q8 = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), k*sizeof(block_q8_1)/QK8_1);
+            swiglu_clamp_q8_kernel<<<k / CUDA_GLU_BLOCK_SIZE, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(src0_p, src1_p, (float *) dst_d,
+                (block_q8_1 *) q8->get(), k, nc, src0_o / sizeof(float), src1_o / sizeof(float), limit);
+            ggml_cuda_q8_cache_put(dst, std::move(q8));
+            ggml_cuda_fuse_moe_count('F');
+            return;
+        }
         swiglu_clamp_cuda(src0_p, src1_p, (float *) dst_d, ggml_nelements(dst), nc, src0_o / sizeof(float), src1_o / sizeof(float), limit, stream);
     }
 }

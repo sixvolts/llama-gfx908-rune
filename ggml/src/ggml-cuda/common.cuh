@@ -1635,7 +1635,33 @@ struct ggml_cuda_mm_fusion_args_device {
     const void * gate_scale = nullptr;
     ggml_glu_op glu_op;
     float glu_limit = 0.0f;
+    // host side only (never read by kernels): q8_1 output buffer of the GLU result for the next GEMV (fuse-moe F);
+    // a launcher that wrote it sets *q8_done = true
+    void * q8_out  = nullptr;
+    bool * q8_done = nullptr;
 };
+
+// Decode MoE / shared-expert fusions, all bit-exact and off by default. GGML_CUDA_FUSE_MOE=1 turns on every item,
+// GGML_CUDA_FUSE_MOE_<X>=0|1 overrides one: C shexp gate+up+GLU in one Q8_0 kernel, D one input quantize for MUL_MAT_ID
+// and shexp, E shexp add folded into the weighted reduction, F GLU epilogues write q8_1, G router GEMV + top-k.
+static inline bool ggml_cuda_fuse_moe(const char item) {
+    static int vals[5] = { -2, -2, -2, -2, -2 };
+    const int k = item - 'C';
+    if (k < 0 || k >= 5) {
+        return false;
+    }
+    if (vals[k] == -2) {
+        const char * all = getenv("GGML_CUDA_FUSE_MOE");
+        char name[32];
+        snprintf(name, sizeof(name), "GGML_CUDA_FUSE_MOE_%c", item);
+        const char * one = getenv(name);
+        vals[k] = one ? (atoi(one) != 0) : (all ? (atoi(all) != 0) : 0);
+    }
+    return vals[k] != 0;
+}
+// fire counter of the fuse-moe items (host side: counts fusion decisions, once per HIP graph capture);
+// GGML_CUDA_FUSE_MOE_STATS=1 prints the counts at exit
+void ggml_cuda_fuse_moe_count(char item);
 
 struct ggml_cuda_kernel_launch_params {
     dim3 block_nums;

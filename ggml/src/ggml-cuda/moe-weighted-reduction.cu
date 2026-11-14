@@ -1,10 +1,13 @@
 #include "moe-weighted-reduction.cuh"
 
-template <bool has_scale, int NE>
+// has_add (fuse-moe E): dst = reduction + addend, the following ADD node (one rounding each, as unfused); addend may
+// alias dst (same index, read before the write by the same thread; hence no __restrict__ on either)
+template <bool has_scale, int NE, bool has_add = false>
 static __global__ void moe_weighted_reduction_f32(const float * __restrict__ experts,
                                                   const float * __restrict__ expert_scale,
                                                   const float * __restrict__ weights,
-                                                  float * __restrict__ dst,
+                                                  const float * addend,
+                                                  float * dst,
                                                   const int64_t n_embd,
                                                   const int     n_expert_used_rt) {
     // explicit operation order (bit-exact with the loop form): with the loop fully unrolled the compiler otherwise
@@ -29,12 +32,16 @@ static __global__ void moe_weighted_reduction_f32(const float * __restrict__ exp
         const float   scale = has_scale ? expert_scale[row] : 1.0f;
         sum = fmaf(experts[row * n_embd + col] * scale, weights[row], sum);
     }
+    if constexpr (has_add) {
+        sum = sum + addend[token * n_embd + col];
+    }
     dst[token * n_embd + col] = sum;
 }
 
 static void launch_moe_weighted_reduction(const float * experts,
                                           const float * expert_scale,
                                           const float * weights,
+                                          const float * addend,
                                           float *       dst,
                                           int64_t       n_embd,
                                           int64_t       n_tokens,
@@ -45,17 +52,22 @@ static void launch_moe_weighted_reduction(const float * experts,
     // has_scale as a template parameter: a nullptr test inside the expert loop split it into branches, so the
     // unrolled loads could not be issued together (same arithmetic either way)
     // NE = 8 (GLM-5.3 / DeepSeek top-8) is compiled fully unrolled so all experts' loads are issued together
+    if (addend != nullptr) {
+        GGML_ASSERT(expert_scale == nullptr && n_expert_used == 8);
+        moe_weighted_reduction_f32<false, 8, true><<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, addend, dst, n_embd, n_expert_used);
+        return;
+    }
     if (expert_scale != nullptr) {
         if (n_expert_used == 8) {
-            moe_weighted_reduction_f32<true, 8><<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
+            moe_weighted_reduction_f32<true, 8><<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, nullptr, dst, n_embd, n_expert_used);
         } else {
-            moe_weighted_reduction_f32<true, 0><<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
+            moe_weighted_reduction_f32<true, 0><<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, nullptr, dst, n_embd, n_expert_used);
         }
     } else {
         if (n_expert_used == 8) {
-            moe_weighted_reduction_f32<false, 8><<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
+            moe_weighted_reduction_f32<false, 8><<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, nullptr, dst, n_embd, n_expert_used);
         } else {
-            moe_weighted_reduction_f32<false, 0><<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, dst, n_embd, n_expert_used);
+            moe_weighted_reduction_f32<false, 0><<<blocks, threads, 0, stream>>>(experts, expert_scale, weights, nullptr, dst, n_embd, n_expert_used);
         }
     }
 }
@@ -64,7 +76,8 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
                                          const ggml_tensor *         experts,
                                          const ggml_tensor *         expert_scale,
                                          const ggml_tensor *         weights,
-                                         ggml_tensor *               dst) {
+                                         ggml_tensor *               dst,
+                                         const ggml_tensor *         addend) {
     GGML_ASSERT(experts->type == GGML_TYPE_F32);
     GGML_ASSERT(weights->type == GGML_TYPE_F32);
     GGML_ASSERT(expert_scale == nullptr || expert_scale->type == GGML_TYPE_F32);
@@ -73,6 +86,8 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
     GGML_ASSERT(ggml_is_contiguous(weights));
     GGML_ASSERT(expert_scale == nullptr || ggml_is_contiguous(expert_scale));
     GGML_ASSERT(ggml_is_contiguous(dst));
+    GGML_ASSERT(addend == nullptr || (addend->type == GGML_TYPE_F32 && ggml_is_contiguous(addend) &&
+                                      ggml_nelements(addend) == ggml_nelements(dst)));
 
     const int64_t n_embd        = experts->ne[0];
     const int64_t n_expert_used = experts->ne[1];
@@ -82,6 +97,7 @@ void ggml_cuda_op_moe_weighted_reduction(ggml_backend_cuda_context & ctx,
     launch_moe_weighted_reduction((const float *) experts->data,
                                   expert_scale ? (const float *) expert_scale->data : nullptr,
                                   (const float *) weights->data,
+                                  addend ? (const float *) addend->data : nullptr,
                                   (float *) dst->data, n_embd, n_tokens, (int) n_expert_used, stream);
     CUDA_CHECK(cudaGetLastError());
 }

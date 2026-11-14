@@ -307,7 +307,24 @@ static __device__ __forceinline__ float moe_kq_dot(const moe_q4K_pair & w, const
 static __device__ __forceinline__ float moe_kq_dot(const moe_q5K_pair & w, const block_q8_1 * y, const float * s8) { return moe_q5K_dot(w, y, s8); }
 static __device__ __forceinline__ float moe_kq_dot(const moe_q6K_half & w, const block_q8_1 * y, const float * s8) { return moe_q6K_dot(w, y, s8); }
 
-template <int NSB, int NW, int RG, int NTMAX, bool GLU, typename block_t = block_q4_K, typename pair_t = moe_q4K_pair>
+// q8_1 of a GLU output chunk of 32 rows (fuse-moe F): the arithmetic of quantize_q8_1 with element iqs in lane iqs of a
+// 32-lane group (the same xor butterflies, so the same bytes the down projection's quantize launch would write)
+static __device__ __forceinline__ void moe_quantize_q8_1_32(const float xi, block_q8_1 * __restrict__ yb, const int iqs) {
+    float amax = fabsf(xi);
+    float sum  = xi;
+    amax = warp_reduce_max<QK8_1>(amax);
+    sum  = warp_reduce_sum<QK8_1>(sum);
+    const float  d = amax / 127.0f;
+    const int8_t q = amax == 0.0f ? 0 : roundf(xi / d);
+    yb->qs[iqs] = q;
+    if (iqs == 0) {
+        yb->ds = make_half2(d, sum);
+    }
+}
+
+// Q8 (fuse-moe F, GLU only): also write the q8_1 of the GLU output to q8_out (layout of the down GEMV's src1 [nrows, n_used,
+// tokens], contiguous): the block's rows are staged in shared memory and quantized 32 at a time after the block is done.
+template <int NSB, int NW, int RG, int NTMAX, bool GLU, typename block_t = block_q4_K, typename pair_t = moe_q4K_pair, bool Q8 = false>
 static __global__ void __launch_bounds__(NW*moe_warp_size, 1) mmvq_moe_q4K(
         const void * __restrict__ vx, const void * __restrict__ vgate, const void * __restrict__ vy,
         const int32_t * __restrict__ ids, float * __restrict__ dst,
@@ -315,7 +332,7 @@ static __global__ void __launch_bounds__(NW*moe_warp_size, 1) mmvq_moe_q4K(
         const int stride_col_y, const int stride_channel_y, const int nchannels_y,
         const int stride_col_dst, const int stride_channel_dst,
         const int n_used, const int ncols_dst, const int ids_stride, unsigned int * __restrict__ stats,
-        const bool glu_clamp, const float glu_limit) {
+        const bool glu_clamp, const float glu_limit, block_q8_1 * __restrict__ q8_out = nullptr) {
     constexpr int IPS = pair_t::IPS;                        // items per superblock: 4 pairs (Q4_K/Q5_K), 2 halves (Q6_K)
     constexpr int QPI = (QK_K/QK8_1)/IPS;                   // q8_1 blocks per item
     static_assert((NSB*IPS) % 8 == 0, "8 lanes per row need a multiple of 8 items per row");
@@ -325,6 +342,9 @@ static __global__ void __launch_bounds__(NW*moe_warp_size, 1) mmvq_moe_q4K(
     __shared__ int   y_sh[NTMAX][NI];
     constexpr int NS  = pair_t::NS8;                        // staged sums per q8_1 block
     __shared__ float s8_sh[NTMAX][NBY*NS];
+    constexpr int BR = 8*RG*NW;                             // rows per block
+    constexpr bool Q8E = Q8 && GLU && BR % QK8_1 == 0;      // instantiated for every config, used where whole chunks fit
+    __shared__ float glu_sh[Q8E ? NTMAX : 1][Q8E ? BR : 1];
 
     int e;
     int sl[NTMAX];
@@ -403,6 +423,9 @@ static __global__ void __launch_bounds__(NW*moe_warp_size, 1) mmvq_moe_q4K(
                         r = glu_clamp ? ggml_cuda_op_swiglu_clamp_single(accg[t], r, glu_limit) : r*ggml_cuda_op_silu_single(accg[t]);
                     }
                     dst[sl[t]*stride_channel_dst + t*stride_col_dst + row] = r;
+                    if constexpr (Q8E) {
+                        glu_sh[t][row - blockIdx.x*BR] = r;
+                    }
                 }
                 acc[t]  = 0.0f;
                 accg[t] = 0.0f;
@@ -410,6 +433,22 @@ static __global__ void __launch_bounds__(NW*moe_warp_size, 1) mmvq_moe_q4K(
         }
         cu = nu;
         cg = ng;
+    }
+    if constexpr (Q8E) {
+        // host guarantees nrows % BR == 0, so every staged row is valid
+        __syncthreads();
+        constexpr int NCH = BR/QK8_1;
+        const int hw  = threadIdx.y*2 + lane/QK8_1;        // half-wave: one 32-row chunk at a time
+        const int iqs = lane % QK8_1;
+        for (int pc = hw; pc < NTMAX*NCH; pc += 2*NW) {
+            const int t  = pc / NCH;
+            const int ch = pc % NCH;
+            if (sl[t] < 0) {
+                continue;
+            }
+            const int64_t i_cont = ((int64_t) t*n_used + sl[t])*nrows + blockIdx.x*BR + ch*QK8_1;
+            moe_quantize_q8_1_32(glu_sh[t][ch*QK8_1 + iqs], q8_out + i_cont/QK8_1, iqs);
+        }
     }
 }
 
@@ -599,6 +638,12 @@ bool ggml_cuda_mmvq_moe_dedup(
     const bool  glu_clamp = glu && fusion.glu_op == GGML_GLU_OP_SWIGLU_CLAMP;
     const float glu_limit = fusion.glu_limit;
     unsigned int * stats = moe_dedup_stats(device);
+    // fuse-moe F: the GLU output's q8_1 is written by the kernel when the host asked for it (q8_out), the output is the
+    // contiguous [nrows, n_used, tokens] tensor the down GEMV quantizes, and a block covers whole 32-row chunks
+    auto q8_ok = [&](const int rows_per_block) {
+        return fusion.q8_out != nullptr && fusion.q8_done != nullptr && stride_channel_dst == nrows_x &&
+            stride_col_dst == n_used*nrows_x && nrows_x % rows_per_block == 0 && rows_per_block % QK8_1 == 0;
+    };
     // tuning: GGML_MOE_V2_Q4K = 10*NW + RG, GGML_MOE_V2_Q51 = 10*NW + RG (NW waves per block, RG row groups per wave)
     static const int cfg_q4k = getenv("GGML_MOE_V2_Q4K") ? atoi(getenv("GGML_MOE_V2_Q4K")) : 41;
     static const int cfg_q51 = getenv("GGML_MOE_V2_Q51") ? atoi(getenv("GGML_MOE_V2_Q51")) : 41;
@@ -620,7 +665,15 @@ bool ggml_cuda_mmvq_moe_dedup(
                 auto go = [&](auto nsb_tag, auto nt_tag) {
                     constexpr int NSB = decltype(nsb_tag)::value;
                     constexpr int NT  = decltype(nt_tag)::value;
-                    if (glu) {
+                    if (glu && q8_ok(8*RG*NW)) {
+                        mmvq_moe_q4K<NSB, NW, RG, NT, true, block_q4_K, moe_q4K_pair, true><<<block_nums, block_dims, 0, stream>>>(vx,
+                            fusion.gate, vy, ids, dst,
+                            nrows_x, stride_row_x, stride_channel_x, stride_col_y, stride_channel_y, nchannels_y,
+                            stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats, glu_clamp, glu_limit,
+                            (block_q8_1 *) fusion.q8_out);
+                        *fusion.q8_done = true;
+                        ggml_cuda_fuse_moe_count('F');
+                    } else if (glu) {
                         mmvq_moe_q4K<NSB, NW, RG, NT, true><<<block_nums, block_dims, 0, stream>>>(vx, fusion.gate, vy, ids, dst,
                             nrows_x, stride_row_x, stride_channel_x, stride_col_y, stride_channel_y, nchannels_y,
                             stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats, glu_clamp, glu_limit);
@@ -735,7 +788,15 @@ bool ggml_cuda_mmvq_moe_dedup(
                 constexpr int NT  = decltype(nt_tag)::value;
                 const dim3 block_dims(moe_warp_size, NW, 1);
                 const dim3 block_nums((nrows_x + 8*RG*NW - 1) / (8*RG*NW), n_used*ncols_dst, 1);
-                if (glu) {
+                if (glu && q8_ok(8*RG*NW)) {
+                    mmvq_moe_q4K<NSB, NW, RG, NT, true, block_q6_K, moe_q6K_half, true><<<block_nums, block_dims, 0, stream>>>(vx,
+                        fusion.gate, vy, ids, dst,
+                        nrows_x, stride_row_x, stride_channel_x, stride_col_y, stride_channel_y, nchannels_y,
+                        stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats, glu_clamp, glu_limit,
+                        (block_q8_1 *) fusion.q8_out);
+                    *fusion.q8_done = true;
+                    ggml_cuda_fuse_moe_count('F');
+                } else if (glu) {
                     mmvq_moe_q4K<NSB, NW, RG, NT, true, block_q6_K, moe_q6K_half><<<block_nums, block_dims, 0, stream>>>(vx, fusion.gate, vy, ids, dst,
                         nrows_x, stride_row_x, stride_channel_x, stride_col_y, stride_channel_y, nchannels_y,
                         stride_col_dst, stride_channel_dst, n_used, ncols_dst, ids_stride, stats, glu_clamp, glu_limit);
