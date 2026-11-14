@@ -24,3 +24,7 @@ bool ggml_cuda_mmvq_q8_v2_glu_supported(int ncols_x, int ncols_dst);
 bool ggml_cuda_mmvq_q8_v2_glu(
         const void * vx, const void * vgate, const void * vy, float * dst, float glu_limit, int ncols_x, int nrows_x, int ncols_dst,
         int stride_row_x, int stride_col_y, int stride_col_dst, cudaStream_t stream);
+// rune fuse-dense (GGML_CUDA_FD_KDA_BETA): arm a sigmoid epilogue for the next ggml_cuda_mmvq_q8_v2 call (K = 4096);
+// pending() is true afterwards when that call did not take it (the caller then applies the sigmoid itself)
+void ggml_cuda_mmvq_q8_set_sigmoid(bool on);
+bool ggml_cuda_mmvq_q8_sigmoid_pending();

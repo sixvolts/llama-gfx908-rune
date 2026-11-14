@@ -19,7 +19,8 @@
 // per-accumulator order.
 // GLU (fuse-moe C): vx = up, vg = gate of a shared-expert pair, both rows run the same lane sequence as their own
 // unfused launches, then dst = swiglu_clamp(gate, up) as the GLU kernel computes it (ggml_cuda_op_swiglu_clamp_single).
-template <int NB, int ncols, int RPB, int NW = 2, int CH = 1 << 20, bool GLU = false>
+// SIG (rune fuse-dense, GGML_CUDA_FD_KDA_BETA): the row's sum goes through op_sigmoid's 1/(1 + expf(-x)) at the store
+template <int NB, int ncols, int RPB, int NW = 2, int CH = 1 << 20, bool GLU = false, bool SIG = false>
 static __global__ void __launch_bounds__(64*NW, 1) mmvq_q8_0_v2(
         const void * __restrict__ vx, const void * __restrict__ vy, float * __restrict__ dst,
         const int nrows, const int stride_row_x, const int stride_col_y, const int stride_col_dst,
@@ -149,6 +150,16 @@ static __global__ void __launch_bounds__(64*NW, 1) mmvq_q8_0_v2(
             }
         }
     }
+    if constexpr (SIG) {
+        // every lane, uniform control flow (a store-side epilogue under the lane test ran 2.5x slower at 3 columns)
+#pragma unroll
+        for (int j = 0; j < ncols; ++j) {
+#pragma unroll
+            for (int i = 0; i < RPB; ++i) {
+                tmp[j][i] = 1.0f / (1.0f + expf(-tmp[j][i]));
+            }
+        }
+    }
     dst += row0;
 #pragma unroll
     for (int j = 0; j < ncols; ++j) {
@@ -176,16 +187,16 @@ static int mmvq_q8_glu_rpb() {
     return r;
 }
 
-template <int NB, int ncols, int RPB, int NW = 2, int CH = 1 << 20>
+template <int NB, int ncols, int RPB, int NW = 2, int CH = 1 << 20, bool SIG = false>
 static void mmvq_q8_0_v2_launch(const void * vx, const void * vy, float * dst, int nrows, int stride_row_x, int stride_col_y,
         int stride_col_dst, cudaStream_t stream) {
     const dim3 block_nums((nrows + RPB - 1)/RPB, 1, 1);
     const dim3 block_dims(64, NW, 1);
-    if (NB == 128 && mmvq_q8_glu_gate != nullptr) {   // GLU only instantiated for K = 4096 (GLM shared expert)
+    if (!SIG && NB == 128 && mmvq_q8_glu_gate != nullptr) {   // GLU only instantiated for K = 4096 (GLM shared expert)
         mmvq_q8_0_v2<NB, ncols, RPB, NW, CH, true><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, stride_row_x,
             stride_col_y, stride_col_dst, mmvq_q8_glu_gate, mmvq_q8_glu_limit);
     } else {
-        mmvq_q8_0_v2<NB, ncols, RPB, NW, CH><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, stride_row_x, stride_col_y,
+        mmvq_q8_0_v2<NB, ncols, RPB, NW, CH, false, SIG><<<block_nums, block_dims, 0, stream>>>(vx, vy, dst, nrows, stride_row_x, stride_col_y,
             stride_col_dst, nullptr, 0.0f);
     }
     CUDA_CHECK(cudaGetLastError());
@@ -428,6 +439,24 @@ bool ggml_cuda_mmvq_q8_smallk(
 #endif
 }
 
+// rune fuse-dense: the next ggml_cuda_mmvq_q8_v2 call applies the sigmoid epilogue (K = 4096 only); the flag is cleared
+// when it is applied, so a caller that finds it still set after the GEMV ran a kernel without it
+static thread_local bool mmvq_q8_sigmoid = false;
+void ggml_cuda_mmvq_q8_set_sigmoid(bool on) { mmvq_q8_sigmoid = on; }
+bool ggml_cuda_mmvq_q8_sigmoid_pending() { return mmvq_q8_sigmoid; }
+
+template <int ncols>
+static void mmvq_q8_0_v2_sig(const void * vx, const void * vy, float * dst, int nrows, int stride_row_x, int stride_col_y,
+        int stride_col_dst, cudaStream_t stream) {
+    // the table entry of mmvq_q8_0_v2_ncols<128>: 2 warps for 1..4 columns, 1 warp for 5..8 (rows per block and load
+    // chunks do not change a row's order)
+    if constexpr (ncols <= 4) {
+        mmvq_q8_0_v2_launch<128, ncols, ncols == 1 ? 1 : 2, 2, 1 << 20, true>(vx, vy, dst, nrows, stride_row_x, stride_col_y, stride_col_dst, stream);
+    } else {
+        mmvq_q8_0_v2_launch<128, ncols, 1, 1, 1, true>(vx, vy, dst, nrows, stride_row_x, stride_col_y, stride_col_dst, stream);
+    }
+}
+
 bool ggml_cuda_mmvq_q8_v2(
         const void * vx, const void * vy, float * dst, int ncols_x, int nrows_x, int ncols_dst,
         int stride_row_x, int stride_col_y, int stride_col_dst,
@@ -444,6 +473,23 @@ bool ggml_cuda_mmvq_q8_v2(
     // K = 12288 / 16384 at 2..4 columns with chunked loads (see mmvq_q8_0_v2_rpb); GGML_MMVQ_Q8_LONGK=0 keeps them on
     // mul_mat_vec_q
     static const bool longk = !getenv("GGML_MMVQ_Q8_LONGK") || atoi(getenv("GGML_MMVQ_Q8_LONGK")) != 0;
+    if (mmvq_q8_sigmoid) {
+        if (ncols_x != 4096) {
+            return false;
+        }
+        mmvq_q8_sigmoid = false;
+        switch (ncols_dst) {
+            case 1: mmvq_q8_0_v2_sig<1>(vx, vy, dst, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+            case 2: mmvq_q8_0_v2_sig<2>(vx, vy, dst, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+            case 3: mmvq_q8_0_v2_sig<3>(vx, vy, dst, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+            case 4: mmvq_q8_0_v2_sig<4>(vx, vy, dst, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+            case 5: mmvq_q8_0_v2_sig<5>(vx, vy, dst, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+            case 6: mmvq_q8_0_v2_sig<6>(vx, vy, dst, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+            case 7: mmvq_q8_0_v2_sig<7>(vx, vy, dst, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+            default: mmvq_q8_0_v2_sig<8>(vx, vy, dst, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); break;
+        }
+        return true;
+    }
     switch (ncols_x) {
         case  640: mmvq_q8_0_v2_ncols< 20>(ncols_dst, vx, vy, dst, nrows_x, stride_row_x, stride_col_y, stride_col_dst, stream); return true;
         // GLM-5.3-Flash (hidden 4096: 6.2 of its 9.4 GB of dense Q8_0 weights have K = 4096)

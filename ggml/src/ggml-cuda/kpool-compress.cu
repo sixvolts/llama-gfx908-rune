@@ -6,7 +6,17 @@
 
 #define KPOOL_R_MAX 8
 
-// one block per new pool; one thread per column (d <= 1024 loops). r slots live in registers.
+// lane 0 of warp_reduce_sum<32> (xor 16, 8, 4, 2, 1) when only lanes 0..7 hold values and no value is -0 (adding the
+// +0 of the empty lanes is then the identity): the sum order of soft_max_f32 and reduce_rows_f32 for r <= 8 columns
+static __device__ __forceinline__ float kpool_xor_sum8(const float * t) {
+#pragma clang fp contract(off)
+    const float a0 = t[0] + t[4], a1 = t[1] + t[5], a2 = t[2] + t[6], a3 = t[3] + t[7];
+    return (a0 + a2) + (a1 + a3);
+}
+
+// one block per new pool; one thread per column (d <= 1024 loops). r slots live in registers. Replays the unfused
+// chain exactly: get_rows (f16 -> f32), add(gate, ape), soft_max_f32 (max, 0 + exp per lane, xor-tree sum, times
+// 1/sum), mul(key, p), reduce_rows_f32 (0 + x per lane, xor-tree sum), set_rows (f32 -> T).
 template <typename T>
 static __global__ void kpool_compress_kernel(
         const char * __restrict__ kg, const int64_t kg_nb1, const int64_t kg_nb2,
@@ -15,6 +25,7 @@ static __global__ void kpool_compress_kernel(
         const int64_t * __restrict__ reps,
         char * __restrict__ dst, const int64_t dst_nb1,
         const int d, const int r, const int n_new) {
+#pragma clang fp contract(off)
     const int p = blockIdx.x;
     const int s = blockIdx.y;
 
@@ -34,30 +45,28 @@ static __global__ void kpool_compress_kernel(
         float mx = -INFINITY;
 #pragma unroll
         for (int j = 0; j < KPOOL_R_MAX; ++j) {
+            k[j] = 0.0f;
+            g[j] = 0.0f;
             if (j < r) {
                 const T * rp = (const T *) (base + row[j]*kg_nb1);
                 k[j] = ggml_cuda_cast<float>(rp[c]);
                 g[j] = ggml_cuda_cast<float>(rp[d + c]) + ape[c + j*ape_s1];
+                g[j] = g[j]*1.0f + 0.0f;   // soft_max_f32: x*scale + 0 (no mask)
                 mx = fmaxf(mx, g[j]);
             }
         }
-        float sum = 0.0f;
+        float e[KPOOL_R_MAX];
 #pragma unroll
         for (int j = 0; j < KPOOL_R_MAX; ++j) {
-            if (j < r) {
-                g[j] = expf(g[j] - mx);
-                sum += g[j];
-            }
+            e[j] = j < r ? 0.0f + expf(g[j] - mx) : 0.0f;
         }
-        const float inv_sum = 1.0f / sum;
-        float acc = 0.0f;
+        const float inv_sum = 1.0f / kpool_xor_sum8(e);
+        float pr[KPOOL_R_MAX];
 #pragma unroll
         for (int j = 0; j < KPOOL_R_MAX; ++j) {
-            if (j < r) {
-                acc += k[j] * (g[j] * inv_sum);
-            }
+            pr[j] = j < r ? 0.0f + k[j] * (e[j] * inv_sum) : 0.0f;
         }
-        out[c] = ggml_cuda_cast<T>(acc);
+        out[c] = ggml_cuda_cast<T>(kpool_xor_sum8(pr));
     }
 }
 
@@ -155,19 +164,24 @@ bool ggml_cuda_kpool_compress_match_graph(const ggml_cgraph * cgraph, int i, ggm
     if (add->src[0] != cg || add->type != GGML_TYPE_F32 || kp_root(ar) != ca || ar->view_offs != 0 ||
             ar->ne[0] != r || ar->ne[1] != d || ar->ne[2] != 1 || ar->ne[3] != 1) { return false; }
 
+    // build_indexer folds the softmax rows into ne1 (gridDim cap): SOFT_MAX(RESHAPE(add)), MUL(key, RESHAPE(probs))
+    auto same_or_flat = [](const ggml_tensor * t, const ggml_tensor * of, int64_t r) {
+        return t == of || (t->op == GGML_OP_RESHAPE && t->src[0] == of && t->ne[0] == r && ggml_nelements(t) == ggml_nelements(of));
+    };
     const int jsm = kp_next(cgraph, jadd + 1);
     if (jsm >= n || cgraph->nodes[jsm]->op != GGML_OP_SOFT_MAX) { return false; }
     const ggml_tensor * sm = cgraph->nodes[jsm];
     float sm_scale, sm_bias;
     memcpy(&sm_scale, (const float *) sm->op_params + 0, sizeof(float));
     memcpy(&sm_bias,  (const float *) sm->op_params + 1, sizeof(float));
-    if (sm->src[0] != add || sm->src[1] != nullptr || sm->src[2] != nullptr || sm->type != GGML_TYPE_F32 ||
-            sm_scale != 1.0f || sm_bias != 0.0f) { return false; }
+    if (!same_or_flat(sm->src[0], add, r) || sm->src[1] != nullptr || sm->src[2] != nullptr || sm->type != GGML_TYPE_F32 ||
+            sm->ne[0] != r || !ggml_is_contiguous(add) || sm_scale != 1.0f || sm_bias != 0.0f) { return false; }
 
     const int jmul = kp_next(cgraph, jsm + 1);
     if (jmul >= n || cgraph->nodes[jmul]->op != GGML_OP_MUL) { return false; }
     const ggml_tensor * mul = cgraph->nodes[jmul];
-    if (!((mul->src[0] == ck && mul->src[1] == sm) || (mul->src[0] == sm && mul->src[1] == ck)) || mul->type != GGML_TYPE_F32) { return false; }
+    if (mul->src[0] != ck || !same_or_flat(mul->src[1], sm, r) || !ggml_are_same_shape(mul->src[1], ck) ||
+            mul->type != GGML_TYPE_F32) { return false; }
 
     const int jsum = kp_next(cgraph, jmul + 1);
     if (jsum >= n || cgraph->nodes[jsum]->op != GGML_OP_SUM_ROWS) { return false; }
@@ -190,6 +204,7 @@ bool ggml_cuda_kpool_compress_match_graph(const ggml_cgraph * cgraph, int i, ggm
     // the write (pooled head) must not overlap the columns the kernel reads (key + gate) in any row:
     // same cache tensor, same row stride, disjoint column ranges within a row. The stream stride is the
     // cache's (kv_size rows), not n_kv rows: get_k views the first n_kv cells of every stream.
+    // (any row offset: get_k views a stream's first cell, the column offsets below are taken modulo the row)
     const ggml_tensor * root = kp_root(kg);
     if (kp_root(dv) != root || kg->view_src == nullptr || dv->nb[1] != kg->nb[1] || kg->nb[2] % kg->nb[1] != 0) { return false; }
     {
@@ -197,7 +212,6 @@ bool ggml_cuda_kpool_compress_match_graph(const ggml_cgraph * cgraph, int i, ggm
         const size_t row  = kg->nb[1];
         const size_t roff = kg->view_offs % row;
         const size_t woff = dv->view_offs % row;
-        if (kg->view_offs / row != 0 || dv->view_offs / row != 0) { return false; }
         const bool disjoint = woff >= roff + 2*d*ts || woff + d*ts <= roff;
         if (!disjoint || roff + 2*d*ts > row || woff + d*ts > row) { return false; }
     }

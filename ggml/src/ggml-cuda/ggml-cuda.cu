@@ -61,6 +61,8 @@
 #include "ggml-cuda/topk-moe.cuh"
 #include "ggml-cuda/unary.cuh"
 #include "ggml-cuda/kpool-compress.cuh"
+#include "ggml-cuda/fuse-dense.cuh"
+#include "ggml-cuda/fuse-dense-ops.cuh"
 #include "ggml-cuda/upscale.cuh"
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
@@ -4587,6 +4589,10 @@ static int ggml_cuda_try_fuse_kda_conv_rows(ggml_backend_cuda_context * cuda_ctx
     return m.last - i;
 }
 
+bool ggml_cuda_fd_buffer_is_cuda(ggml_backend_buffer_t buffer) {
+    return ggml_backend_buffer_is_cuda(buffer);
+}
+
 static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, int i) {
 
     static bool disable_fusion = getenv("GGML_CUDA_DISABLE_FUSION") != nullptr && std::atoi(getenv("GGML_CUDA_DISABLE_FUSION"));
@@ -4605,11 +4611,36 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
 
     // halo-hybrid: glm5next DSA indexer pool compressor, 9 launches -> 1 (kpool-compress.cu)
     if (node->op == GGML_OP_GET_ROWS) {
-        static const bool no_kpool = getenv("GGML_CUDA_NO_KPOOL_COMPRESS") != nullptr && std::atoi(getenv("GGML_CUDA_NO_KPOOL_COMPRESS"));
+        // rune: off unless GGML_CUDA_FD_KPOOL / GGML_CUDA_FUSE_DENSE (it never matched before the fuse-dense fix)
+        static const bool no_kpool = (getenv("GGML_CUDA_NO_KPOOL_COMPRESS") != nullptr && std::atoi(getenv("GGML_CUDA_NO_KPOOL_COMPRESS"))) ||
+                                     !ggml_cuda_fd_on("GGML_CUDA_FD_KPOOL");
         ggml_cuda_kpool_compress_match km;
         if (!no_kpool && ggml_cuda_kpool_compress_match_graph(cgraph, i, km)) {
             ggml_cuda_op_kpool_compress(*cuda_ctx, km);
+            ggml_cuda_fd_count(FD_KPOOL);
             return km.last - i;
+        }
+    }
+
+    if (node->op == GGML_OP_CONT) {
+        const int skip = ggml_cuda_fd_try_topk_mask(*cuda_ctx, cgraph, i);
+        if (skip > 0) {
+            return skip;
+        }
+        const int skip_t = ggml_cuda_fd_try_kda_tail(*cuda_ctx, cgraph, i, ggml_cuda_compute_forward);
+        if (skip_t > 0) {
+            return skip_t;
+        }
+    }
+
+    if (node->op == GGML_OP_MUL_MAT) {
+        const int skip = ggml_cuda_fd_try_kda_gate(*cuda_ctx, cgraph, i);
+        if (skip > 0) {
+            return skip;
+        }
+        const int skip_b = ggml_cuda_fd_try_kda_beta(*cuda_ctx, cgraph, i);
+        if (skip_b > 0) {
+            return skip_b;
         }
     }
 
@@ -4617,6 +4648,10 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
         const int skip = ggml_cuda_try_fuse_kda_conv_l2(cuda_ctx, cgraph, i);
         if (skip > 0) {
             return skip;
+        }
+        const int skip_ms = ggml_cuda_fd_try_conv_ms(*cuda_ctx, cgraph, i, ggml_cuda_compute_forward);
+        if (skip_ms > 0) {
+            return skip_ms;
         }
     }
 
@@ -6120,6 +6155,10 @@ static void ggml_backend_cuda_graph_optimize(ggml_backend_t backend, ggml_cgraph
             }
             i += match.node_count - 1;
         }
+    }
+
+    if (!disable_fusion) {
+        ggml_cuda_fd_alloc_deps(*cuda_ctx, cgraph, params);
     }
 
     // keep q/k/v of the KDA conv-input assembly alive until conv_input is allocated, so the fused kernel
