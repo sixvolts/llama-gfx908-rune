@@ -339,7 +339,9 @@ static void ckpt_hash_log(const char * part, int slot_id, int64_t n_tokens, cons
         return;
     }
     uint64_t h = 1469598103934665603ull;
-    for (size_t i = 0; i < n; ++i) { h = (h ^ p[i]) * 1099511628211ull; }
+    size_t i = 0;
+    for (; i + 8 <= n; i += 8) { uint64_t w; memcpy(&w, p + i, 8); h = (h ^ w) * 1099511628211ull; }   // ~8x faster than bytes
+    for (; i < n; ++i) { h = (h ^ p[i]) * 1099511628211ull; }
     LOG_WRN("ckpt-hash slot %d n_tokens %lld %s bytes %zu hash %016llx\n", slot_id, (long long) n_tokens, part, n, (unsigned long long) h);
 }
 
@@ -2863,7 +2865,8 @@ private:
     }
 
     // n_tokens_cur: the number of tokens added to the batch for the current slot
-    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max) {
+    // final: this batch completes the prompt (the end-of-prompt checkpoint; outputs and a full drain follow anyway)
+    void create_checkpoint(server_slot & slot, const int64_t n_tokens_cur, llama_pos pos_min, llama_pos pos_max, bool final = false) {
         const int id_task = slot.task->id;
 
         // LLAMA_SPEC_DEFER: catch the draft up first. The target's state copy below waits for the target to finish
@@ -2874,7 +2877,10 @@ private:
         // is taken when the deferred catch-up reaches this point (a marker queued behind the pending views), i.e. from
         // exactly the draft state the flush would have produced. With LLAMA_CKPT_ASYNC the target part is also queued,
         // so a mid-prompt checkpoint no longer empties the pipeline (rune GLM-5.3 32k: ~0.85 s per far checkpoint).
-        const bool dft_marker = spec_ckpt_marker_on() && ctx_dft && spec && spec_defer_depth() >= 2 && !spec_pending.valid && spec_busy();
+        // The end-of-prompt checkpoint keeps the flush: its batch is the prompt's last, the outputs need a caught-up
+        // draft anyway, and flushing here overlaps that catch-up with the target's last ubatches (a marker would move
+        // it after them: w90 8k prefill -9 %). The target copy is then synchronous as well (no overlap to gain).
+        const bool dft_marker = spec_ckpt_marker_on() && !final && ctx_dft && spec && spec_defer_depth() >= 2 && !spec_pending.valid && spec_busy();
         if (spec_busy() && ctx_dft && !dft_marker) {
             spec_flush();
         }
@@ -2934,7 +2940,7 @@ private:
         const int64_t t_ckpts = ggml_time_us();
         bool queued = false;
         int64_t t_ckpt0 = t_ckpts;
-        if (ckpt_async && slot.ckpt_pool) {
+        if (ckpt_async && slot.ckpt_pool && !(final && spec_ckpt_marker_on())) {
             const size_t sz = llama_state_seq_get_size_ext(ctx_tgt, slot.id, LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
             int si = slot.ckpt_pool->acquire(sz);
             if (si < 0) {
@@ -4466,7 +4472,7 @@ private:
                     //       yet processed and therefore it is not part of the checkpoint.
                     if (do_checkpoint) {
                         if (ggml_host_trace_on()) { ggml_host_trace("ckpt_b", n_tokens_cur, 0); }
-                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max);
+                        create_checkpoint(slot, n_tokens_cur, pos_min, pos_max, slot.state == SLOT_STATE_DONE_PROMPT);
                         if (ggml_host_trace_on()) { ggml_host_trace("ckpt_e", n_tokens_cur, 0); }
                     }
 
