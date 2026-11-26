@@ -651,6 +651,32 @@ bool ggml_cuda_mmvq_moe_dedup(
             // each row is still reduced by the same 8 lanes in the same order (bit-identical). rune GLM, 6 streams: 75.6 -> 79.9 t/s.
             // GGML_MOE_V2_Q4K applies to 5..8 tokens only with GGML_MOE_V2_NT8_NW=4.
             static const int nt8_nw = getenv("GGML_MOE_V2_NT8_NW") ? atoi(getenv("GGML_MOE_V2_NT8_NW")) : 8;
+            // review sweep knobs (10*NW + RG): GGML_MOE_V2_NT8_GU / _NT8_DOWN for 5..8 tokens, GGML_MOE_V2_Q4K_DOWN_CFG
+            // for the K = 2048 down projection at 1..4 tokens. Bit-identical per row (same 8 lanes, same order).
+            static const int cfg_nt8_gu   = getenv("GGML_MOE_V2_NT8_GU")       ? atoi(getenv("GGML_MOE_V2_NT8_GU"))       : 0;
+            static const int cfg_nt8_down = getenv("GGML_MOE_V2_NT8_DOWN")     ? atoi(getenv("GGML_MOE_V2_NT8_DOWN"))     : 0;
+            static const int cfg_down4    = getenv("GGML_MOE_V2_Q4K_DOWN_CFG") ? atoi(getenv("GGML_MOE_V2_Q4K_DOWN_CFG")) : 0;
+            int cfg_sweep = ncols_dst > 4 ? (ncols_x == 8*QK_K ? cfg_nt8_down : cfg_nt8_gu) : (ncols_x == 8*QK_K ? cfg_down4 : 0);
+            // K = 2048 down at 5..8 tokens: 4 waves x 2 row groups (20 KB of staged activations: 3 blocks per CU, and
+            // 8 items per lane keep the prefetch fed). MI100, 6 tokens all distinct: 300 -> 261 us (755 -> 868 GB/s),
+            // 5 tokens -42 us, 8 tokens -71 us; bytes identical. GGML_MOE_V2_NT8_DOWN=81 restores 8 x 1.
+            if (cfg_sweep == 0 && ncols_dst > 4 && ncols_x == 8*QK_K && nt8_nw == 8) {
+                cfg_sweep = 42;
+            }
+            if (cfg_sweep != 0) {
+                switch (cfg_sweep) {
+                    case 21: launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 1>{}); break;
+                    case 22: launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 2>{}); break;
+                    case 24: launch(std::integral_constant<int, 2>{}, std::integral_constant<int, 4>{}); break;
+                    case 41: launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 1>{}); break;
+                    case 42: launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 2>{}); break;
+                    case 44: launch(std::integral_constant<int, 4>{}, std::integral_constant<int, 4>{}); break;
+                    case 82: launch(std::integral_constant<int, 8>{}, std::integral_constant<int, 2>{}); break;
+                    case 84: launch(std::integral_constant<int, 8>{}, std::integral_constant<int, 4>{}); break;
+                    default: launch(std::integral_constant<int, 8>{}, std::integral_constant<int, 1>{}); break;
+                }
+                return true;
+            }
             if (ncols_dst > 4 && nt8_nw == 8) {
                 launch(std::integral_constant<int, 8>{}, std::integral_constant<int, 1>{});
                 return true;
