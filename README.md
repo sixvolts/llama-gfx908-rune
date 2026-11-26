@@ -1,9 +1,65 @@
 # llama-gfx908-rune
 
-llama.cpp (danielhanchen `qwen4exp/mtp` fork) tuned for AMD MI100 (gfx908) to serve Qwen3.8-Flash-Next:
-bit-exact HyperConnection fusions, batched-decode and pipelined-prefill fixes, and an MTP head that runs on a
-separate GPU with its prompt catch-up overlapped. Details, numbers, env knobs and the production launch:
-[docs/rune-gfx908.md](docs/rune-gfx908.md).
+llama.cpp tuned for **AMD MI100 (gfx908)** to serve **GLM-5.3-Flash** (`glm5next` architecture) with an MTP
+(NextN) draft head, pipeline-parallel across 9 GPUs plus 1 drafter GPU. `main` is the current production build;
+everything here is built and validated on one 10x MI100 box ("rune").
+
+**Current build: 20th (`glm53-build20`, 2026-11-15).** Single-stream decode ~49-56 tok/s (2k-8k context),
+~44 tok/s at 98k; 6 streams ~100-110 tok/s aggregate; prefill ~2.9k tok/s at 8k, ~4.1k tok/s at 32k-98k.
+Every optimization is gated by an env flag and checked bit-exact (greedy server oracles, checkpoint hashes,
+KL vs the previous build) before it goes into production.
+
+## What to grab
+
+| You want | Use |
+|---|---|
+| The production build | `main` (= tag `glm53-build20` + this README) |
+| An earlier production build | tags `glm53-build02` ... `glm53-build20` (one per promotion) |
+| Retired / unmerged experiments | tags `archive/*` (not maintained, not validated as a whole) |
+| The old Qwen3.8-Flash-Next line | tag `archive/flash-next-main` |
+
+## Build
+
+ROCm 6.4, gfx908:
+
+```sh
+cmake -B build -DGGML_HIP=ON -DAMDGPU_TARGETS=gfx908 -DGGML_HIP_GRAPHS=ON -DGGML_HIP_NO_VMM=ON \
+      -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=ON -DLLAMA_CURL=OFF
+cmake --build build -j --target llama-server llama-perplexity
+```
+
+## Run (production configuration)
+
+Most of the gfx908 work is off by default and enabled by environment variables. Production sets:
+
+```sh
+# pipeline / prefill
+LLAMA_PIPELINE_PARALLEL=1 GGML_SCHED_COPIES=8 GGML_CUDA_STAGE_RING=16 LLAMA_KV_PAD_PREFILL=32768
+LLAMA_PP_RESERVE_FULL=1 GGML_SCHED_STAGE_VIEWS=1 GGML_CUDA_H2D_KERNEL=1 LLAMA_PROMPT_SJF=1000
+GGML_CUDA_STAGE_RING_MIN_MB=33 GGML_CUDA_STAGE_RING_GROW=2 ROC_P2P_SDMA_SIZE=1048576
+# decode
+LLAMA_DSA_SPARSE=1 LLAMA_DECODE_GROUPS=6 LLAMA_DECODE_GROUPS_BY_SEQ=1 LLAMA_DECODE_GROUPS_MIN_SEQS=2
+LLAMA_KPOOL_INC=1 GGML_CUDA_LI_MFMA=1 GGML_CUDA_FUSE_DENSE=1 GGML_CUDA_FUSE_DEPS=1 GGML_CUDA_GRAPH_FULL_BATCH=512
+# MTP drafter
+LLAMA_SPEC_MAX_GEN=2 LLAMA_SPEC_NMAX_BY_GEN=2 LLAMA_SPEC_DEFER=3 LLAMA_NEXTN_RING=4
+# checkpoints / prompt cache
+LLAMA_CKPT_RECYCLE=1 LLAMA_CKPT_SPEC_MARKER=1 LLAMA_CKPT_ASYNC=1 LLAMA_CKPT_TAIL_ALIGN=1
+```
+
+Keep `GGML_CUDA_FUSE_DEPS=1` whenever `GGML_CUDA_FUSE_DENSE` or `LLAMA_PP_RESERVE_FULL` is on: the stock
+topk-moe fusion is not bit-exact and otherwise fires or declines depending on compute-buffer layout.
+
+```sh
+llama-server -m GLM-5.3-Flash-Q4_K_XL.gguf -md GLM-5.3-Flash-MTP.gguf --spec-type draft-mtp \
+  --spec-draft-n-max 2 --spec-draft-sampling probabilistic -ngld 99 -devd ROCm9 \
+  -ngl 99 -dev ROCm0,ROCm1,ROCm2,ROCm3,ROCm4,ROCm5,ROCm6,ROCm7,ROCm8 -ts 6,4,5,5,5,5,5,5,7 \
+  -fa off --load-mode none -lzm off -t 16 -c 786432 -np 6 -ub 512 -b 8192 \
+  --no-cache-idle-slots --cache-ram 65536
+```
+
+Design notes and measurements: [docs/rune-glm53-flash-plan.md](docs/rune-glm53-flash-plan.md),
+[prefill](docs/rune-glm53-flash-prefill.md), [prefill round 2](docs/rune-glm53-flash-prefill-r2.md),
+[decode round 3](docs/rune-glm53-flash-decode-r3.md), [gfx908 notes](docs/rune-gfx908.md).
 
 ---
 
