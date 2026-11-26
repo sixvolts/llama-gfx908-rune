@@ -1446,8 +1446,8 @@ const ggml_tensor * ggml_cuda_q8_cache_root(const ggml_tensor * t) {
     return t;
 }
 
-void ggml_cuda_q8_cache_put(const ggml_tensor * t, std::unique_ptr<ggml_cuda_pool_alloc<char>> buf) {
-    ggml_cuda_q8_cache & cache = ggml_cuda_q8_cache_get(ggml_cuda_get_device());
+void ggml_cuda_q8_cache_put(int device, const ggml_tensor * t, std::unique_ptr<ggml_cuda_pool_alloc<char>> buf) {
+    ggml_cuda_q8_cache & cache = ggml_cuda_q8_cache_get(device);
     GGML_ASSERT(cache.active && ggml_is_contiguous(t) && t->ne[0] % MATRIX_ROW_PADDING == 0);
     ggml_cuda_q8_cache_entry e;
     e.t = t; e.data = t->data; e.bytes = ggml_nrows(t)*t->ne[0]*sizeof(block_q8_1)/QK8_1;
@@ -1652,7 +1652,7 @@ void ggml_cuda_mul_mat_vec_q(
         ne03,              ne3,           s03, s13,              s3,               ids_stride, stream);
 
     if (glu_q8_done) {
-        ggml_cuda_q8_cache_put(dst, std::move(glu_q8));
+        ggml_cuda_q8_cache_put(ctx.device, dst, std::move(glu_q8));
     }
 }
 

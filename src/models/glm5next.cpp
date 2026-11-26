@@ -602,12 +602,16 @@ ggml_tensor * llama_model_glm5next::graph::build_layer_ffn(
                 nullptr, LLM_FFN_SILU, LLM_FFN_PAR, il);
     }
 
-    // GGML_CUDA_FUSE_MOE(_E)=1: the shared expert is built first, so the final add directly follows the routed
+    // GGML_CUDA_FUSE_MOE_E=1: the shared expert is built first, so the final add directly follows the routed
     // experts' weighted sum and the CUDA backend folds it into that kernel (same ops, only the node order changes)
+    // (LLAMA_GLM_SHEXP_FIRST=0|1 forces the order alone, for isolating the fusion from the reorder)
     static const bool shexp_first = [] {
+        const char * ord = getenv("LLAMA_GLM_SHEXP_FIRST");
+        if (ord) {
+            return atoi(ord) != 0;
+        }
         const char * one = getenv("GGML_CUDA_FUSE_MOE_E");
-        const char * all = getenv("GGML_CUDA_FUSE_MOE");
-        return one ? atoi(one) != 0 : (all ? atoi(all) != 0 : false);
+        return one ? atoi(one) != 0 : false;   // not part of the GGML_CUDA_FUSE_MOE umbrella (see ggml_cuda_fuse_moe)
     }();
     ggml_tensor * shexp = nullptr;
     if (shexp_first) {

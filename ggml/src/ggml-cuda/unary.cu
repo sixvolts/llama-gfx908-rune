@@ -533,7 +533,7 @@ void ggml_cuda_op_swiglu_clamp(ggml_backend_cuda_context & ctx, ggml_tensor * ds
             auto q8 = std::make_unique<ggml_cuda_pool_alloc<char>>(ctx.pool(), k*sizeof(block_q8_1)/QK8_1);
             swiglu_clamp_q8_kernel<<<k / CUDA_GLU_BLOCK_SIZE, CUDA_GLU_BLOCK_SIZE, 0, stream>>>(src0_p, src1_p, (float *) dst_d,
                 (block_q8_1 *) q8->get(), k, nc, src0_o / sizeof(float), src1_o / sizeof(float), limit);
-            ggml_cuda_q8_cache_put(dst, std::move(q8));
+            ggml_cuda_q8_cache_put(ctx.device, dst, std::move(q8));
             ggml_cuda_fuse_moe_count('F');
             return;
         }

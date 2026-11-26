@@ -23,8 +23,8 @@ struct ggml_cuda_q8_cache {
 };
 ggml_cuda_q8_cache & ggml_cuda_q8_cache_get(int device);
 const ggml_tensor * ggml_cuda_q8_cache_root(const ggml_tensor * t);
-// fuse-moe F: register buf as the q8_1 (mmvq layout) of the contiguous tensor t, written by t's producer
-void ggml_cuda_q8_cache_put(const ggml_tensor * t, std::unique_ptr<ggml_cuda_pool_alloc<char>> buf);
+// fuse-moe F: register buf (device = the ggml device index, ctx.device) as the q8_1 (mmvq layout) of the contiguous tensor t, written by t's producer
+void ggml_cuda_q8_cache_put(int device, const ggml_tensor * t, std::unique_ptr<ggml_cuda_pool_alloc<char>> buf);
 void ggml_cuda_q8_cache_begin(ggml_backend_cuda_context & ctx);   // call at the start of a graph evaluation
 void ggml_cuda_q8_cache_end(ggml_backend_cuda_context & ctx);     // releases the cached buffers
 

@@ -1641,7 +1641,7 @@ struct ggml_cuda_mm_fusion_args_device {
     bool * q8_done = nullptr;
 };
 
-// Decode MoE / shared-expert fusions, all bit-exact and off by default. GGML_CUDA_FUSE_MOE=1 turns on every item,
+// Decode MoE / shared-expert fusions, all bit-exact and off by default. GGML_CUDA_FUSE_MOE=1 turns on C, D and F,
 // GGML_CUDA_FUSE_MOE_<X>=0|1 overrides one: C shexp gate+up+GLU in one Q8_0 kernel, D one input quantize for MUL_MAT_ID
 // and shexp, E shexp add folded into the weighted reduction, F GLU epilogues write q8_1, G router GEMV + top-k.
 static inline bool ggml_cuda_fuse_moe(const char item) {
@@ -1655,7 +1655,10 @@ static inline bool ggml_cuda_fuse_moe(const char item) {
         char name[32];
         snprintf(name, sizeof(name), "GGML_CUDA_FUSE_MOE_%c", item);
         const char * one = getenv(name);
-        vals[k] = one ? (atoi(one) != 0) : (all ? (atoi(all) != 0) : 0);
+        // the umbrella covers C, D, F only: E needs the shexp-first graph order, which moves the compute-buffer layout and
+        // changed full-model numerics (w91: the order alone differs from off), so E and G are opt-in only
+        const bool in_all = item == 'C' || item == 'D' || item == 'F';
+        vals[k] = one ? (atoi(one) != 0) : (all && in_all ? (atoi(all) != 0) : 0);
     }
     return vals[k] != 0;
 }

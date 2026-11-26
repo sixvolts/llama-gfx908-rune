@@ -3645,6 +3645,31 @@ static bool ggml_cuda_topk_moe_fusion(const struct ggml_cgraph * cgraph, int nod
 }
 
 // returns whether the write (out) nodes overwrite the read nodes in operation
+// fusions declined by an allocation-dependent check (memory ranges / aliasing), per pattern: printed at exit with
+// GGML_CUDA_FUSE_MOE_STATS=1. Such a decline makes numerics depend on the compute-buffer layout wherever the unfused
+// path is not bit-identical to the fused one (diagnostics)
+static void ggml_cuda_fusion_decline_count(const char * what, int n) {
+    static const bool stats = getenv("GGML_CUDA_FUSE_MOE_STATS") && atoi(getenv("GGML_CUDA_FUSE_MOE_STATS")) != 0;
+    if (!stats) {
+        return;
+    }
+    static std::mutex mtx;
+    static std::map<std::string, int64_t> * counts = [] {
+        auto * m = new std::map<std::string, int64_t>();
+        atexit([] {
+            std::lock_guard<std::mutex> lock(mtx);
+            fprintf(stderr, "fusion declines (layout-dependent):");
+            for (auto & kv : *counts) {
+                fprintf(stderr, " %s=%lld", kv.first.c_str(), (long long) kv.second);
+            }
+            fprintf(stderr, "\n");
+        });
+        return m;
+    }();
+    std::lock_guard<std::mutex> lock(mtx);
+    (*counts)[std::string(what) + "/" + std::to_string(n)]++;
+}
+
 static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
                                                  const int           node_idx,
                                                  const int           node_count,
@@ -3708,6 +3733,9 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
         }
     }
 
+    if (!is_ok) {
+        ggml_cuda_fusion_decline_count(ggml_op_name(cgraph->nodes[node_idx]->op), node_count);
+    }
     return is_ok;
 }
 
@@ -3715,13 +3743,17 @@ static bool ggml_cuda_check_fusion_memory_ranges(const ggml_cgraph * cgraph,
 // 31 nodes, so k <= 15; larger values use the per-operation path.
 static constexpr int MOE_WEIGHTED_REDUCTION_MAX_EXPERTS = 15;
 
-static std::atomic<int64_t> ggml_cuda_fuse_moe_counts[5];
+// C..G = the items; R = weighted reduction fused (no E), X = reduction matched but its memory check failed (unfused
+// adds), e = E matched but its memory check failed (diagnostics)
+static const char ggml_cuda_fuse_moe_labels[] = "CDEFGRXe";
+static std::atomic<int64_t> ggml_cuda_fuse_moe_counts[8];
 
 static void ggml_cuda_fuse_moe_print_counts() {
-    fprintf(stderr, "fuse-moe fired: C %lld D %lld E %lld F %lld G %lld\n",
-        (long long) ggml_cuda_fuse_moe_counts[0].load(), (long long) ggml_cuda_fuse_moe_counts[1].load(),
-        (long long) ggml_cuda_fuse_moe_counts[2].load(), (long long) ggml_cuda_fuse_moe_counts[3].load(),
-        (long long) ggml_cuda_fuse_moe_counts[4].load());
+    fprintf(stderr, "fuse-moe fired:");
+    for (int k = 0; k < 8; ++k) {
+        fprintf(stderr, " %c %lld", ggml_cuda_fuse_moe_labels[k], (long long) ggml_cuda_fuse_moe_counts[k].load());
+    }
+    fprintf(stderr, "\n");
 }
 
 void ggml_cuda_fuse_moe_count(char item) {
@@ -3732,8 +3764,9 @@ void ggml_cuda_fuse_moe_count(char item) {
         }
         return on;
     }();
-    if (stats && item >= 'C' && item <= 'G') {
-        ggml_cuda_fuse_moe_counts[item - 'C']++;
+    const char * p = stats ? strchr(ggml_cuda_fuse_moe_labels, item) : nullptr;
+    if (p && item) {
+        ggml_cuda_fuse_moe_counts[p - ggml_cuda_fuse_moe_labels]++;
     }
 }
 
@@ -4237,6 +4270,7 @@ static int ggml_cuda_try_fuse_hc_norm(ggml_backend_cuda_context * cuda_ctx, ggml
             dsv4_hc_disjoint(post, px) && dsv4_hc_disjoint(post, pr) && dsv4_hc_disjoint(post, pp) && dsv4_hc_disjoint(post, pc) &&
             dsv4_hc_disjoint(mix, px) && dsv4_hc_disjoint(mix, pr) && dsv4_hc_disjoint(mix, pp) && dsv4_hc_disjoint(mix, pc);
         if (!ok) {
+            ggml_cuda_fusion_decline_count("hc_post_check", 0);
             return 0;
         }
     }
@@ -4258,6 +4292,9 @@ static int ggml_cuda_try_fuse_hc_norm(ggml_backend_cuda_context * cuda_ctx, ggml
             dsv4_hc_disjoint(m, x) && dsv4_hc_disjoint(m, mix) && dsv4_hc_disjoint(m, wv) &&
             (!post || (dsv4_hc_disjoint(m, post->src[0]) && dsv4_hc_disjoint(m, post->src[1]) &&
                        dsv4_hc_disjoint(m, post->src[2]) && dsv4_hc_disjoint(m, post->src[3])));
+        if (!ok && wv && dsv4_hc_uses1(cgraph, ir) && !(dsv4_hc_disjoint(m, x) && dsv4_hc_disjoint(m, mix) && dsv4_hc_disjoint(m, wv))) {
+            ggml_cuda_fusion_decline_count("hc_norm_alias", 0);
+        }
         if (ok) {
             rn = r; mul = m;
             for (int q = im + 1; q < ir; ++q) {
@@ -4363,6 +4400,7 @@ static int ggml_cuda_try_fuse_kda_conv_l2(ggml_backend_cuda_context * cuda_ctx, 
             logged = true;
             GGML_LOG_INFO("%s: %s aliases its conv input or outputs, KDA conv-l2 fusion declined\n", __func__, silu->name);
         }
+        ggml_cuda_fusion_decline_count("kda_conv_l2_alias", 0);
         return 0;
     }
 
@@ -4567,6 +4605,7 @@ static int ggml_cuda_try_fuse_kda_conv_rows(ggml_backend_cuda_context * cuda_ctx
             logged = true;
             GGML_LOG_INFO("%s: %s: conv_input or a slot overlaps q/k/v, unfused path (logged once)\n", __func__, m.c3->name);
         }
+        ggml_cuda_fusion_decline_count("kda_conv_rows_alias", 0);
         return 0;
     }
     // v's GEMV (no hoist: it sits between the two concats) runs first, as in the graph; the check above made sure
@@ -4996,13 +5035,16 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
                         *cuda_ctx, match.experts, match.expert_scale, match.weights, match.add_dst, match.addend);
                     return match.node_count;
                 }
+                ggml_cuda_fuse_moe_count('e');
             }
             const int output_idx = i + match.node_count - 1;
             if (ggml_cuda_check_fusion_memory_ranges(cgraph, i, match.node_count, &output_idx, 1)) {
+                ggml_cuda_fuse_moe_count('R');
                 ggml_cuda_op_moe_weighted_reduction(
                     *cuda_ctx, match.experts, match.expert_scale, match.weights, match.dst);
                 return match.node_count - 1;
             }
+            ggml_cuda_fuse_moe_count('X');
         }
     }
 
