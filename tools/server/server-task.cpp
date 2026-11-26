@@ -1765,13 +1765,13 @@ server_prompt_cache_state * server_prompt_cache::alloc(const server_prompt & pro
         }
     }
 
-    std::vector<uint8_t> state_data_tgt;
-    std::vector<uint8_t> state_data_dft;
+    common_state_blob state_data_tgt;
+    common_state_blob state_data_dft;
 
     // check if we can allocate enough memory for the new state
     try {
-        state_data_tgt.resize(state_size_tgt);
-        state_data_dft.resize(state_size_dft);
+        state_data_tgt.alloc(state_size_tgt);
+        state_data_dft.alloc(state_size_dft);
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for prompt cache state: %s\n", e.what());
 
@@ -1924,8 +1924,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
             }
 
             if (!shared) {
-                data.clear();
-                data.shrink_to_fit();
+                data.release();
             }
         }
 
@@ -1944,8 +1943,7 @@ bool server_prompt_cache::load(server_prompt & prompt, const server_tokens & tok
                 }
 
                 if (!shared) {
-                    data.clear();
-                    data.shrink_to_fit();
+                    data.release();
                 }
             }
         }
@@ -2073,11 +2071,11 @@ server_prompt_cache_state * server_prompt_cache::alloc_shared(const server_token
         }
     }
 
-    std::vector<uint8_t> state_data_tgt;
-    std::vector<uint8_t> state_data_dft;
+    common_state_blob state_data_tgt;
+    common_state_blob state_data_dft;
     try {
-        state_data_tgt.resize(state_size_tgt);
-        state_data_dft.resize(state_size_dft);
+        state_data_tgt.alloc(state_size_tgt);
+        state_data_dft.alloc(state_size_dft);
     } catch (const std::bad_alloc & e) {
         SRV_ERR("failed to allocate memory for a shared prefix snapshot: %s\n", e.what());
         return nullptr;

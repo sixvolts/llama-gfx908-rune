@@ -9,6 +9,7 @@
 #include "llama.h"
 
 #include <list>
+#include <memory>
 #include <set>
 #include <sstream>
 #include <string>
@@ -1164,6 +1165,37 @@ enum ggml_opt_optimizer_type common_opt_get_optimizer(const char *);
 // prompt utils
 //
 
+// (rune) host copy of a sequence state (context checkpoints, host prompt cache entries).
+// LLAMA_CKPT_RECYCLE=1: copies share the bytes (a blob is never modified after it is written), and freed buffers are
+// kept, already faulted in, for the next blob of about the same size (up to LLAMA_CKPT_RECYCLE_MIB, default 4096): a
+// fresh 145.6 MiB checkpoint vector cost ~40 ms of page faults + zeroing (the D2H copy itself ~12 ms), and seconds under
+// direct reclaim. Unset: a plain vector, deep-copied (the upstream behaviour).
+struct common_state_blob {
+    common_state_blob() = default;
+    common_state_blob(const common_state_blob & other);
+    common_state_blob & operator=(const common_state_blob & other);
+    common_state_blob(common_state_blob &&) noexcept = default;
+    common_state_blob & operator=(common_state_blob &&) noexcept = default;
+
+    size_t          size()  const { return buf ? buf->size() : 0; }
+    bool            empty() const { return size() == 0; }
+    const uint8_t * data()  const { return buf ? buf->data() : nullptr; }
+    uint8_t *       data()        { return buf ? buf->data() : nullptr; }   // write only right after alloc()
+
+    // an unshared buffer of n bytes to write the state into (contents unspecified)
+    uint8_t * alloc(size_t n);
+
+    void clear();     // size 0 (unset: keeps the capacity, as std::vector::clear)
+    void release();   // drop the storage
+
+    static bool recycle();
+    // recycling stats: buffers reused / freshly allocated, bytes kept for reuse
+    static void stats(uint64_t & n_hit, uint64_t & n_miss, size_t & pooled);
+
+private:
+    std::shared_ptr<std::vector<uint8_t>> buf;
+};
+
 struct common_prompt_checkpoint {
     int64_t n_tokens;
 
@@ -1173,8 +1205,8 @@ struct common_prompt_checkpoint {
     llama_pos pos_min;
     llama_pos pos_max;
 
-    std::vector<uint8_t> data_tgt;
-    std::vector<uint8_t> data_dft;
+    common_state_blob data_tgt;
+    common_state_blob data_dft;
 
     // (optional) speculative-decoding implementation state stashed with the checkpoint
     // (e.g. eagle3's deferred-boundary g_embd row)

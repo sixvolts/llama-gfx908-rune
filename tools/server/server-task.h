@@ -586,8 +586,8 @@ struct server_prompt {
 };
 
 struct server_prompt_data {
-    std::vector<uint8_t> main;
-    std::vector<uint8_t> drft;
+    common_state_blob main;
+    common_state_blob drft;
     std::vector<uint8_t> spec; // the drafter's per-sequence carry-over state (common_speculative_get_state), if any
 
     size_t size() const {
