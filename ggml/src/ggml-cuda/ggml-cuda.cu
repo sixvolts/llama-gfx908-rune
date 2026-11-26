@@ -875,6 +875,16 @@ static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer
     return GGML_STATUS_SUCCESS;
 }
 
+// D2H verification (definitions after the staging ring below)
+struct ggml_cuda_d2h_pending { void * host; const void * dev; size_t nbytes; uint64_t seq; int slot; };
+static bool ggml_cuda_d2h_begin(int device, cudaStream_t stream, void * host, const void * dev, size_t nbytes, ggml_cuda_d2h_pending & rec);
+static void ggml_cuda_d2h_verify(int device, const ggml_cuda_d2h_pending & rec);
+static void ggml_cuda_d2h_push(int device, const ggml_cuda_d2h_pending & rec);
+static void ggml_cuda_d2h_flush(int device);
+static bool ggml_cuda_d2h_has_pending(int device);
+static bool ggml_cuda_d2h_verify_on();
+static bool ggml_cuda_d2h_kernel_copy(int device, cudaStream_t stream, void * host, const void * dev, size_t nbytes);
+
 static void ggml_backend_cuda_buffer_memset_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor, uint8_t value, size_t offset, size_t size) {
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
@@ -895,8 +905,15 @@ static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, co
     ggml_backend_cuda_buffer_context * ctx = (ggml_backend_cuda_buffer_context *) buffer->context;
 
     ggml_cuda_set_device(ctx->device);
-    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    ggml_cuda_d2h_pending rec;
+    const bool verify = ggml_cuda_d2h_begin(ctx->device, cudaStreamPerThread, data, (const char *) tensor->data + offset, size, rec);
+    if (!ggml_cuda_d2h_kernel_copy(ctx->device, cudaStreamPerThread, data, (const char *) tensor->data + offset, size)) {
+        CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cudaStreamPerThread));
+    }
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+    if (verify) {
+        ggml_cuda_d2h_verify(ctx->device, rec);
+    }
 }
 
 static void ggml_backend_cuda_buffer_set_tensor_2d(ggml_backend_buffer_t buffer, struct ggml_tensor * tensor, const void * data,
@@ -2641,7 +2658,17 @@ static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggm
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-    CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+    ggml_cuda_d2h_pending rec;
+    if (ggml_cuda_d2h_verify_on()) {
+        ggml_cuda_set_device(cuda_ctx->device);   // the hash kernels below launch on this device's stream
+    }
+    const bool verify = ggml_cuda_d2h_begin(cuda_ctx->device, cuda_ctx->stream(), data, (const char *) tensor->data + offset, size, rec);
+    if (!ggml_cuda_d2h_kernel_copy(cuda_ctx->device, cuda_ctx->stream(), data, (const char *) tensor->data + offset, size)) {
+        CUDA_CHECK(cudaMemcpyAsync(data, (const char *) tensor->data + offset, size, cudaMemcpyDeviceToHost, cuda_ctx->stream()));
+    }
+    if (verify) {
+        ggml_cuda_d2h_push(cuda_ctx->device, rec);
+    }
 }
 
 static void ggml_backend_cuda_set_tensor_2d_async(ggml_backend_t backend, struct ggml_tensor * tensor, const void * data,
@@ -2680,11 +2707,167 @@ struct ggml_cuda_stage_ring {
     int         next        = 0;
 };
 
+// GGML_CUDA_COPY_FENCE=1 (candidate fix): an empty kernel after every inter-device async copy, before the event that
+// tells the other device the copy is done. ROCm runs these copies on SDMA queues while events are markers on the
+// stream's compute queue; an event that fires before its SDMA copy finished lets the consumer read stale data (graph
+// replays start immediately, so they hit it; HSA_ENABLE_SDMA=0 cures it at -77 % prefill)
+static __global__ void ggml_cuda_copy_fence_kernel() {}
+
+static bool ggml_cuda_copy_fence_on() {
+    static const bool on = getenv("GGML_CUDA_COPY_FENCE") && atoi(getenv("GGML_CUDA_COPY_FENCE")) != 0;
+    return on;
+}
+
+// Validated staging (GGML_CUDA_STAGE_RING_PULL=1, candidate fix for the w47 ON-3 failure: the consumer's H2D read the
+// pinned slot before the producer's SDMA D2H had landed): no SDMA on the crossing at all. The producer runs a kernel that
+// writes the data into the host-mapped slot and a {seq, hash} trailer after it; the consumer runs a kernel that pulls the
+// slot into the destination while hashing it, then a finisher that compares against the trailer and, on a mismatch
+// (trailer or data not landed yet), re-reads the slot (volatile host loads) until seq and hash agree - bounded, counted.
+#define GGML_CUDA_RING_TRAILER 64
+static __device__ __forceinline__ uint64_t ggml_cuda_ring_mix(uint32_t w, uint64_t k) {
+    uint64_t x = (uint64_t) w * 0x9E3779B97F4A7C15ull + k * 0xC2B2AE3D27D4EB4Full;
+    x ^= x >> 31; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 29;
+    return x;
+}
+static __device__ __forceinline__ uint64_t ggml_cuda_ring_block_sum(uint64_t h) {
+    __shared__ uint64_t sh[256];
+    sh[threadIdx.x] = h;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if ((int) threadIdx.x < s) { sh[threadIdx.x] += sh[threadIdx.x + s]; }
+        __syncthreads();
+    }
+    return sh[0];
+}
+// GGML_CUDA_D2H_KERNEL=1 (candidate fix, w55n/w60): device->host tensor reads (logits, state saves) are done by a copy
+// kernel writing into the host-mapped pinned destination instead of an SDMA cudaMemcpyAsync; every stale read traced so
+// far was an SDMA host-memory transfer while the kernel-based ring never saw one. Falls back to cudaMemcpyAsync when the
+// destination is not device-mapped.
+static __global__ void ggml_cuda_d2h_copy_words(const uint32_t * __restrict__ src, uint32_t * __restrict__ dst, size_t nwords) {
+    for (size_t k = blockIdx.x * (size_t) blockDim.x + threadIdx.x; k < nwords; k += (size_t) gridDim.x * blockDim.x) {
+        dst[k] = src[k];
+    }
+}
+static __global__ void ggml_cuda_d2h_copy_bytes(const uint8_t * __restrict__ src, uint8_t * __restrict__ dst, size_t n) {
+    for (size_t k = blockIdx.x * (size_t) blockDim.x + threadIdx.x; k < n; k += (size_t) gridDim.x * blockDim.x) {
+        dst[k] = src[k];
+    }
+}
+static bool ggml_cuda_d2h_kernel_on() {
+    static const bool on = getenv("GGML_CUDA_D2H_KERNEL") && atoi(getenv("GGML_CUDA_D2H_KERNEL")) != 0;
+    return on;
+}
+// returns true when the copy was enqueued as a kernel on the stream
+static bool ggml_cuda_d2h_kernel_copy(int device, cudaStream_t stream, void * host, const void * dev, size_t nbytes) {
+    if (!ggml_cuda_d2h_kernel_on() || nbytes == 0) {
+        return false;
+    }
+    void * hd = nullptr;
+    if (cudaHostGetDevicePointer(&hd, host, 0) != cudaSuccess || hd == nullptr) {
+        (void) cudaGetLastError();
+        return false;
+    }
+    ggml_cuda_set_device(device);
+    if ((nbytes % 4) == 0 && ((uintptr_t) dev % 4) == 0 && ((uintptr_t) hd % 4) == 0) {
+        const size_t nwords = nbytes / 4;
+        const int nblk = (int) std::min<size_t>(1024, (nwords + 2047) / 2048);
+        ggml_cuda_d2h_copy_words<<<nblk, 256, 0, stream>>>((const uint32_t *) dev, (uint32_t *) hd, nwords);
+    } else {
+        const int nblk = (int) std::min<size_t>(1024, (nbytes + 2047) / 2048);
+        ggml_cuda_d2h_copy_bytes<<<nblk, 256, 0, stream>>>((const uint8_t *) dev, (uint8_t *) hd, nbytes);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
+// copy src -> dst (either may be host-mapped), per-block partial hashes of the words copied
+static __global__ void ggml_cuda_ring_copy_kernel(const uint32_t * __restrict__ src, uint32_t * __restrict__ dst, size_t nwords, uint64_t * partial) {
+    uint64_t h = 0;
+    for (size_t k = blockIdx.x * (size_t) blockDim.x + threadIdx.x; k < nwords; k += (size_t) gridDim.x * blockDim.x) {
+        const uint32_t w = src[k];
+        dst[k] = w;
+        h += ggml_cuda_ring_mix(w, k);
+    }
+    h = ggml_cuda_ring_block_sum(h);
+    if (threadIdx.x == 0) { partial[blockIdx.x] = h; }
+}
+// producer finisher: reduce the partials and publish the trailer {seq, hash} after the data
+static __global__ void ggml_cuda_ring_push_fin(const uint64_t * partial, int nblk, uint64_t seq, volatile uint64_t * trailer) {
+    uint64_t h = 0;
+    for (int b = threadIdx.x; b < nblk; b += blockDim.x) { h += partial[b]; }
+    h = ggml_cuda_ring_block_sum(h);
+    if (threadIdx.x == 0) {
+        trailer[1] = h;
+        __threadfence_system();
+        trailer[0] = seq;
+        __threadfence_system();
+    }
+}
+// consumer finisher: compare with the trailer; on a mismatch re-pull the slot until seq and hash agree
+static __global__ void ggml_cuda_ring_pull_fin(const uint64_t * partial, int nblk, uint64_t seq, const volatile uint64_t * trailer,
+        const volatile uint32_t * slot, uint32_t * dst, size_t nwords, unsigned long long * stats) {
+    uint64_t h = 0;
+    for (int b = threadIdx.x; b < nblk; b += blockDim.x) { h += partial[b]; }
+    h = ggml_cuda_ring_block_sum(h);
+    __shared__ int ok;
+    if (threadIdx.x == 0) { ok = (trailer[0] == seq && trailer[1] == h); }
+    __syncthreads();
+    if (ok) { return; }
+    // slow path: the trailer or the data had not landed. Re-read everything from host memory until consistent.
+    unsigned long long tries = 0;
+    for (;;) {
+        __syncthreads();
+        if (threadIdx.x == 0) { ok = (trailer[0] == seq); }
+        __syncthreads();
+        if (ok) {
+            uint64_t hh = 0;
+            for (size_t k = threadIdx.x; k < nwords; k += blockDim.x) {
+                const uint32_t w = slot[k];
+                dst[k] = w;
+                hh += ggml_cuda_ring_mix(w, k);
+            }
+            hh = ggml_cuda_ring_block_sum(hh);
+            if (threadIdx.x == 0) { ok = (hh == trailer[1] && trailer[0] == seq); }
+            __syncthreads();
+            if (ok) { break; }
+        }
+        if (++tries > 2000000ull) { if (threadIdx.x == 0) { atomicAdd(stats + 2, 1ull); } break; }   // gave up (~seconds)
+    }
+    if (threadIdx.x == 0) { atomicAdd(stats + 0, 1ull); atomicAdd(stats + 1, tries); }
+}
+
+struct ggml_cuda_ring_pull_state {
+    uint64_t * partial_src[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES] = {};   // on the src device
+    uint64_t * partial_dst[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES] = {};   // on the dst device
+    unsigned long long * stats[GGML_CUDA_MAX_DEVICES] = {};                       // per dst device: [mismatches, spins, giveups]
+    uint64_t seq[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES] = {};
+    bool registered = false;
+};
+static ggml_cuda_ring_pull_state g_ring_pull;
+
+static void ggml_cuda_ring_pull_report() {
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+        if (!g_ring_pull.stats[d]) { continue; }
+        unsigned long long st[3] = {};
+        ggml_cuda_set_device(d);
+        cudaDeviceSynchronize();
+        cudaMemcpy(st, g_ring_pull.stats[d], sizeof(st), cudaMemcpyDeviceToHost);
+        GGML_LOG_WARN("ring pull dev%d: %llu validated-pull mismatches (re-read), %llu spins, %llu give-ups\n", d, st[0], st[1], st[2]);
+    }
+}
+
+static bool ggml_cuda_ring_pull_on() {
+    static const bool on = getenv("GGML_CUDA_STAGE_RING_PULL") && atoi(getenv("GGML_CUDA_STAGE_RING_PULL")) != 0;
+    return on;
+}
+
 static void ggml_cuda_cpy_host_staged(ggml_backend_cuda_context * ctx_src, ggml_backend_cuda_context * ctx_dst,
         void * dst, const void * src, const size_t nbytes) {
     static std::mutex mtx;
     static ggml_cuda_stage_ring rings[GGML_CUDA_MAX_DEVICES][GGML_CUDA_MAX_DEVICES];
     std::lock_guard<std::mutex> lock(mtx);
+    const bool pull = ggml_cuda_ring_pull_on();
+    const size_t slot_bytes = pull ? ((nbytes + 15) & ~(size_t) 15) + GGML_CUDA_RING_TRAILER : nbytes;
 
     // more slots let a source GPU run further ahead of its destination (rotating pipeline copies) before the host waits
     static const int n_slots = getenv("GGML_CUDA_STAGE_RING") ? std::max(1, std::min(ggml_cuda_stage_ring::N, atoi(getenv("GGML_CUDA_STAGE_RING")))) : 4;
@@ -2697,12 +2880,13 @@ static void ggml_cuda_cpy_host_staged(ggml_backend_cuda_context * ctx_src, ggml_
         CUDA_CHECK(cudaEventSynchronize(r.h2d_done[i]));   // slot i's previous H2D has consumed the buffer
         if (ht) { ggml_host_trace("ring_e", ctx_src->device, (int64_t) nbytes); }
     }
-    if (r.size[i] < nbytes) {
+    if (r.size[i] < slot_bytes) {
         if (r.buf[i]) {
             CUDA_CHECK(cudaFreeHost(r.buf[i]));
         }
-        CUDA_CHECK(cudaMallocHost(&r.buf[i], nbytes));
-        r.size[i] = nbytes;
+        CUDA_CHECK(cudaMallocHost(&r.buf[i], slot_bytes));
+        memset(r.buf[i], 0, slot_bytes);
+        r.size[i] = slot_bytes;
     }
     if (!r.d2h_done[i]) {
         ggml_cuda_set_device(ctx_src->device);
@@ -2710,15 +2894,175 @@ static void ggml_cuda_cpy_host_staged(ggml_backend_cuda_context * ctx_src, ggml_
         ggml_cuda_set_device(ctx_dst->device);
         CUDA_CHECK(cudaEventCreateWithFlags(&r.h2d_done[i], cudaEventDisableTiming));
     }
+    if (pull) {
+        const int sd = ctx_src->device, dd = ctx_dst->device;
+        const size_t nwords = (nbytes + 3) / 4;   // ggml buffers are 4-byte aligned and padded
+        const int nblk = (int) std::min<size_t>(1024, (nwords + 2047) / 2048);
+        if (!g_ring_pull.partial_src[sd][dd]) {
+            ggml_cuda_set_device(sd);
+            CUDA_CHECK(cudaMalloc(&g_ring_pull.partial_src[sd][dd], 1024 * sizeof(uint64_t)));
+            ggml_cuda_set_device(dd);
+            CUDA_CHECK(cudaMalloc(&g_ring_pull.partial_dst[sd][dd], 1024 * sizeof(uint64_t)));
+            if (!g_ring_pull.stats[dd]) {
+                CUDA_CHECK(cudaMalloc(&g_ring_pull.stats[dd], 3 * sizeof(unsigned long long)));
+                CUDA_CHECK(cudaMemset(g_ring_pull.stats[dd], 0, 3 * sizeof(unsigned long long)));
+            }
+            if (!g_ring_pull.registered) { g_ring_pull.registered = true; atexit(ggml_cuda_ring_pull_report); }
+            GGML_LOG_WARN("ring pull: validated host-staged copies %d -> %d (no SDMA)\n", sd, dd);
+        }
+        const uint64_t seq = ++g_ring_pull.seq[sd][dd];
+        const size_t tr_off = (nbytes + 15) & ~(size_t) 15;
+        // producer: copy into the host-mapped slot + trailer
+        ggml_cuda_set_device(sd);
+        void * slot_src = nullptr;
+        CUDA_CHECK(cudaHostGetDevicePointer(&slot_src, r.buf[i], 0));
+        ggml_cuda_ring_copy_kernel<<<nblk, 256, 0, ctx_src->stream()>>>((const uint32_t *) src, (uint32_t *) slot_src, nwords, g_ring_pull.partial_src[sd][dd]);
+        ggml_cuda_ring_push_fin<<<1, 256, 0, ctx_src->stream()>>>(g_ring_pull.partial_src[sd][dd], nblk, seq, (volatile uint64_t *) ((char *) slot_src + tr_off));
+        CUDA_CHECK(cudaEventRecord(r.d2h_done[i], ctx_src->stream()));
+        // consumer: pull + validate (the event keeps the fast path ordered; the finisher handles everything else)
+        ggml_cuda_set_device(dd);
+        void * slot_dst = nullptr;
+        CUDA_CHECK(cudaHostGetDevicePointer(&slot_dst, r.buf[i], 0));
+        CUDA_CHECK(cudaStreamWaitEvent(ctx_dst->stream(), r.d2h_done[i], 0));
+        ggml_cuda_ring_copy_kernel<<<nblk, 256, 0, ctx_dst->stream()>>>((const uint32_t *) slot_dst, (uint32_t *) dst, nwords, g_ring_pull.partial_dst[sd][dd]);
+        ggml_cuda_ring_pull_fin<<<1, 256, 0, ctx_dst->stream()>>>(g_ring_pull.partial_dst[sd][dd], nblk, seq, (const volatile uint64_t *) ((char *) slot_dst + tr_off),
+            (const volatile uint32_t *) slot_dst, (uint32_t *) dst, nwords, g_ring_pull.stats[dd]);
+        CUDA_CHECK(cudaEventRecord(r.h2d_done[i], ctx_dst->stream()));
+        r.used[i] = true;
+        ggml_cuda_set_device(sd);
+        return;
+    }
     ggml_cuda_set_device(ctx_src->device);
     CUDA_CHECK(cudaMemcpyAsync(r.buf[i], src, nbytes, cudaMemcpyDeviceToHost, ctx_src->stream()));
+    if (ggml_cuda_copy_fence_on()) {
+        ggml_cuda_copy_fence_kernel<<<1, 1, 0, ctx_src->stream()>>>();
+    }
     CUDA_CHECK(cudaEventRecord(r.d2h_done[i], ctx_src->stream()));
+    // GGML_CUDA_STAGE_RING_SYNC=1 (candidate fix, w47/w52): the host waits for the D2H to land before the H2D is even
+    // issued, instead of relying on the cross-device event (the consumer read the slot's previous content, 16 copies old)
+    static const int ring_sync = getenv("GGML_CUDA_STAGE_RING_SYNC") ? atoi(getenv("GGML_CUDA_STAGE_RING_SYNC")) : 0;
+    if (ring_sync & 1) {
+        CUDA_CHECK(cudaEventSynchronize(r.d2h_done[i]));
+    }
     ggml_cuda_set_device(ctx_dst->device);
     CUDA_CHECK(cudaStreamWaitEvent(ctx_dst->stream(), r.d2h_done[i], 0));
     CUDA_CHECK(cudaMemcpyAsync(dst, r.buf[i], nbytes, cudaMemcpyHostToDevice, ctx_dst->stream()));
+    if (ggml_cuda_copy_fence_on()) {
+        ggml_cuda_copy_fence_kernel<<<1, 1, 0, ctx_dst->stream()>>>();
+    }
     CUDA_CHECK(cudaEventRecord(r.h2d_done[i], ctx_dst->stream()));
     r.used[i] = true;
     ggml_cuda_set_device(ctx_src->device);
+}
+
+// D2H verification (GGML_CUDA_D2H_VERIFY=1, candidate fix for the stale logits / state readback, w52 BLIT256-7 and the
+// prod canary): every device->host tensor read gets a device-side {seq, hash} of the source (written to a pinned trailer
+// ring by a kernel on the same stream, before the copy); at the backend's synchronize the host hashes what it received
+// and, on a mismatch or a missing trailer, re-copies synchronously until the data agrees with the device hash (bounded).
+// Order-independent word-sum hash = ggml_backend_hash_bytes, so the CPU side uses that directly.
+#define GGML_CUDA_D2H_SLOTS 256
+struct ggml_cuda_d2h_state {
+    uint64_t * trailer_host = nullptr;   // pinned [slots][2] = {seq, hash}
+    uint64_t * trailer_dev  = nullptr;
+    uint64_t * partial      = nullptr;   // device [1024]
+    uint64_t   seq          = 0;
+    std::vector<ggml_cuda_d2h_pending> pending;
+    unsigned long long n_verified = 0, n_late_trailer = 0, n_mismatch = 0, n_recopy = 0, n_giveup = 0;
+};
+static ggml_cuda_d2h_state g_d2h[GGML_CUDA_MAX_DEVICES];
+
+static __global__ void ggml_cuda_d2h_hash_kernel(const uint32_t * __restrict__ src, size_t nwords, uint64_t * partial) {
+    uint64_t h = 0;
+    for (size_t k = blockIdx.x * (size_t) blockDim.x + threadIdx.x; k < nwords; k += (size_t) gridDim.x * blockDim.x) {
+        h += ggml_cuda_ring_mix(src[k], k);
+    }
+    h = ggml_cuda_ring_block_sum(h);
+    if (threadIdx.x == 0) { partial[blockIdx.x] = h; }
+}
+
+static bool ggml_cuda_d2h_verify_on() {
+    static const bool on = getenv("GGML_CUDA_D2H_VERIFY") && atoi(getenv("GGML_CUDA_D2H_VERIFY")) != 0;
+    return on;
+}
+
+static void ggml_cuda_d2h_report() {
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+        ggml_cuda_d2h_state & st = g_d2h[d];
+        if (st.n_verified == 0) { continue; }
+        GGML_LOG_WARN("d2h verify dev%d: %llu reads verified, %llu late trailers, %llu data mismatches, %llu re-copies, %llu give-ups\n",
+            d, st.n_verified, st.n_late_trailer, st.n_mismatch, st.n_recopy, st.n_giveup);
+    }
+}
+
+// enqueue the device hash of [dev, nbytes) on the stream (before the D2H copy that follows it); returns the pending record
+static bool ggml_cuda_d2h_begin(int device, cudaStream_t stream, void * host, const void * dev, size_t nbytes, ggml_cuda_d2h_pending & rec) {
+    if (!ggml_cuda_d2h_verify_on() || nbytes == 0 || (nbytes % 4) != 0 || ((uintptr_t) dev % 4) != 0) {
+        return false;
+    }
+    ggml_cuda_d2h_state & st = g_d2h[device];
+    if (!st.trailer_host) {
+        ggml_cuda_set_device(device);
+        CUDA_CHECK(cudaMallocHost((void **) &st.trailer_host, GGML_CUDA_D2H_SLOTS * 2 * sizeof(uint64_t)));
+        memset(st.trailer_host, 0, GGML_CUDA_D2H_SLOTS * 2 * sizeof(uint64_t));
+        CUDA_CHECK(cudaHostGetDevicePointer((void **) &st.trailer_dev, st.trailer_host, 0));
+        CUDA_CHECK(cudaMalloc(&st.partial, 1024 * sizeof(uint64_t)));
+        static bool registered = false;
+        if (!registered) { registered = true; atexit(ggml_cuda_d2h_report); }
+        GGML_LOG_WARN("d2h verify dev%d: enabled\n", device);
+    }
+    const size_t nwords = nbytes / 4;
+    const int nblk = (int) std::min<size_t>(1024, (nwords + 2047) / 2048);
+    const uint64_t seq = ++st.seq;
+    const int slot = (int) (seq % GGML_CUDA_D2H_SLOTS);
+    ggml_cuda_set_device(device);
+    ggml_cuda_d2h_hash_kernel<<<nblk, 256, 0, stream>>>((const uint32_t *) dev, nwords, st.partial);
+    ggml_cuda_ring_push_fin<<<1, 256, 0, stream>>>(st.partial, nblk, seq, (volatile uint64_t *) (st.trailer_dev + 2 * slot));
+    CUDA_CHECK(cudaGetLastError());
+    rec = { host, dev, nbytes, seq, slot };
+    return true;
+}
+
+// host side, after the stream is synchronized: wait for the trailer, compare, re-copy on mismatch
+static void ggml_cuda_d2h_verify(int device, const ggml_cuda_d2h_pending & rec) {
+    ggml_cuda_d2h_state & st = g_d2h[device];
+    ggml_cuda_set_device(device);   // the re-copies below must run against this device's address space
+    volatile uint64_t * tr = st.trailer_host + 2 * rec.slot;
+    st.n_verified++;
+    // the trailer itself is a device->host write and may land late: spin briefly
+    int spins = 0;
+    while (tr[0] != rec.seq && spins < 200000) { spins++; }
+    if (spins) { st.n_late_trailer++; }
+    if (tr[0] != rec.seq) {
+        // never landed: fetch the device-side partials and reduce on the host instead
+        std::vector<uint64_t> part(1024);
+        CUDA_CHECK(cudaMemcpy(part.data(), st.partial, 1024 * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+        const size_t nwords = rec.nbytes / 4;
+        const int nblk = (int) std::min<size_t>(1024, (nwords + 2047) / 2048);
+        uint64_t h = 0;
+        for (int b = 0; b < nblk; ++b) { h += part[b]; }
+        tr[1] = h; tr[0] = rec.seq;
+        st.n_giveup++;
+    }
+    const uint64_t want = tr[1];
+    for (int t = 0; t < 20; ++t) {
+        const uint64_t got = ggml_backend_hash_bytes(rec.host, rec.nbytes);
+        if (got == want) { return; }
+        if (t == 0) { st.n_mismatch++; }
+        st.n_recopy++;
+        CUDA_CHECK(cudaMemcpy(rec.host, rec.dev, rec.nbytes, cudaMemcpyDeviceToHost));
+    }
+    st.n_giveup++;
+}
+
+static void ggml_cuda_d2h_push(int device, const ggml_cuda_d2h_pending & rec) { g_d2h[device].pending.push_back(rec); }
+static bool ggml_cuda_d2h_has_pending(int device) { return !g_d2h[device].pending.empty(); }
+
+static void ggml_cuda_d2h_flush(int device) {
+    ggml_cuda_d2h_state & st = g_d2h[device];
+    for (const auto & rec : st.pending) {
+        ggml_cuda_d2h_verify(device, rec);
+    }
+    st.pending.clear();
 }
 
 static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_backend_t backend_dst, const ggml_tensor * src, ggml_tensor * dst) {
@@ -2767,6 +3111,10 @@ static bool ggml_backend_cuda_cpy_tensor_async(ggml_backend_t backend_src, ggml_
 #endif // GGML_CUDA_NO_PEER_COPY
         }
 
+        if (ggml_cuda_copy_fence_on()) {
+            ggml_cuda_set_device(cuda_ctx_src->device);
+            ggml_cuda_copy_fence_kernel<<<1, 1, 0, cuda_ctx_src->stream()>>>();
+        }
         // record event on src stream after the copy
         if (!cuda_ctx_src->copy_event) {
             ggml_cuda_set_device(cuda_ctx_src->device);
@@ -2788,6 +3136,9 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *)backend->context;
 
     CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    if (ggml_cuda_d2h_has_pending(cuda_ctx->device)) {
+        ggml_cuda_d2h_flush(cuda_ctx->device);
+    }
 
     GGML_UNUSED(backend);
 }
@@ -2815,7 +3166,10 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
     // where graphs pay (GLM-5.3-Flash prefill 497 vs 408 t/s on rune); the partial last ubatch of a prompt, whose row
     // count is arbitrary and which is what makes the cache thrash, still runs eagerly.
     static const int64_t full_batch = getenv("GGML_CUDA_GRAPH_FULL_BATCH") ? atoll(getenv("GGML_CUDA_GRAPH_FULL_BATCH")) : 0;
-    if (max_batch > 0) {
+    // GGML_CUDA_GRAPH_MIN_BATCH=<rows>: batches with fewer rows run eagerly (bisection aid / mitigation: with
+    // MIN_BATCH=FULL_BATCH only the full prompt ubatches stay graphed and decode-shaped batches never replay)
+    static const int64_t min_batch = getenv("GGML_CUDA_GRAPH_MIN_BATCH") ? atoll(getenv("GGML_CUDA_GRAPH_MIN_BATCH")) : 0;
+    if (max_batch > 0 || min_batch > 0) {
         int64_t batch = 0;
         for (int i = 0; i < cgraph->n_nodes; i++) {
             const ggml_tensor * node = cgraph->nodes[i];
@@ -2824,7 +3178,10 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
                 batch = std::max(batch, node->op == GGML_OP_MUL_MAT ? node->src[1]->ne[1] : node->src[1]->ne[2]);
             }
         }
-        if (batch > max_batch && !(full_batch > 0 && batch == full_batch)) {
+        if (batch < min_batch) {
+            return false;
+        }
+        if (max_batch > 0 && batch > max_batch && !(full_batch > 0 && batch == full_batch)) {
             static bool logged = false;
             if (!logged) {
                 logged = true;
@@ -3007,6 +3364,13 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
 
 static void ggml_cuda_graph_update_executable(ggml_backend_cuda_context * cuda_ctx, const void * graph_key) {
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
+
+    // GGML_CUDA_GRAPH_SYNC_UPDATE=1: wait for the stream before updating / re-instantiating an exec that an earlier
+    // launch may still be using (the pipeline lets the host run n_copies ubatches ahead) - bisection aid
+    static const bool sync_update = getenv("GGML_CUDA_GRAPH_SYNC_UPDATE") && atoi(getenv("GGML_CUDA_GRAPH_SYNC_UPDATE")) != 0;
+    if (sync_update) {
+        CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+    }
 
 #if CUDART_VERSION >= 12000
     cudaGraphExecUpdateResultInfo result_info;
@@ -5348,6 +5712,135 @@ static int ggml_cuda_try_fuse(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph 
     return 0;
 }
 
+static __global__ void ggml_cuda_graph_fence_kernel() {}
+
+// In-graph per-node output hashing (GGML_CUDA_NODE_HASH=<device bitmask>, GGML_CUDA_NODE_HASH_FILE=<path prefix>): a tiny
+// hash kernel after every computed node, captured into the graph like any other kernel, writes the node's output hash into a
+// device log indexed by a device-side execution counter (bumped by a captured kernel at the start of every execution). The
+// log is dumped at exit (<prefix>.dev<d>.bin: u64 [slots][max_n], <prefix>.dev<d>.names: node names per n_nodes layout, and
+// the host-side execution list). Lets a replay that produced a different output be bisected to the first divergent node.
+#define GGML_CUDA_NODE_HASH_MAX_N 1024
+#define GGML_CUDA_NODE_HASH_SLOTS 8448
+struct ggml_cuda_node_hash_state {
+    uint64_t * log = nullptr;   // device [slots][max_n]
+    uint32_t * ctr = nullptr;   // device execution counter
+    int64_t    host_execs = 0;                          // device executions issued by the host (eager runs + replays)
+    std::vector<std::array<int64_t, 3>> exec_layout;    // (exec index, n_nodes, kind 0 replay / 2 eager)
+    std::map<int, std::vector<std::string>> names;      // n_nodes -> node names
+};
+static ggml_cuda_node_hash_state g_node_hash[GGML_CUDA_MAX_DEVICES];
+
+static __global__ void ggml_cuda_node_hash_bump(uint32_t * ctr) {
+    if (threadIdx.x == 0) { *ctr += 1; }
+}
+static __global__ void ggml_cuda_node_hash_kernel(const uint8_t * p, unsigned long long nbytes, uint64_t * log, const uint32_t * ctr, int idx) {
+    const unsigned long long nw = (nbytes + 3) / 4;
+    uint64_t h = 0;
+    for (unsigned long long k = threadIdx.x; k < nw; k += blockDim.x) {
+        const unsigned long long rem = nbytes - 4*k;
+        uint32_t w = 0;
+        const int nb = rem >= 4 ? 4 : (int) rem;
+        for (int b = 0; b < nb; ++b) { w |= (uint32_t) p[4*k + b] << (8*b); }
+        uint64_t x = (uint64_t) w * 0x9E3779B97F4A7C15ull + (uint64_t) k * 0xC2B2AE3D27D4EB4Full;
+        x ^= x >> 31; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 29;
+        h += x;
+    }
+    __shared__ uint64_t sh[256];
+    sh[threadIdx.x] = h;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if ((int) threadIdx.x < s) { sh[threadIdx.x] += sh[threadIdx.x + s]; }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) {
+        const uint32_t slot = *ctr % GGML_CUDA_NODE_HASH_SLOTS;
+        log[(size_t) slot * GGML_CUDA_NODE_HASH_MAX_N + idx] = sh[0];
+    }
+}
+
+static long long ggml_cuda_node_hash_mask() {
+    static const long long m = getenv("GGML_CUDA_NODE_HASH") ? strtoll(getenv("GGML_CUDA_NODE_HASH"), nullptr, 0) : 0;
+    return m;
+}
+
+static void ggml_cuda_node_hash_dump() {
+    const char * prefix = getenv("GGML_CUDA_NODE_HASH_FILE");
+    if (!prefix) { return; }
+    for (int d = 0; d < GGML_CUDA_MAX_DEVICES; ++d) {
+        ggml_cuda_node_hash_state & st = g_node_hash[d];
+        if (!st.log) { continue; }
+        ggml_cuda_set_device(d);
+        CUDA_CHECK(cudaDeviceSynchronize());
+        const size_t n = (size_t) GGML_CUDA_NODE_HASH_SLOTS * GGML_CUDA_NODE_HASH_MAX_N;
+        std::vector<uint64_t> h(n);
+        CUDA_CHECK(cudaMemcpy(h.data(), st.log, n * sizeof(uint64_t), cudaMemcpyDeviceToHost));
+        uint32_t ctr = 0;
+        CUDA_CHECK(cudaMemcpy(&ctr, st.ctr, sizeof(ctr), cudaMemcpyDeviceToHost));
+        char path[1024];
+        snprintf(path, sizeof(path), "%s.dev%d.bin", prefix, d);
+        FILE * f = fopen(path, "wb");
+        if (f) { fwrite(h.data(), sizeof(uint64_t), n, f); fclose(f); }
+        snprintf(path, sizeof(path), "%s.dev%d.names", prefix, d);
+        f = fopen(path, "w");
+        if (f) {
+            fprintf(f, "device_ctr %u host_execs %lld slots %d max_n %d\n", ctr, (long long) st.host_execs, GGML_CUDA_NODE_HASH_SLOTS, GGML_CUDA_NODE_HASH_MAX_N);
+            for (auto & kv : st.names) {
+                fprintf(f, "L %d", kv.first);
+                for (auto & nm : kv.second) { fprintf(f, " %s", nm.c_str()); }
+                fprintf(f, "\n");
+            }
+            for (auto & e : st.exec_layout) { fprintf(f, "E %lld %lld %lld\n", (long long) e[0], (long long) e[1], (long long) e[2]); }
+            fclose(f);
+        }
+        GGML_LOG_WARN("node hash dev%d: device ctr %u, host execs %lld, dumped to %s.dev%d.*\n", d, ctr, (long long) st.host_execs, prefix, d);
+    }
+}
+
+// called once per graph execution (eager or capture) before node 0; returns true when this device hashes nodes
+static bool ggml_cuda_node_hash_begin(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
+    const int d = cuda_ctx->device;
+    if (!((ggml_cuda_node_hash_mask() >> d) & 1)) { return false; }
+    ggml_cuda_node_hash_state & st = g_node_hash[d];
+    if (!st.log) {
+        const size_t n = (size_t) GGML_CUDA_NODE_HASH_SLOTS * GGML_CUDA_NODE_HASH_MAX_N;
+        CUDA_CHECK(cudaMalloc(&st.log, n * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMemset(st.log, 0, n * sizeof(uint64_t)));
+        CUDA_CHECK(cudaMalloc(&st.ctr, sizeof(uint32_t)));
+        CUDA_CHECK(cudaMemset(st.ctr, 0, sizeof(uint32_t)));
+        static bool registered = false;
+        if (!registered) { registered = true; atexit(ggml_cuda_node_hash_dump); }
+        GGML_LOG_WARN("node hash dev%d: enabled (%d slots x %d nodes)\n", d, GGML_CUDA_NODE_HASH_SLOTS, GGML_CUDA_NODE_HASH_MAX_N);
+    }
+    if (st.names.find(cgraph->n_nodes) == st.names.end()) {
+        std::vector<std::string> v;
+        for (int i = 0; i < cgraph->n_nodes; ++i) {
+            char buf[160];
+            snprintf(buf, sizeof(buf), "%s:%s[%lld,%lld,%lld,%lld]", ggml_op_name(cgraph->nodes[i]->op), cgraph->nodes[i]->name,
+                (long long) cgraph->nodes[i]->ne[0], (long long) cgraph->nodes[i]->ne[1], (long long) cgraph->nodes[i]->ne[2], (long long) cgraph->nodes[i]->ne[3]);
+            for (char * c = buf; *c; ++c) { if (*c == ' ') { *c = '_'; } }
+            v.push_back(buf);
+        }
+        st.names[cgraph->n_nodes] = v;
+    }
+    ggml_cuda_node_hash_bump<<<1, 1, 0, cuda_ctx->stream()>>>(st.ctr);
+    return true;
+}
+
+// called once per ggml_backend_cuda_graph_compute_impl: kind 0 = replayed instance, 1 = captured (no execution), 2 = eager
+static void ggml_cuda_node_hash_record(ggml_backend_cuda_context * cuda_ctx, const ggml_cgraph * cgraph, int kind) {
+    const int d = cuda_ctx->device;
+    if (!((ggml_cuda_node_hash_mask() >> d) & 1) || kind == 1) { return; }
+    ggml_cuda_node_hash_state & st = g_node_hash[d];
+    st.exec_layout.push_back({st.host_execs, (int64_t) cgraph->n_nodes, (int64_t) kind});
+    st.host_execs++;
+}
+
+static void ggml_cuda_node_hash_node(ggml_backend_cuda_context * cuda_ctx, const ggml_tensor * node, int idx) {
+    if (idx >= GGML_CUDA_NODE_HASH_MAX_N || node->data == nullptr) { return; }
+    ggml_cuda_node_hash_state & st = g_node_hash[cuda_ctx->device];
+    ggml_cuda_node_hash_kernel<<<1, 256, 0, cuda_ctx->stream()>>>((const uint8_t *) node->data, ggml_nbytes(node), st.log, st.ctr, idx);
+}
+
 static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph, const bool use_cuda_graph_in, const bool cuda_graph_update_required, const void * graph_key) {
     bool graph_evaluated_or_captured = false;
     bool use_cuda_graph = use_cuda_graph_in;
@@ -5447,6 +5940,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 stream_ctx.concurrent_events.clear();
             }
 
+            const bool node_hash = ggml_cuda_node_hash_begin(cuda_ctx, cgraph);
             for (int i = 0; i < cgraph->n_nodes; i++) {
                 ggml_tensor * node = cgraph->nodes[i];
                 if (is_concurrent_event_active) {
@@ -5499,6 +5993,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                             ggml_op_name(cgraph->nodes[last_fused]->op), cgraph->nodes[last_fused]->name);
 #endif
                     i += nodes_to_skip;
+                    if (node_hash) { ggml_cuda_node_hash_node(cuda_ctx, cgraph->nodes[i], i); }
                     continue;
                 }
 #ifndef NDEBUG
@@ -5523,6 +6018,7 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                     GGML_LOG_ERROR("%s: op not supported %s (%s)\n", __func__, node->name, ggml_op_name(node->op));
                 }
                 GGML_ASSERT(ok);
+                if (node_hash) { ggml_cuda_node_hash_node(cuda_ctx, node, i); }
 
                 if (!is_concurrent_event_active) {
                     try_launch_concurrent_event(node);
@@ -5577,8 +6073,30 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
         if (cuda_graph_update_required) { // Update graph executable
             ggml_cuda_graph_update_executable(cuda_ctx, graph_key);
         }
+        // GGML_CUDA_GRAPH_SYNC_LAUNCH=<device bitmask> (bisection aid): wait for the stream before and after each graph
+        // launch on those devices, so a replay neither overlaps earlier queued work nor lets the host run ahead of it
+        // GGML_CUDA_GRAPH_SYNC_LAUNCH_MODE: bit 0 = before the launch, bit 1 = after it (default 3 = both)
+        static const long long sync_launch = getenv("GGML_CUDA_GRAPH_SYNC_LAUNCH") ? strtoll(getenv("GGML_CUDA_GRAPH_SYNC_LAUNCH"), nullptr, 0) : 0;
+        static const int sync_mode = getenv("GGML_CUDA_GRAPH_SYNC_LAUNCH_MODE") ? atoi(getenv("GGML_CUDA_GRAPH_SYNC_LAUNCH_MODE")) : 3;
+        const bool sl = (sync_launch >> cuda_ctx->device) & 1;
+        if (sl && (sync_mode & 1)) {
+            CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        }
+        // GGML_CUDA_GRAPH_FENCE: bit 0 = an empty kernel before the graph launch, bit 1 = after it. Candidate fix for
+        // ROCm ordering an SDMA copy and a graph replay on one stream incorrectly (w40: HSA_ENABLE_SDMA=0 cures the
+        // graph-on flips but costs 77 % of prefill); ordinary kernels and SDMA copies are ordered correctly
+        static const int graph_fence = getenv("GGML_CUDA_GRAPH_FENCE") ? atoi(getenv("GGML_CUDA_GRAPH_FENCE")) : 0;
+        if (graph_fence & 1) {
+            ggml_cuda_graph_fence_kernel<<<1, 1, 0, cuda_ctx->stream()>>>();
+        }
         // Launch graph
         CUDA_CHECK(cudaGraphLaunch(graph->instance, cuda_ctx->stream()));
+        if (graph_fence & 2) {
+            ggml_cuda_graph_fence_kernel<<<1, 1, 0, cuda_ctx->stream()>>>();
+        }
+        if (sl && (sync_mode & 2)) {
+            CUDA_CHECK(cudaStreamSynchronize(cuda_ctx->stream()));
+        }
 #else
         GGML_UNUSED(graph_key);
         graph_evaluated_or_captured = true;
@@ -5603,7 +6121,29 @@ static bool ggml_cuda_graph_set_enabled(ggml_backend_cuda_context * cuda_ctx, co
 }
 #endif // USE_CUDA_GRAPH
 
+static enum ggml_status ggml_backend_cuda_graph_compute_impl(ggml_backend_t backend, ggml_cgraph * cgraph, bool allow_graph);
+
+// GGML_CUDA_GRAPH_SPLIT_AT=<node> (bisection aid): on device GGML_CUDA_GRAPH_SPLIT_DEV (default 0), evaluate a graph with
+// more nodes than that as two views [0, node) and [node, n); GGML_CUDA_GRAPH_SPLIT_GRAPHED=0 (default) keeps the first
+// view on HIP graphs and runs the second eagerly, =1 the reverse. Pick a layer boundary: fusion does not cross views.
 static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, ggml_cgraph * cgraph) {
+    ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
+    static const int split_at  = getenv("GGML_CUDA_GRAPH_SPLIT_AT")      ? atoi(getenv("GGML_CUDA_GRAPH_SPLIT_AT"))      : 0;
+    static const int split_dev = getenv("GGML_CUDA_GRAPH_SPLIT_DEV")     ? atoi(getenv("GGML_CUDA_GRAPH_SPLIT_DEV"))     : 0;
+    static const int graphed   = getenv("GGML_CUDA_GRAPH_SPLIT_GRAPHED") ? atoi(getenv("GGML_CUDA_GRAPH_SPLIT_GRAPHED")) : 0;
+    if (split_at > 0 && cuda_ctx->device == split_dev && cgraph->n_nodes > split_at) {
+        ggml_cgraph a = ggml_graph_view(cgraph, 0, split_at);
+        ggml_cgraph b = ggml_graph_view(cgraph, split_at, cgraph->n_nodes);
+        enum ggml_status st = ggml_backend_cuda_graph_compute_impl(backend, &a, graphed == 0);
+        if (st != GGML_STATUS_SUCCESS) {
+            return st;
+        }
+        return ggml_backend_cuda_graph_compute_impl(backend, &b, graphed == 1);
+    }
+    return ggml_backend_cuda_graph_compute_impl(backend, cgraph, true);
+}
+
+static enum ggml_status ggml_backend_cuda_graph_compute_impl(ggml_backend_t backend, ggml_cgraph * cgraph, bool allow_graph) {
     ggml_backend_cuda_context * cuda_ctx = (ggml_backend_cuda_context *) backend->context;
 
     ggml_cuda_set_device(cuda_ctx->device);
@@ -5619,7 +6159,9 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
     ggml_cuda_graph_set_enabled(cuda_ctx, graph_key);
 
     ggml_cuda_graph * graph = cuda_ctx->cuda_graph(graph_key);
-    if (graph->is_enabled()) {
+    // GGML_CUDA_GRAPH_DEVICES=<bitmask of device indices>: graphs only on those devices (bisection aid)
+    static const long long graph_devices = getenv("GGML_CUDA_GRAPH_DEVICES") ? strtoll(getenv("GGML_CUDA_GRAPH_DEVICES"), nullptr, 0) : -1;
+    if (allow_graph && graph->is_enabled() && ((graph_devices >> cuda_ctx->device) & 1)) {
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
@@ -5685,6 +6227,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         // 0 = replayed instance, 1 = (re)captured, 2 = eager (warmup / not graph-compatible)
         ggml_host_trace("g_kind", cuda_ctx->device, !use_cuda_graph ? 2 : (cuda_graph_update_required ? 1 : 0));
     }
+    ggml_cuda_node_hash_record(cuda_ctx, cgraph, !use_cuda_graph ? 2 : (cuda_graph_update_required ? 1 : 0));
     if (graph_stats) {
         const int kind = !use_cuda_graph ? 2 : (cuda_graph_update_required ? 1 : 0);
         const int d = cuda_ctx->device;
@@ -7006,11 +7549,60 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
     return &reg;
 }
 
+// Split I/O hash trace hook (GGML_SCHED_HASH_TRACE, see ggml-backend.h): one block per tensor, same function as
+// ggml_backend_hash_bytes (an order-independent sum of mixed 32-bit words, so the block reduction order is free).
+#define GGML_CUDA_HASH_MAX_T 64
+struct ggml_cuda_hash_desc { const uint8_t * ptr[GGML_CUDA_HASH_MAX_T]; unsigned long long nbytes[GGML_CUDA_HASH_MAX_T]; };
+
+static __global__ void ggml_cuda_hash_kernel(ggml_cuda_hash_desc d, uint64_t * out) {
+    const uint8_t * p = d.ptr[blockIdx.x];
+    const unsigned long long nbytes = d.nbytes[blockIdx.x];
+    const unsigned long long nw = (nbytes + 3) / 4;
+    uint64_t h = 0;
+    for (unsigned long long k = threadIdx.x; k < nw; k += blockDim.x) {
+        const unsigned long long rem = nbytes - 4*k;
+        uint32_t w = 0;
+        const int nb = rem >= 4 ? 4 : (int) rem;
+        for (int b = 0; b < nb; ++b) { w |= (uint32_t) p[4*k + b] << (8*b); }
+        uint64_t x = (uint64_t) w * 0x9E3779B97F4A7C15ull + (uint64_t) k * 0xC2B2AE3D27D4EB4Full;
+        x ^= x >> 31; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 29;
+        h += x;
+    }
+    __shared__ uint64_t sh[256];
+    sh[threadIdx.x] = h;
+    __syncthreads();
+    for (int s = 128; s > 0; s >>= 1) {
+        if ((int) threadIdx.x < s) { sh[threadIdx.x] += sh[threadIdx.x + s]; }
+        __syncthreads();
+    }
+    if (threadIdx.x == 0) { out[blockIdx.x] = sh[0]; }
+}
+
+static bool ggml_backend_cuda_hash_hook(ggml_backend_t backend, const ggml_tensor ** tensors, int n, uint64_t * out_host) {
+    if (!ggml_backend_is_cuda(backend) || n <= 0) {
+        return false;
+    }
+    ggml_backend_cuda_context * ctx = (ggml_backend_cuda_context *) backend->context;
+    ggml_cuda_set_device(ctx->device);
+    ggml_cuda_hash_desc d = {};
+    n = std::min(n, GGML_CUDA_HASH_MAX_T);
+    for (int i = 0; i < n; ++i) {
+        d.ptr[i]    = (const uint8_t *) tensors[i]->data;
+        d.nbytes[i] = ggml_nbytes(tensors[i]);
+    }
+    void * out_dev = nullptr;
+    CUDA_CHECK(cudaHostGetDevicePointer(&out_dev, out_host, 0));
+    ggml_cuda_hash_kernel<<<n, 256, 0, ctx->stream()>>>(d, (uint64_t *) out_dev);
+    CUDA_CHECK(cudaGetLastError());
+    return true;
+}
+
 ggml_backend_t ggml_backend_cuda_init(int device) {
     if (device < 0 || device >= ggml_backend_cuda_get_device_count()) {
         GGML_LOG_ERROR("%s: invalid device %d\n", __func__, device);
         return nullptr;
     }
+    ggml_backend_set_hash_hook(ggml_backend_cuda_hash_hook);
 
     ggml_backend_cuda_context * ctx = new ggml_backend_cuda_context(device);
     if (ctx == nullptr) {

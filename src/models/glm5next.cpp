@@ -448,7 +448,15 @@ ggml_tensor * llama_model_glm5next::graph::build_indexer(
         // pool_k stays f32 so the kernel takes its f32 path; f16 wmma would undo the prec
         ggml_tensor * pool_kf = ggml_reshape_4d(ctx0, pool_k, d_idx, 1, n_pools, n_stream);
 
-        pool_score = ggml_lightning_indexer(ctx0, iq, pool_kf, w, inp_kp->pool_bias_f16);
+        // LLAMA_KPOOL_BIAS_F16_LOCAL=1 (bisection aid): cast the pool bias in this layer instead of using the shared cast,
+        // which lives on the first indexer layer's device and is copied to every pipeline stage (same values)
+        static const bool bias_local = getenv("LLAMA_KPOOL_BIAS_F16_LOCAL") && atoi(getenv("LLAMA_KPOOL_BIAS_F16_LOCAL")) != 0;
+        ggml_tensor * bias_f16 = inp_kp->pool_bias_f16;
+        if (bias_local) {
+            const ggml_tensor * pb = inp_kp->pool_bias;
+            bias_f16 = ggml_cast(ctx0, ggml_reshape_4d(ctx0, inp_kp->pool_bias, pb->ne[0], pb->ne[1], 1, pb->ne[2]), GGML_TYPE_F16);
+        }
+        pool_score = ggml_lightning_indexer(ctx0, iq, pool_kf, w, bias_f16);
         cb(pool_score, "indexer_pool_score", il);
 
         res->add_fused_node({LLM_FUSED_OP_LIGHTNING_INDEXER, pool_score, il});

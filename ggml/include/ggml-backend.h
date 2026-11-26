@@ -439,6 +439,14 @@ extern "C" {
     GGML_API bool ggml_host_trace_on(void);
     GGML_API void ggml_host_trace(const char * tag, int64_t a, int64_t b);
 
+    // Split I/O hash trace (diagnostics, rune graph-flip bisect): GGML_SCHED_HASH_TRACE=<path>. The scheduler hashes every
+    // split's input copies on the split backend's stream right before the launch and its outputs right after it, plus
+    // a CPU hash of each user input as copied; one record per ubatch. A backend provides the device hash kernel via the
+    // hook (it must enqueue on its compute stream and write n 64-bit hashes to out, a pinned host buffer).
+    typedef bool (*ggml_backend_hash_hook_t)(ggml_backend_t backend, const struct ggml_tensor ** tensors, int n, uint64_t * out);
+    GGML_API void     ggml_backend_set_hash_hook(ggml_backend_hash_hook_t fn);
+    GGML_API uint64_t ggml_backend_hash_bytes(const void * data, size_t nbytes);   // the reference (CPU) hash
+
 #ifdef  __cplusplus
 }
 #endif

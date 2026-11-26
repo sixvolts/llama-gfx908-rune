@@ -1778,9 +1778,181 @@ static const void * ggml_backend_sched_stage_input(ggml_backend_sched_t sched, c
     return ggml_backend_buffer_get_base(st->buf[c]);
 }
 
+// ---- split I/O hash trace (GGML_SCHED_HASH_TRACE=<path>, rune graph-flip diagnostics) ---------------------------------
+static ggml_backend_hash_hook_t g_sched_hash_hook = nullptr;
+
+void ggml_backend_set_hash_hook(ggml_backend_hash_hook_t fn) {
+    g_sched_hash_hook = fn;
+}
+
+uint64_t ggml_backend_hash_bytes(const void * data, size_t nbytes) {
+    const uint8_t * p = (const uint8_t *) data;
+    const uint64_t nw = (nbytes + 3) / 4;
+    uint64_t h = 0;
+    for (uint64_t k = 0; k < nw; ++k) {
+        const size_t rem = nbytes - 4*k;
+        uint32_t w = 0;
+        memcpy(&w, p + 4*k, rem >= 4 ? 4 : rem);
+        uint64_t x = (uint64_t) w * 0x9E3779B97F4A7C15ull + k * 0xC2B2AE3D27D4EB4Full;
+        x ^= x >> 31; x *= 0xBF58476D1CE4E5B9ull; x ^= x >> 29;
+        h += x;
+    }
+    return h;
+}
+
+#define GGML_SCHED_HT_MAX_T  64
+#define GGML_SCHED_HT_SLOTS  64
+#define GGML_SCHED_HT_SPLITS 16
+struct ggml_sched_hash_trace {
+    FILE *     f    = nullptr;
+    uint64_t * base = nullptr;                  // pinned: [slot][split][kind: 0 in(dev) 1 in(cpu) 2 out(dev)][t]
+    uintptr_t  layout_sig = 0;                  // header rewritten when the split layout changes
+    std::vector<std::vector<ggml_tensor *>> outs;   // per split: tensors consumed by later splits
+    bool       pending = false;                 // a record of gen-1 waits to be written
+    uint8_t    n_in [GGML_SCHED_HT_SLOTS][GGML_SCHED_HT_SPLITS] = {};   // entries used per record (0-byte tensors hash to 0)
+    uint8_t    n_out[GGML_SCHED_HT_SLOTS][GGML_SCHED_HT_SPLITS] = {};
+    uint64_t   last_gen = 0;
+    int        last_n_splits = 0;
+    int        n_splits_of[GGML_SCHED_HT_SLOTS] = {};
+    static size_t idx(uint64_t gen, int split, int kind, int t) {
+        return (((gen % GGML_SCHED_HT_SLOTS) * GGML_SCHED_HT_SPLITS + split) * 3 + kind) * GGML_SCHED_HT_MAX_T + t;
+    }
+};
+
+static ggml_sched_hash_trace * ggml_sched_hash_trace_get(ggml_backend_sched_t sched) {
+    // one scheduler per process is traced (the first to compute, i.e. the server's target context); others are ignored
+    // (GGML_SCHED_HASH_TRACE_SCHED=<n> traces the n-th distinct scheduler seen instead)
+    // every scheduler with >= GGML_SCHED_HASH_TRACE_MINNB backends (default 3: the server's target context, also after
+    // it re-creates its scheduler; the 2-backend MTP drafter is skipped) writes to the one trace file
+    static const int min_nb = getenv("GGML_SCHED_HASH_TRACE_MINNB") ? atoi(getenv("GGML_SCHED_HASH_TRACE_MINNB")) : 3;
+    static ggml_backend_sched_t last_sched = nullptr;
+    if (sched->n_backends < min_nb) {
+        return nullptr;
+    }
+    if (sched != last_sched) {
+        GGML_LOG_WARN("hash trace: scheduler %p (%d backends)\n", (void *) sched, sched->n_backends);
+        last_sched = sched;
+    }
+    static ggml_sched_hash_trace * ht = [sched] () -> ggml_sched_hash_trace * {
+        const char * p = getenv("GGML_SCHED_HASH_TRACE");
+        if (!p || !*p || g_sched_hash_hook == nullptr) {
+            return nullptr;
+        }
+        ggml_sched_hash_trace * t = new ggml_sched_hash_trace();
+        t->f = fopen(p, "w");
+        if (!t->f) {
+            return nullptr;
+        }
+        const size_t n = (size_t) GGML_SCHED_HT_SLOTS * GGML_SCHED_HT_SPLITS * 3 * GGML_SCHED_HT_MAX_T;
+        ggml_backend_buffer_type_t buft = ggml_backend_dev_host_buffer_type(ggml_backend_get_device(sched->backends[0]));
+        ggml_backend_buffer_t buf = buft ? ggml_backend_buft_alloc_buffer(buft, n * sizeof(uint64_t)) : nullptr;
+        if (!buf) {
+            GGML_LOG_WARN("hash trace: no pinned host buffer, disabled\n");
+            return nullptr;
+        }
+        t->base = (uint64_t *) ggml_backend_buffer_get_base(buf);
+        memset(t->base, 0, n * sizeof(uint64_t));
+        GGML_LOG_WARN("hash trace: writing split I/O hashes to %s\n", p);
+        return t;
+    }();
+    return ht;
+}
+
+// rebuild the per-split output lists and write a header when the split layout changes
+static void ggml_sched_hash_trace_layout(ggml_backend_sched_t sched, ggml_sched_hash_trace * ht, uint64_t gen) {
+    uintptr_t sig = (uintptr_t) sched->n_splits * 7919;
+    for (int s = 0; s < sched->n_splits; ++s) {
+        sig = sig * 1000003 + (uintptr_t) sched->splits[s].n_inputs;
+        for (int i = 0; i < sched->splits[s].n_inputs; ++i) {
+            sig = sig * 1000003 + (uintptr_t) sched->splits[s].inputs[i];
+        }
+    }
+    if (sig == ht->layout_sig) {
+        return;
+    }
+    ht->layout_sig = sig;
+    ht->outs.assign(sched->n_splits, {});
+    // GGML_SCHED_HASH_LEAFS: 1 = also hash every node whose output lives in a persistent (usage ANY, i.e. model memory /
+    // KV / recurrent state) buffer - the rows this ubatch writes; 2 = additionally the whole state tensors they view
+    static const int hash_leafs = getenv("GGML_SCHED_HASH_LEAFS") ? atoi(getenv("GGML_SCHED_HASH_LEAFS")) : 0;
+    for (int s = 0; s < sched->n_splits; ++s) {
+        auto & v = ht->outs[s];
+        auto add = [&](ggml_tensor * t) {
+            if (t && t->buffer && std::find(v.begin(), v.end(), t) == v.end() && (int) v.size() < GGML_SCHED_HT_MAX_T) {
+                v.push_back(t);
+            }
+        };
+        for (int j = s + 1; j < sched->n_splits; ++j) {
+            for (int i = 0; i < sched->splits[j].n_inputs; ++i) {
+                ggml_tensor * t = sched->splits[j].inputs[i];
+                if ((t->flags & GGML_TENSOR_FLAG_INPUT) || tensor_backend_id(t) != sched->splits[s].backend_id) {
+                    continue;
+                }
+                add(t);
+            }
+        }
+        const ggml_cgraph & g = sched->splits[s].graph;
+        if (g.n_nodes > 0) {
+            add(g.nodes[g.n_nodes - 1]);   // the split's last node (the logits on the last split)
+        }
+        if (hash_leafs > 0) {
+            for (int i = 0; i < g.n_nodes; ++i) {
+                ggml_tensor * t = g.nodes[i];
+                ggml_backend_buffer_t buf = t->view_src ? t->view_src->buffer : t->buffer;
+                if (buf && !ggml_backend_buffer_is_host(buf) && ggml_backend_buffer_get_usage(buf) == GGML_BACKEND_BUFFER_USAGE_ANY) {
+                    add(t);
+                    if (hash_leafs > 1 && t->view_src) {
+                        add(t->view_src);
+                    }
+                }
+            }
+        }
+    }
+    for (int s = 0; s < sched->n_splits && s < GGML_SCHED_HT_SPLITS; ++s) {
+        fprintf(ht->f, "H %llu %d %s in:", (unsigned long long) gen, s, ggml_backend_name(sched->backends[sched->splits[s].backend_id]));
+        for (int i = 0; i < sched->splits[s].n_inputs && i < GGML_SCHED_HT_MAX_T; ++i) {
+            fprintf(ht->f, " %s", sched->splits[s].inputs[i]->name);
+        }
+        fprintf(ht->f, " out:");
+        for (ggml_tensor * t : ht->outs[s]) {
+            fprintf(ht->f, " %s", t->name);
+        }
+        fprintf(ht->f, "\n");
+    }
+}
+
+static void ggml_sched_hash_trace_flush(ggml_sched_hash_trace * ht, uint64_t gen) {
+    const int n_splits = ht->n_splits_of[gen % GGML_SCHED_HT_SLOTS];
+    for (int s = 0; s < n_splits && s < GGML_SCHED_HT_SPLITS; ++s) {
+        fprintf(ht->f, "R %llu %d", (unsigned long long) gen, s);
+        for (int kind = 0; kind < 3; ++kind) {
+            fputs(kind == 0 ? " in:" : kind == 1 ? " cpu:" : " out:", ht->f);
+            const int n = kind == 2 ? ht->n_out[gen % GGML_SCHED_HT_SLOTS][s] : ht->n_in[gen % GGML_SCHED_HT_SLOTS][s];
+            for (int t = 0; t < n; ++t) {
+                const uint64_t v = ht->base[ggml_sched_hash_trace::idx(gen, s, kind, t)];
+                if (v == 0) {
+                    fputs(" -", ht->f);
+                } else {
+                    fprintf(ht->f, " %016llx", (unsigned long long) v);
+                }
+            }
+        }
+        fputc('\n', ht->f);
+    }
+}
+
 static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t sched) {
     GGML_ASSERT(sched);
     struct ggml_backend_sched_split * splits = sched->splits;
+    ggml_sched_hash_trace * ht_trace = ggml_sched_hash_trace_get(sched);
+    {
+        static ggml_backend_sched_t ht_last = nullptr;
+        if (ht_trace && sched != ht_last) {
+            ht_trace->pending = false;
+            ht_trace->layout_sig = 0;
+            ht_last = sched;
+        }
+    }
 
     ggml_tensor * prev_ids_tensor = nullptr;
     std::vector<int32_t> ids;
@@ -1789,6 +1961,13 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     int prev_backend_id = -1;
 
     sched->compute_gen++;
+    const uint64_t ht_gen = sched->compute_gen;
+    if (ht_trace) {
+        ggml_sched_hash_trace_layout(sched, ht_trace, ht_gen);
+        memset(ht_trace->base + ggml_sched_hash_trace::idx(ht_gen, 0, 0, 0), 0, (size_t) GGML_SCHED_HT_SPLITS * 3 * GGML_SCHED_HT_MAX_T * sizeof(uint64_t));
+        memset(ht_trace->n_in[ht_gen % GGML_SCHED_HT_SLOTS], 0, sizeof(ht_trace->n_in[0]));
+        memset(ht_trace->n_out[ht_gen % GGML_SCHED_HT_SLOTS], 0, sizeof(ht_trace->n_out[0]));
+    }
 
     // see ggml_backend_sched_rotate_copy: no backend may still use the copy this ubatch is about to overwrite. In steady
     // state this waits on the same events the staged-input refill waits on, so it is free.
@@ -1865,6 +2044,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     const void * staged = ggml_backend_sched_stage_input(sched, input, split_backend_id);
                     if (staged != nullptr) {
                         ggml_backend_tensor_set_async(split_backend, input_cpy, staged, 0, ggml_nbytes(input));
+                        if (ht_trace && split_id < GGML_SCHED_HT_SPLITS && input_id < GGML_SCHED_HT_MAX_T) {
+                            ht_trace->base[ggml_sched_hash_trace::idx(ht_gen, split_id, 1, input_id)] = ggml_backend_hash_bytes(staged, ggml_nbytes(input));
+                        }
                         continue;
                     }
                 }
@@ -1882,6 +2064,9 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
                 } else {
                     ggml_backend_tensor_copy(input, input_cpy);
+                }
+                if (ht_trace && split_id < GGML_SCHED_HT_SPLITS && input_id < GGML_SCHED_HT_MAX_T) {
+                    ht_trace->base[ggml_sched_hash_trace::idx(ht_gen, split_id, 1, input_id)] = ggml_backend_hash_bytes(input->data, ggml_nbytes(input));
                 }
             } else {
                 // wait for the split backend to finish using the input before overwriting it
@@ -1989,7 +2174,15 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                     // that far ahead; and the cross-device wait is expensive where the GPUs are not peers (rune: the
                     // gpu9 -> gpu6 crossing cost ~180 ms of host time per ubatch). GGML_SCHED_NO_SRC_WAIT=1 disables.
                     static const bool no_src_wait = getenv("GGML_SCHED_NO_SRC_WAIT") != NULL && atoi(getenv("GGML_SCHED_NO_SRC_WAIT")) != 0;
-                    if (!no_src_wait && sched->rotating && !stage_inputs && input_backend != split_backend && input_backend->iface.event_wait != NULL &&
+                    // A graph that is not rotating (decode-sized and small prompt ubatches, LLAMA_PP_ROTATE_MIN) keeps every
+                    // ubatch on ONE copy, so the source overwrites the very buffer the split backend read for the previous
+                    // ubatch, and nothing else orders it (no staged inputs without rotation): a peer copy issued on the
+                    // source stream raced the destination's last reads of its input (rune GLM-5.3: sporadic gross single-
+                    // ubatch errors and corrupted state, HIP graphs on, -ub 3 and decode). GGML_SCHED_SRC_WAIT_NONROT=0
+                    // disables the wait (A/B).
+                    static const bool nonrot_src_wait = !(getenv("GGML_SCHED_SRC_WAIT_NONROT") && atoi(getenv("GGML_SCHED_SRC_WAIT_NONROT")) == 0);
+                    const bool need_src_wait = sched->rotating ? !stage_inputs : nonrot_src_wait;
+                    if (!no_src_wait && need_src_wait && input_backend != split_backend && input_backend->iface.event_wait != NULL &&
                         sched->events[split_backend_id][sched->cur_copy] != NULL && split_backend->iface.cpy_tensor_async &&
                         ggml_backend_dev_type(ggml_backend_get_device(input_backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
                         ggml_backend_event_wait(input_backend, sched->events[split_backend_id][sched->cur_copy]);
@@ -2012,9 +2205,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
         const int64_t t_split1 = timing ? ggml_time_us() : 0;
         if (ht) { ggml_host_trace("sp_in", split_id, split->n_inputs); }
         if (!sched->callback_eval) {
+            if (ht_trace && split_id < GGML_SCHED_HT_SPLITS && split->n_inputs > 0) {
+                const ggml_tensor * lst[GGML_SCHED_HT_MAX_T];
+                const int n = std::min(split->n_inputs, GGML_SCHED_HT_MAX_T);
+                for (int i = 0; i < n; ++i) {
+                    lst[i] = tensor_copy(split->inputs[i], split_backend_id, sched->cur_copy);
+                }
+                g_sched_hash_hook(split_backend, lst, n, ht_trace->base + ggml_sched_hash_trace::idx(ht_gen, split_id, 0, 0));
+                ht_trace->n_in[ht_gen % GGML_SCHED_HT_SLOTS][split_id] = (uint8_t) n;
+            }
             enum ggml_status ec = ggml_backend_graph_compute_async(split_backend, &split->graph);
             if (ec != GGML_STATUS_SUCCESS) {
                 return ec;
+            }
+            if (ht_trace && split_id < GGML_SCHED_HT_SPLITS && !ht_trace->outs[split_id].empty()) {
+                const auto & v = ht_trace->outs[split_id];
+                g_sched_hash_hook(split_backend, (const ggml_tensor **) v.data(), (int) v.size(), ht_trace->base + ggml_sched_hash_trace::idx(ht_gen, split_id, 2, 0));
+                ht_trace->n_out[ht_gen % GGML_SCHED_HT_SLOTS][split_id] = (uint8_t) v.size();
             }
             if (ht) { ggml_host_trace("sp_l", split_id, split_backend_id); }
             if (timing) {
@@ -2064,6 +2271,17 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
     }
 
     if (ht) { ggml_host_trace("cs_e", sched->n_splits, sched->cur_copy); }
+    if (ht_trace) {
+        // records are flushed GGML_SCHED_HASH_TRACE_LAG gens late (default 16 > the 8 pipelined ubatches in flight with
+        // GGML_SCHED_COPIES=8: the copy-reuse wait at gen g guarantees every backend finished gen g-8, so gen g-16 is final)
+        static const uint64_t lag = getenv("GGML_SCHED_HASH_TRACE_LAG") ? strtoull(getenv("GGML_SCHED_HASH_TRACE_LAG"), nullptr, 10) : 16;
+        ht_trace->n_splits_of[ht_gen % GGML_SCHED_HT_SLOTS] = sched->n_splits;
+        if (ht_gen > lag) {
+            ggml_sched_hash_trace_flush(ht_trace, ht_gen - lag);
+        }
+        ht_trace->last_gen = ht_gen;
+        fflush(ht_trace->f);
+    }
     if (timing && ++st_calls % 200 == 0) {
         char buf[1024]; int o = 0;
         for (int b = 0; b < sched->n_backends && o < (int) sizeof(buf) - 40; b++) {
@@ -2385,6 +2603,52 @@ void ggml_backend_sched_rotate_copy(ggml_backend_sched_t sched) {
     for (int p = 0; p < sched->n_rot_patches; p++) {
         const auto & rp = sched->rot_patches[p];
         rp.node->src[rp.j] = tensor_id_copy(rp.id, rp.backend_id, sched->cur_copy);
+    }
+    // GGML_SCHED_ROT_CHECK=1 (diagnostics): report graph nodes that VIEW a split-input copy other than the current one
+    // (view_src/data are fixed at allocation and are not repointed above)
+    static const bool rot_check = getenv("GGML_SCHED_ROT_CHECK") && atoi(getenv("GGML_SCHED_ROT_CHECK")) != 0;
+    if (rot_check) {
+        static int n_logged = 0;
+        for (int i = 0; i < sched->graph.n_nodes; i++) {
+            struct ggml_tensor * node = sched->graph.nodes[i];
+            if (node->view_src == NULL) {
+                continue;
+            }
+            for (int p = 0; p < sched->n_rot_patches; p++) {
+                const auto & rp = sched->rot_patches[p];
+                bool other = false;
+                for (int c = 0; c < sched->n_copies; c++) {
+                    if (c != sched->cur_copy && node->view_src == tensor_id_copy(rp.id, rp.backend_id, c)) {
+                        other = true;
+                    }
+                }
+                if (other && n_logged < 64) {
+                    n_logged++;
+                    GGML_LOG_WARN("sched rot check: node %d '%s' (%s) views '%s' (not copy %d): data %p\n", i, node->name,
+                        ggml_op_desc(node), node->view_src->name, sched->cur_copy, node->data);
+                    break;
+                }
+            }
+        }
+        static int n_src_logged = 0;
+        for (int i = 0; i < sched->graph.n_nodes && n_src_logged < 64; i++) {
+            struct ggml_tensor * node = sched->graph.nodes[i];
+            for (int j = 0; j < GGML_MAX_SRC; j++) {
+                struct ggml_tensor * s = node->src[j];
+                if (s && s->view_src) {
+                    for (int p = 0; p < sched->n_rot_patches; p++) {
+                        const auto & rp = sched->rot_patches[p];
+                        for (int c = 0; c < sched->n_copies; c++) {
+                            if (c != sched->cur_copy && s->view_src == tensor_id_copy(rp.id, rp.backend_id, c) && n_src_logged < 64) {
+                                n_src_logged++;
+                                GGML_LOG_WARN("sched rot check: node %d '%s' src%d '%s' is a view of '%s' (not copy %d)\n", i, node->name, j,
+                                    s->name, s->view_src->name, sched->cur_copy);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
     for (int i = 0; i < sched->n_splits; i++) {
         uint64_t & uid = sched->rot_uids[i*sched->n_copies + sched->cur_copy];

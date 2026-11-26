@@ -490,6 +490,13 @@ static bool ggml_cuda_cpy_rows(const ggml_tensor * src0, ggml_tensor * src1, cud
     return true;
 }
 
+// GGML_CUDA_CPY_MEMCPY2D=0: strided same-type copies use the copy kernels instead of cudaMemcpy2DAsync (bisection aid: a
+// memcpy node inside a HIP graph runs on SDMA)
+static bool ggml_cuda_cpy_memcpy_2d_on() {
+    static const bool on = [] { const char * e = getenv("GGML_CUDA_CPY_MEMCPY2D"); return e == nullptr || atoi(e) != 0; }();
+    return on;
+}
+
 // check if a same-type copy reduces to a 2D strided copy (height rows of width
 // contiguous bytes), so it can use cudaMemcpy2DAsync instead of the scalar kernel
 static bool ggml_cuda_cpy_as_memcpy_2d(const ggml_tensor * src0, const ggml_tensor * src1,
@@ -582,7 +589,7 @@ void ggml_cuda_cpy(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, gg
                 CUDA_CHECK(cudaMemcpyAsync(src1_ddc, src0_ddc, nbytes, cudaMemcpyDeviceToDevice, main_stream));
             }
         }
-    } else if (ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
+    } else if (ggml_cuda_cpy_memcpy_2d_on() && ggml_cuda_cpy_as_memcpy_2d(src0, src1, mc_width, mc_height, mc_spitch, mc_dpitch)) {
         CUDA_CHECK(cudaMemcpy2DAsync(src1_ddc, mc_dpitch, src0_ddc, mc_spitch,
                                      mc_width, mc_height, cudaMemcpyDeviceToDevice, main_stream));
     } else if (ggml_cuda_cpy_rows(src0, src1, main_stream)) {
