@@ -1819,6 +1819,11 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 static const float th_draft2 = getenv("LLAMA_SPEC_DRAFT2_MIN_P") ? atof(getenv("LLAMA_SPEC_DRAFT2_MIN_P")) : 0.5f;
                 static const float th_draft3 = getenv("LLAMA_SPEC_DRAFT3_MIN_P") ? atof(getenv("LLAMA_SPEC_DRAFT3_MIN_P")) : 0.9f;
                 bool stop = params.n_max <= (int) result.size();
+                // with a per-step cap from the server, do not decode drafts that would be truncated
+                static const bool nmax_by_gen = getenv("LLAMA_SPEC_NMAX_BY_GEN") != nullptr;
+                if (nmax_by_gen && dp.n_max > 0 && dp.n_max <= (int) result.size()) {
+                    stop = true;
+                }
                 if (adaptive && !stop) {
                     const float p = cur_p->data[0].p;
                     if (i == 0 && p < th_draft2) {
