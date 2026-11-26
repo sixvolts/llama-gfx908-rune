@@ -168,6 +168,12 @@ public:
     bool get_kpool_dirty(const llama_ubatch & ubatch) const;   // any stream of the ubatch
     void clear_kpool_dirty(const llama_ubatch & ubatch) const; // the ubatch's streams only
 
+    // rune LLAMA_KPOOL_INC (default 1): kpool and kv_pos inputs patch only the cells changed since the last call
+    // (llama_kv_cells_mut_log) instead of walking all n_kv cells; anything unusual takes the full path
+    static bool inc_inputs();
+    // per-stream state of the incremental kpool input; the caller must not resize it
+    llama_kv_inc_state & get_inc_kpool(llama_seq_id seq_id) const;
+
     ggml_type type_k() const;
     ggml_type type_v() const;
 
@@ -280,6 +286,10 @@ private:
 
     // see set_kpool_dirty. mutable: its only consumer runs from set_input, holding a const cache
     mutable std::vector<uint8_t> kpool_dirty; // [n_stream]
+
+    // LLAMA_KPOOL_INC state per stream; mutable for the same reason
+    mutable std::vector<llama_kv_inc_state> inc_kpool;  // [n_stream]
+    mutable std::vector<llama_kv_inc_state> inc_kv_pos; // [n_stream]
 
     const uint32_t n_seq_max = 1;
     const uint32_t n_stream  = 1;

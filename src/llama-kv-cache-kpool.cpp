@@ -590,6 +590,8 @@ struct kpool_stream_args {
     int32_t * dst_pool_reps; int32_t * dst_new_cells; int64_t * dst_new_reps;
     int32_t * dst_cell_pool; int32_t * dst_pool_cells; float * dst_bias; float * dst_pool_bias;
     char * dst_sel_mask; char * dst_cand_mask; int32_t * dst_tail_cells; float * dst_tail_mask;
+    // LLAMA_KPOOL_INC: [n_ns] state to seed from this full rebuild (nullptr = none); only with n_ps == 1
+    llama_kv_inc_state * const * seed;
 };
 
 static void kpool_set_input_stream(const kpool_stream_args & a, const int64_t s) {
@@ -829,6 +831,31 @@ static void kpool_set_input_stream(const kpool_stream_args & a, const int64_t s)
             }
         }
 
+        if (a.seed && a.seed[s]) {
+            // the run is complete here; pool_cells and pool_reps of the stream are final
+            GGML_ASSERT(n_ps == 1 && kcache);
+
+            const auto & cells = kv->get_cells(seq_of_pool);
+
+            llama_kv_inc_state & st = *a.seed[s];
+
+            st.valid   = (int64_t) cells.used_max_p1() <= n_kv;
+            st.gen     = cells.mut_gen();
+            st.n_mut   = cells.mut_n();
+            st.seq     = seq_of_pool;
+            st.n_kv    = n_kv;
+            st.n_pools = n_pools;
+            st.b_base  = b_base;
+            st.n_run   = n_run;
+            st.filled  = filled;
+            st.pool_cells.assign(cur_pool_cells, cur_pool_cells + r*n_pools);
+            st.pool_reps .assign(cur_pool_reps,  cur_pool_reps  + n_pools);
+            st.vals.resize(n_pools);
+            for (int64_t p = 0; p < n_pools; ++p) {
+                st.vals[p] = p < n_run && filled[p] == (int32_t) r ? 0.0f : -INFINITY;
+            }
+        }
+
         for (int64_t ii = 0; ii < n_tps; ++ii) {
             const int64_t i = s*n_tps + ii;
 
@@ -906,6 +933,212 @@ static void kpool_set_input_stream(const kpool_stream_args & a, const int64_t s)
             }
         }
     }
+}
+
+// LLAMA_KPOOL_INC: the same outputs for stream s from the state of the previous call plus the cells logged since
+// (llama_kv_cells_mut_log). A pool is recomputed from the sequence's (pos, cell) set when a logged position falls in
+// it or the run end moves across it; the per-query parts (pool_bias rows, tail, new-pool list) are O(n_tps*kpool) plus
+// a copy of the stored rows. Returns false (nothing usable written) when anything differs from what the state
+// covers: the caller then runs kpool_set_input_stream, which reseeds the state. Needs n_ps == 1, sparse, kcache.
+static bool kpool_set_input_stream_inc(const kpool_stream_args & a, const int64_t s, llama_kv_inc_state & st) {
+    const llama_ubatch * ubatch = a.ubatch;
+    const int64_t n_kv = a.n_kv, n_pools = a.n_pools, n_tps = a.n_tps, n_tail = a.n_tail, n_new_max = a.n_new_max;
+    const int64_t r = a.r;
+
+    const llama_seq_id seq   = ubatch->seq_id[s*n_tps][0];
+    const auto       & cells = a.kv->get_cells(seq);
+    const uint64_t     n_mut = cells.mut_n();
+
+    if (!st.valid || st.gen != cells.mut_gen() || st.seq != seq || st.n_kv != n_kv || st.n_pools != n_pools ||
+            n_mut - st.n_mut > llama_kv_cells::mut_log_t::N) {
+        return false;
+    }
+
+    // the full path reads cells [0, n_kv) only, the (pos, cell) set holds them all
+    if ((int64_t) cells.used_max_p1() > n_kv) {
+        return false;
+    }
+
+    // decode-sized ubatches only (a prompt overflows the log anyway)
+    if (n_tps > 64) {
+        return false;
+    }
+
+    for (int64_t ii = 0; ii < n_tps; ++ii) {
+        const int64_t i = s*n_tps + ii;
+        if (ubatch->seq_id[i][0] != seq || ubatch->pos[i] < 0) {
+            return false;
+        }
+    }
+
+    const llama_pos p_min = cells.seq_pos_min(seq);
+    const llama_pos p_max = cells.seq_pos_max(seq);
+
+    if (p_min < 0) {
+        return false;
+    }
+
+    const int64_t b_lo   = p_min/r;
+    const int64_t b_hi   = p_max/r;
+    const int64_t n_run  = std::min(b_hi - b_lo + 1, n_pools);
+    const int64_t b_base = std::max(b_lo, b_hi - (n_run - 1));
+
+    // a moved base renumbers every pool
+    if (b_base != st.b_base) {
+        return false;
+    }
+
+    // pools to recompute: logged positions plus the span the run end moved over
+    static thread_local std::vector<int64_t> blk;
+    blk.clear();
+
+    for (uint64_t k = st.n_mut; k < n_mut; ++k) {
+        const llama_pos p = cells.mut_at(k).p;
+        if (p < 0) {
+            continue;
+        }
+        const int64_t bo = p/r - b_base;
+        if (bo >= 0 && bo < n_pools) {
+            blk.push_back(bo);
+        }
+    }
+
+    {
+        const int64_t lo = std::min(st.n_run, n_run);
+        const int64_t hi = std::max(st.n_run, n_run);
+        if (hi - lo > 4096) {
+            return false;
+        }
+        for (int64_t bo = lo; bo < hi; ++bo) {
+            blk.push_back(bo);
+        }
+    }
+
+    std::sort(blk.begin(), blk.end());
+    blk.erase(std::unique(blk.begin(), blk.end()), blk.end());
+
+    // as the full path: members by position, the highest cell wins a shared position, filled counts every cell
+    for (const int64_t bo : blk) {
+        int32_t * pc = st.pool_cells.data() + bo*r;
+
+        std::fill(pc, pc + r, 0);
+
+        int32_t cnt = 0;
+
+        if (bo < n_run) {
+            const llama_pos p0 = (llama_pos) ((b_base + bo)*r);
+
+            cells.seq_pos_each(seq, p0, p0 + (llama_pos) r, [&](llama_pos p, uint32_t j) {
+                pc[p - p0] = (int32_t) j;
+                cnt++;
+            });
+        }
+
+        const bool full = cnt == (int32_t) r;
+
+        st.filled[bo]    = cnt;
+        st.pool_reps[bo] = full ? pc[r - 1] : 0;
+        st.vals[bo]      = full ? 0.0f : -INFINITY;
+    }
+
+    st.n_run = n_run;
+    st.n_mut = n_mut;
+
+    int32_t * cur_pool_cells = a.dst_pool_cells + s*(r*n_pools);
+    float   * cur_pool_bias  = a.dst_pool_bias  + s*(n_tps*n_pools);
+    int32_t * cur_tail_cells = a.dst_tail_cells + s*(n_tps*n_tail);
+    float   * cur_tail_mask  = a.dst_tail_mask  + s*(n_tps*n_tail);
+    int32_t * cur_pool_reps  = a.dst_pool_reps  + s*n_pools;
+    int32_t * cur_new_cells  = a.dst_new_cells  + s*(r*n_new_max);
+    int64_t * cur_new_reps   = a.dst_new_reps   + s*n_new_max;
+
+    memcpy(cur_pool_cells, st.pool_cells.data(), r*n_pools*sizeof(int32_t));
+    memcpy(cur_pool_reps,  st.pool_reps .data(),   n_pools*sizeof(int32_t));
+
+    std::fill(cur_tail_cells, cur_tail_cells + n_tps*n_tail, 0);
+    std::fill(cur_tail_mask,  cur_tail_mask  + n_tps*n_tail, -INFINITY);
+
+    for (int64_t ii = 0; ii < n_tps; ++ii) {
+        const llama_pos q          = ubatch->pos[s*n_tps + ii];
+        const llama_pos tail_start = (q + 1)/r*r;
+
+        // vals is -INFINITY from n_run on, as the full path leaves those pools
+        const int64_t bo_vis = std::max<int64_t>(0, tail_start/r - b_base);
+        const int64_t n_vis  = std::min(bo_vis, n_pools);
+
+        float * row = cur_pool_bias + ii*n_pools;
+        memcpy(row, st.vals.data(), n_vis*sizeof(float));
+        std::fill(row + n_vis, row + n_pools, -INFINITY);
+
+        int32_t * tc = cur_tail_cells + ii*n_tail;
+        float   * tm = cur_tail_mask  + ii*n_tail;
+
+        for (llama_pos p = tail_start; p <= q; ++p) {
+            int32_t j = -1;
+            cells.seq_pos_each(seq, p, p + 1, [&](llama_pos, uint32_t c) { j = (int32_t) c; });
+            if (j >= 0) {
+                tc[p - tail_start] = j;
+                tm[p - tail_start] = 0.0f;
+            }
+        }
+    }
+
+    // pools the ubatch touches, ascending, complete ones only (the full path's order)
+    std::fill(cur_new_cells, cur_new_cells + r*n_new_max, 0);
+
+    int64_t tb[64];
+    int64_t n_tb = 0;
+    for (int64_t ii = 0; ii < n_tps; ++ii) {
+        const int64_t bo = ubatch->pos[s*n_tps + ii]/r - b_base;
+        if (bo >= 0 && bo < n_run) {
+            tb[n_tb++] = bo;
+        }
+    }
+    std::sort(tb, tb + n_tb);
+    n_tb = std::unique(tb, tb + n_tb) - tb;
+
+    const int64_t row0 = (int64_t) a.strm_of[s]*a.kv_size;
+
+    int64_t n_new = 0;
+    for (int64_t k = 0; k < n_tb; ++k) {
+        const int64_t bo = tb[k];
+        if (st.filled[bo] != (int32_t) r) {
+            continue;
+        }
+        if (n_new >= n_new_max) {
+            return false;   // the full path asserts on it
+        }
+        const int32_t * pc = st.pool_cells.data() + bo*r;
+        std::copy(pc, pc + r, cur_new_cells + n_new*r);
+        cur_new_reps[n_new] = row0 + pc[r - 1];
+        n_new++;
+    }
+
+    const int32_t * any_rep_src = nullptr;
+    for (int64_t p = 0; p < n_run; ++p) {
+        if (st.filled[p] == (int32_t) r) {
+            any_rep_src = st.pool_cells.data() + p*r;
+            break;
+        }
+    }
+
+    for (int64_t p = n_new; p < n_new_max; ++p) {
+        if (any_rep_src) {
+            std::copy(any_rep_src, any_rep_src + r, cur_new_cells + p*r);
+            cur_new_reps[p] = row0 + any_rep_src[r - 1];
+        } else {
+            cur_new_reps[p] = row0;
+        }
+    }
+
+    return true;
+}
+
+// LLAMA_KPOOL_TIMING / LLAMA_KPOOL_VERIFY report how many streams took the incremental path
+static int64_t kpool_inc_n[2] = { 0, 0 };
+
+static void kpool_inc_count(bool inc) {
+    kpool_inc_n[inc ? 1 : 0]++;
 }
 
 static void llama_kv_cache_set_input_kpool_fast(
@@ -1064,28 +1297,57 @@ static void llama_kv_cache_set_input_kpool_fast(
     args.dst_cell_pool = dst_cell_pool; args.dst_pool_cells = dst_pool_cells; args.dst_bias = dst_bias;
     args.dst_pool_bias = dst_pool_bias; args.dst_sel_mask = dst_sel_mask; args.dst_cand_mask = dst_cand_mask;
     args.dst_tail_cells = dst_tail_cells; args.dst_tail_mask = dst_tail_mask;
+    args.seed = nullptr;
+
+    // streams left for the full rebuild
+    std::vector<int64_t> todo;
+    todo.reserve(n_ns);
+
+    std::vector<llama_kv_inc_state *> seed;
+
+    if (llama_kv_cache::inc_inputs() && n_ps == 1 && !dense && kcache && !cell_pool && !bias) {
+        seed.assign(n_ns, nullptr);
+        for (int64_t s = 0; s < n_ns; ++s) {
+            llama_kv_inc_state & st = kv->get_inc_kpool(ubatch->seq_id[s*n_tps][0]);
+            if (!rebuild && kpool_set_input_stream_inc(args, s, st)) {
+                kpool_inc_count(true);
+                continue;
+            }
+            kpool_inc_count(false);
+            st.valid = false;
+            seed[s]  = &st;
+            todo.push_back(s);
+        }
+        args.seed = seed.data();
+    } else {
+        for (int64_t s = 0; s < n_ns; ++s) {
+            todo.push_back(s);
+        }
+    }
+
+    const int64_t n_todo = todo.size();
 
     // LLAMA_KPOOL_THREADS: max threads over streams (default 8; 1 = serial). Spawned per call: ~20 us each against
     // ~1 ms of work per 32k-cell stream, so only for enough cells
     static const int max_thr = getenv("LLAMA_KPOOL_THREADS") ? std::max(1, atoi(getenv("LLAMA_KPOOL_THREADS"))) : 8;
-    const int64_t n_thr = n_kv*n_ns >= 16384 ? std::min<int64_t>(n_ns, max_thr) : 1;
+    const int64_t n_thr = n_kv*n_todo >= 16384 ? std::min<int64_t>(n_todo, max_thr) : 1;
 
     if (n_thr <= 1) {
-        for (int64_t s = 0; s < n_ns; ++s) {
-            kpool_set_input_stream(args, s);
+        for (int64_t k = 0; k < n_todo; ++k) {
+            kpool_set_input_stream(args, todo[k]);
         }
     } else {
         std::vector<std::thread> workers;
         workers.reserve(n_thr - 1);
         for (int64_t t = 1; t < n_thr; ++t) {
-            workers.emplace_back([&args, t, n_thr, n_ns] {
-                for (int64_t s = t; s < n_ns; s += n_thr) {
-                    kpool_set_input_stream(args, s);
+            workers.emplace_back([&args, &todo, t, n_thr, n_todo] {
+                for (int64_t k = t; k < n_todo; k += n_thr) {
+                    kpool_set_input_stream(args, todo[k]);
                 }
             });
         }
-        for (int64_t s = 0; s < n_ns; s += n_thr) {
-            kpool_set_input_stream(args, s);
+        for (int64_t k = 0; k < n_todo; k += n_thr) {
+            kpool_set_input_stream(args, todo[k]);
         }
         for (auto & w : workers) {
             w.join();
@@ -1133,8 +1395,9 @@ void llama_kv_cache_set_input_kpool(
         static int    n_call = 0;
         acc_ms += std::chrono::duration<double, std::milli>(t1 - t0).count();
         if (++n_call % 256 == 0) {
-            LLAMA_LOG_WARN("kpool input: %.3f ms per call (mean of 256; n_kv %lld, streams %lld)\n", acc_ms/256,
-                    (long long) n_kv, (long long) pool_cells->ne[1]);
+            LLAMA_LOG_WARN("kpool input: %.3f ms per call (mean of 256; n_kv %lld, streams %lld; inc streams %lld, full %lld)\n",
+                    acc_ms/256, (long long) n_kv, (long long) pool_cells->ne[1], (long long) kpool_inc_n[1],
+                    (long long) kpool_inc_n[0]);
             acc_ms = 0.0;
         }
     }
@@ -1207,7 +1470,8 @@ void llama_kv_cache_set_input_kpool(
             }
         }
         if (++n_checked % 256 == 0) {
-            LLAMA_LOG_WARN("kpool input: %lld calls verified identical to the reference\n", (long long) n_checked);
+            LLAMA_LOG_WARN("kpool input: %lld calls verified identical to the reference (inc streams %lld, full %lld)\n",
+                    (long long) n_checked, (long long) kpool_inc_n[1], (long long) kpool_inc_n[0]);
         }
     }
 }
