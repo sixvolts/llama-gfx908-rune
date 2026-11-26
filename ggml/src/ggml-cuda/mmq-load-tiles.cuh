@@ -1928,6 +1928,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 #ifndef GGML_MMQ_Q4K_VEC
 #define GGML_MMQ_Q4K_VEC 1
 #endif
+#ifndef GGML_MMQ_Q4K_SWZ
+#define GGML_MMQ_Q4K_SWZ 0
+#endif
 
 template <ggml_type type, int J, bool fallback> struct mmq_x_prefetch { static constexpr bool available = false; };
 
@@ -1997,8 +2000,30 @@ template <int J, bool fallback> struct mmq_x_prefetch<GGML_TYPE_Q4_K, J, fallbac
             lo.y = (r.qs[n][1] >> 0) & 0x0F0F0F0F; hi.y = (r.qs[n][1] >> 4) & 0x0F0F0F0F;
             lo.z = (r.qs[n][2] >> 0) & 0x0F0F0F0F; hi.z = (r.qs[n][2] >> 4) & 0x0F0F0F0F;
             lo.w = (r.qs[n][3] >> 0) & 0x0F0F0F0F; hi.w = (r.qs[n][3] >> 4) & 0x0F0F0F0F;
+#if GGML_MMQ_Q4K_SWZ
+            // LDS swizzle (bit-exact): rows with (i/8) odd keep the two dword pairs of every 16-byte unit swapped,
+            // so the 16 rows of an MFMA operand read hit 16 distinct bank pairs (stride 84 = 20 mod 32 alone puts
+            // rows i and i+8 on the same banks). (i/8)&1 == threadIdx.y&1 here: uniform per wave.
+            static_assert(nrows == 8 && (nrows*nwarps) % 16 == 0, "swizzle assumes 8 rows per wave");
+            if (threadIdx.y & 1) {
+                *((int4 *) (x_qs + i*sram_stride + k + 0)) = make_int4(lo.z, lo.w, lo.x, lo.y);
+                *((int4 *) (x_qs + i*sram_stride + k + 8)) = make_int4(hi.z, hi.w, hi.x, hi.y);
+            } else {
+                *((int4 *) (x_qs + i*sram_stride + k + 0)) = lo;
+                *((int4 *) (x_qs + i*sram_stride + k + 8)) = hi;
+            }
+#elif GGML_MMQ_Q8_1F_PAD != 4
+#if GGML_MMQ_Q4K_B128_UNALIGNED
+            typedef int4 int4_a8; // experiment: ds_write_b128 at 8-byte aligned LDS addresses
+#else
+            typedef int4 __attribute__((aligned(8))) int4_a8; // the row stride is only a multiple of 8 bytes
+#endif
+            *((int4_a8 *) (x_qs + i*sram_stride + k + 0)) = lo;
+            *((int4_a8 *) (x_qs + i*sram_stride + k + 8)) = hi;
+#else
             *((int4 *) (x_qs + i*sram_stride + k + 0)) = lo;
             *((int4 *) (x_qs + i*sram_stride + k + 8)) = hi;
+#endif
 #else
             x_qs[i*sram_stride + 16*(txi/8) + txi % 8 + 0] = (r.qs[n][0] >> 0) & 0x0F0F0F0F;
             x_qs[i*sram_stride + 16*(txi/8) + txi % 8 + 8] = (r.qs[n][0] >> 4) & 0x0F0F0F0F;

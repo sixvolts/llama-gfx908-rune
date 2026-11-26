@@ -339,6 +339,9 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     }
 }
 
+#ifndef GGML_MMQ_ABL
+#define GGML_MMQ_ABL 0
+#endif
 template <ggml_type type, int J, bool fallback, int NJ> static __device__ __forceinline__ void ggml_cuda_mmq_vec_dot_q8_1_q8_1_mma_impl(
         const int * __restrict__ x, const int * __restrict__ y, float * __restrict__ sum, const int k00) {
 #if defined(AMD_MFMA_AVAILABLE) || defined(AMD_WMMA_AVAILABLE)
@@ -361,6 +364,15 @@ template <ggml_type type, int J, bool fallback, int NJ> static __device__ __forc
 
     const int i0 = (threadIdx.y / ntx) * rows_per_warp;
 
+#if defined(GGML_MMQ_Q4K_SWZ) && GGML_MMQ_Q4K_SWZ
+    // LDS swizzle of the Q4_K CDNA x tile (see mmq_x_prefetch<Q4_K>::store): rows 8..15 of an operand read the
+    // other dword pair of their 16-byte unit. Lane-constant offset, no work in the loop.
+    const int swz = (ggml_cuda_mmq_get_sram_layout(type, J, fallback) == GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1F && (tile_A::get_i(0) & 8)) ?
+        ((tile_A::get_j(0) & 2) ? -2 : 2) : 0;
+#else
+    constexpr int swz = 0;
+#endif
+
     // unrolled (bit-exact: same per-element operation order): lets the scheduler overlap the LDS reads and MFMAs of
     // consecutive k01 steps (Q4_K MoE at prefill -4..7%; not done for the Q8_0 variant, where it measured slower)
 #pragma unroll
@@ -370,7 +382,7 @@ template <ggml_type type, int J, bool fallback, int NJ> static __device__ __forc
         tile_A A[ntx];
 #pragma unroll
         for (int n = 0; n < ntx; ++n) {
-            load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*sram_stride + k0, sram_stride);
+            load_ldmatrix(A[n], x_qs + (i0 + n*tile_A::I)*sram_stride + k0 + swz, sram_stride);
         }
 
 #pragma unroll
@@ -384,19 +396,34 @@ template <ggml_type type, int J, bool fallback, int NJ> static __device__ __forc
 #pragma unroll
             for (int n = 0; n < ntx; ++n) {
                 tile_C C;
+#if GGML_MMQ_ABL == 7
+#pragma unroll
+                for (int l = 0; l < tile_C::ne; ++l) { C.x[l] = A[n].x[l % 2] + B.x[l % 2]; }
+#else
                 mma(C, A[n], B);
+#endif
 
 #pragma unroll
                 for (int l = 0; l < tile_C::ne; ++l) {
                     const int i = i0 + n*tile_A::I + tile_C::get_i(l);
                     float2 dmA;
+#if GGML_MMQ_ABL == 2 || GGML_MMQ_ABL == 3
+                    dmA = make_float2(1.5f, 0.25f); GGML_UNUSED(i);
+#else
                     if constexpr (ggml_cuda_mmq_get_sram_layout(type, J, fallback) == GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1F) {
                         dmA = ((const float2 *) x_dm)[(i*sram_stride)/2 + k0/QI8_1];
                     } else {
                         dmA = __half22float2(x_dm[i*sram_stride + k0/QI8_1]);
                     }
+#endif
+#if GGML_MMQ_ABL == 3
+                    sum[(j0/tile_C::J + n)*tile_C::ne + l] += (float) C.x[l]; GGML_UNUSED(dsB);
+#else
                     sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA.x*dsB.x*C.x[l];
+#if GGML_MMQ_ABL != 1
                     sum[(j0/tile_C::J + n)*tile_C::ne + l] += dmA.y*dsB.y;
+#endif
+#endif
                 }
             }
         }

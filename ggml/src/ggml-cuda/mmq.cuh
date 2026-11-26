@@ -123,6 +123,16 @@ struct tile_x_sizes {
 #define MMQ_TILE_Y_K     (MMQ_TILE_NE_K + MMQ_TILE_NE_K / QI8_1)
 #define MMQ_TILE_Y_FP4_K MMQ_TILE_Y_K
 
+#ifndef GGML_MMQ_Y2_SHIFT
+#define GGML_MMQ_Y2_SHIFT 0
+#endif
+#ifndef GGML_MMQ_Y2_PADX
+#define GGML_MMQ_Y2_PADX 0
+#endif
+#ifndef GGML_MMQ_Q8_1F_PAD
+#define GGML_MMQ_Q8_1F_PAD 4
+#endif
+
 enum ggml_cuda_mmq_sram_layout {
     GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0,
     GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1,
@@ -162,7 +172,9 @@ static constexpr __host__ __device__ int ggml_cuda_mmq_get_sram_stride(ggml_cuda
         case GGML_CUDA_MMQ_SRAM_LAYOUT_NVFP4:
             return 2*MMQ_TILE_NE_K + MMQ_TILE_NE_K/2       + 4;
         case GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1F:
-            return 2*MMQ_TILE_NE_K + 2*(2*MMQ_TILE_NE_K/QI8_1) + 4;
+            // GGML_MMQ_Q8_1F_PAD (default 4): 6 gives a row stride of 86 dwords = 22 mod 32, so the 16 rows of an
+            // MFMA operand read (2 dwords per lane) hit 32 distinct LDS banks; with 84 rows i and i+8 share banks.
+            return 2*MMQ_TILE_NE_K + 2*(2*MMQ_TILE_NE_K/QI8_1) + GGML_MMQ_Q8_1F_PAD;
         default:
             return -1;
     }
@@ -170,7 +182,7 @@ static constexpr __host__ __device__ int ggml_cuda_mmq_get_sram_stride(ggml_cuda
 
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_0)  % 8 == 4, "Wrong padding.");
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1)  % 8 == 4, "Wrong padding.");
-static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1F) % 8 == 4, "Wrong padding.");
+static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q8_1F) % 2 == 0, "Wrong padding.");
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q2_K)  % 8 == 4, "Wrong padding.");
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q3_K)  % 8 == 4, "Wrong padding.");
 static_assert(ggml_cuda_mmq_get_sram_stride(GGML_CUDA_MMQ_SRAM_LAYOUT_Q2_K_PS) % 8 == 4, "Wrong padding.");
@@ -933,6 +945,9 @@ static constexpr __device__ ggml_cuda_mmq_write_back_t ggml_cuda_mmq_get_write_b
 
 // ---------------------------------------------------------------------------------------------
 
+#ifndef GGML_MMQ_ABL
+#define GGML_MMQ_ABL 0
+#endif
 template <ggml_type type, int J, bool fallback, bool fixup>
 static __device__ __forceinline__ void mul_mat_q_process_tile(
         const char * __restrict__ x, const int offset_x, const int * __restrict__ y,
@@ -951,8 +966,10 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
 
     extern __shared__ int data_mul_mat_q[];
     int * tile_y  = data_mul_mat_q + J;
-    int * tile_y2 = tile_y  + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size); // second K half of the same iteration
-    int * tile_x  = tile_y2 + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size);
+    // GGML_MMQ_Y2_SHIFT (dwords): bank offset between the two y buffers. Their chunk stores go out as one
+    // ds_write2st64 per lane; with a distance that is a multiple of 32 dwords both dwords hit the same bank.
+    int * tile_y2 = tile_y  + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size) + GGML_MMQ_Y2_SHIFT; // second K half of the same iteration
+    int * tile_x  = tile_y2 + GGML_PAD(J*MMQ_TILE_Y_K, nwarps*warp_size) + GGML_MMQ_Y2_PADX;
 
 #if defined(BLACKWELL_MMA_AVAILABLE)
     // FP4 tile stores 8 blocks
@@ -997,33 +1014,90 @@ static __device__ __forceinline__ void mul_mat_q_process_tile(
                 }
             };
             int kb0 = kb0_start;
+#if GGML_MMQ_ABL == 20
+            // experiment: x prefetched two K steps ahead (two register sets, loop unrolled by two)
+            typename XP::regs xr2;
+            if (kb0 < kb0_stop) {
+                XP::load(xr, x, offset_x + kb0, tile_x_max_i, stride_row_x);
+                load_y(kb0);
+                if (kb0 + blocks_per_iter < kb0_stop) {
+                    XP::load(xr2, x, offset_x + kb0 + blocks_per_iter, tile_x_max_i, stride_row_x);
+                }
+            }
+            auto step2 = [&](typename XP::regs & xc) {
+                XP::store(xc, tile_x, tile_x_max_i);
+#pragma unroll
+                for (int n = 0; n < NYC; ++n) {
+                    tile_y [n*nwarps*warp_size + tid] = y0r[n];
+                    tile_y2[n*nwarps*warp_size + tid] = y1r[n];
+                }
+                __syncthreads();
+                if (kb0 + 2*blocks_per_iter < kb0_stop) {
+                    XP::load(xc, x, offset_x + kb0 + 2*blocks_per_iter, tile_x_max_i, stride_row_x);
+                }
+                if (kb0 + blocks_per_iter < kb0_stop) {
+                    load_y(kb0 + blocks_per_iter);
+                }
+                __builtin_amdgcn_sched_barrier(0);
+                vec_dot(tile_x, tile_y,  sum, 0,             j_lim);
+                vec_dot(tile_x, tile_y2, sum, MMQ_TILE_NE_K, j_lim);
+                __syncthreads();
+                kb0 += blocks_per_iter;
+            };
+            while (kb0 < kb0_stop) {
+                step2(xr);
+                if (kb0 >= kb0_stop) { break; }
+                step2(xr2);
+            }
+#endif
             if (kb0 < kb0_stop) {
                 XP::load(xr, x, offset_x + kb0, tile_x_max_i, stride_row_x);
                 load_y(kb0);
             }
             for (; kb0 < kb0_stop; kb0 += blocks_per_iter) {
+#if GGML_MMQ_ABL == 9
+                if (kb0 == kb0_start) {
+#endif
                 XP::store(xr, tile_x, tile_x_max_i);
 #pragma unroll
                 for (int n = 0; n < NYC; ++n) {
                     tile_y [n*nwarps*warp_size + tid] = y0r[n];
                     tile_y2[n*nwarps*warp_size + tid] = y1r[n];
                 }
+#if GGML_MMQ_ABL == 9
+                }
+#endif
 
+#if GGML_MMQ_ABL != 4 && GGML_MMQ_ABL != 9 && GGML_MMQ_ABL != 11
                 __syncthreads();
+#endif
 
                 const int kb0_next = kb0 + blocks_per_iter;
+#if GGML_MMQ_ABL == 13
+                vec_dot(tile_x, tile_y,  sum, 0,             j_lim);
+                vec_dot(tile_x, tile_y2, sum, MMQ_TILE_NE_K, j_lim);
+                __builtin_amdgcn_sched_barrier(0);
+#endif
                 if (kb0_next < kb0_stop) {
+#if GGML_MMQ_ABL != 5 && GGML_MMQ_ABL != 6 && GGML_MMQ_ABL != 9 && GGML_MMQ_ABL != 10
                     XP::load(xr, x, offset_x + kb0_next, tile_x_max_i, stride_row_x);
+#endif
+#if GGML_MMQ_ABL != 6 && GGML_MMQ_ABL != 9 && GGML_MMQ_ABL != 10
                     load_y(kb0_next);
+#endif
                 }
 #ifdef GGML_USE_HIP
                 __builtin_amdgcn_sched_barrier(0); // keep the prefetch loads ahead of the MFMAs
 #endif // GGML_USE_HIP
 
+#if GGML_MMQ_ABL != 8 && GGML_MMQ_ABL != 10 && GGML_MMQ_ABL != 11 && GGML_MMQ_ABL != 13
                 vec_dot(tile_x, tile_y,  sum, 0,             j_lim);
                 vec_dot(tile_x, tile_y2, sum, MMQ_TILE_NE_K, j_lim);
+#endif
 
+#if GGML_MMQ_ABL != 4 && GGML_MMQ_ABL != 9 && GGML_MMQ_ABL != 11
                 __syncthreads();
+#endif
             }
         };
         const int ny = min(NY, (GGML_PAD(j_lim, 16)*MMQ_TILE_Y_K + nwarps*warp_size - 1) / (nwarps*warp_size));
@@ -1605,7 +1679,7 @@ static size_t mmq_get_nbytes_shared(const ggml_cuda_mmq_config & config, const i
     const size_t nbs_x = ggml_cuda_mmq_get_nbytes_shared_x(config, cc);
     const size_t nbs_y = config.J * (sizeof(block_q8_1_mmq));
     // two y buffers: both K halves of an iteration are loaded together (one exposed global round trip per K step)
-    return nbs_ids + nbs_x + 2*GGML_PAD(nbs_y, config.nthreads*sizeof(int));
+    return nbs_ids + nbs_x + 2*GGML_PAD(nbs_y, config.nthreads*sizeof(int)) + (GGML_MMQ_Y2_SHIFT + GGML_MMQ_Y2_PADX)*sizeof(int);
 }
 
 template <ggml_type type, int J, bool fallback>
@@ -1662,7 +1736,8 @@ static void launch_mul_mat_q(ggml_backend_cuda_context & ctx, const mmq_args & a
         mmq_moe_build_tile_list<<<1, 1024, 0, stream>>>(args.expert_bounds, tile_list.ptr, (int) args.nchannels_y, config.J, ntiles_max);
         CUDA_CHECK(cudaGetLastError());
         const dim3 block_nums_moe(nty, ntiles_max, 1);
-        mul_mat_q_moe_tiled<type, J, fallback><<<block_nums_moe, block_dims, nbytes_shared, stream>>>
+        static const int lds_pad = [] { const char * e = getenv("GGML_MMQ_LDS_PAD"); return e ? atoi(e) : 0; }();
+        mul_mat_q_moe_tiled<type, J, fallback><<<block_nums_moe, block_dims, nbytes_shared + lds_pad, stream>>>
             (args.x, args.y, args.ids_dst, args.expert_bounds, tile_list.ptr, args.dst,
              blocks_per_ne00_fd, args.nrows_x, args.stride_row_x, args.ncols_y, args.nrows_dst,
              channel_ratio_fd, args.stride_channel_x);

@@ -94,7 +94,13 @@ static constexpr __host__ __device__ ggml_cuda_mmq_config ggml_cuda_mmq_get_conf
     // Q4_K on CDNA: 64-row tiles, 256 threads, 2 blocks per CU (J <= 32 so x + y tiles fit in 32 KB of LDS): two
     // independent blocks per CU overlap their load/store/barrier phases; per-element accumulation order unchanged
     // (bit-exact). MoE at ub 512 -10..12%. GGML_MMQ_Q4K_I128=1 (compile time) restores the 128-row/512-thread tiles.
-#if !GGML_MMQ_Q4K_I128
+#if GGML_MMQ_Q4K_I32
+    // experiment: 32-row tiles, 2 waves, 3 blocks per CU
+    CASE(GGML_TYPE_Q4_K, 128, 3,  32,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q4K_CDNA, MMQ_ITER_K, true, true);
+    CASE(GGML_TYPE_Q4_K, 128, 3,  32,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q4K_CDNA, MMQ_ITER_K, true, true);
+    CASE(GGML_TYPE_Q4_K, 128, 3,  32,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q4K_CDNA, MMQ_ITER_K, true, false);
+    CASE(GGML_TYPE_Q4_K, 128, 3,  32,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q4K_CDNA, MMQ_ITER_K, true, false);
+#elif !GGML_MMQ_Q4K_I128
     CASE(GGML_TYPE_Q4_K, 256, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q4K_CDNA, MMQ_ITER_K, true, true);
     CASE(GGML_TYPE_Q4_K, 256, 2,  64,  32, GGML_CUDA_MMQ_SRAM_LAYOUT_Q4K_CDNA, MMQ_ITER_K, true, true);
     CASE(GGML_TYPE_Q4_K, 256, 2,  64,  16, GGML_CUDA_MMQ_SRAM_LAYOUT_Q4K_CDNA, MMQ_ITER_K, true, false);
