@@ -611,7 +611,9 @@ static void ggml_cuda_sparse_attn_launch(ggml_backend_cuda_context & ctx, ggml_t
 
     // few queries (decode, speculative verify): split the cell range so that every CU gets work
     const int n_cu   = ggml_cuda_info().devices[ctx.device].nsm;
-    const int want   = (2*n_cu + n_tok*n_hg - 1)/(n_tok*n_hg);
+    // experiment knob: blocks wanted, in quarters of the CU count (default 8 = 2 blocks per CU)
+    static const int want_q4 = getenv("GGML_CUDA_SPARSE_WANT_Q4") ? std::max(1, atoi(getenv("GGML_CUDA_SPARSE_WANT_Q4"))) : 8;
+    const int want   = (want_q4*n_cu/4 + n_tok*n_hg - 1)/(n_tok*n_hg);
     int tiles_per_split = (n_tiles + std::max(1, want) - 1)/std::max(1, want);
     tiles_per_split = std::max(1, tiles_per_split);
     const int n_split = (n_tiles + tiles_per_split - 1)/tiles_per_split;
